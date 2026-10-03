@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Abaqus replay / journal files
+abaqus.rpy*
+abaqus.jnl*
+
+# Abaqus temporary and solver output files
+*.lck
+*.log
+*.msg
+*.sta
+*.dat
+*.com
+*.prt
+*.sim
+*.stt
+*.mdl
+*.pac
+*.res
+*.sel
+*.abq
+*.cid
+*.ipm
+
+# Large Abaqus result files
+*.odb
+*.fil
+
+# Windows
+Thumbs.db
+Desktop.ini
