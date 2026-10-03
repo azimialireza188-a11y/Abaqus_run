@@ -1,0 +1,311 @@
+# -*- coding: mbcs -*-
+#
+# Abaqus/CAE Release 2024 replay file
+# Internal Version: 2023_09_21-16.25.25 RELr426 190762
+# Run by 810200014 on Fri Oct  2 15:41:47 2026
+#
+
+# from driverUtils import executeOnCaeGraphicsStartup
+# executeOnCaeGraphicsStartup()
+#: Executing "onCaeGraphicsStartup()" in the site directory ...
+from abaqus import *
+from abaqusConstants import *
+session.Viewport(name='Viewport: 1', origin=(0.957031, 0.954861), 
+    width=140.875, height=94.7222)
+session.viewports['Viewport: 1'].makeCurrent()
+from driverUtils import executeOnCaeStartup
+executeOnCaeStartup()
+execfile('abaqus_complete_model_m20.py', __main__.__dict__)
+#: [15:41:48] Output directory: D:\CFS-Column\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15
+#: [15:41:48] Settings: {"build_only": false, "builtup_dir": "C:\\Users\\810200014.HAMI.000\\Documents\\CUFSM-Single\\cfs_abaqus\\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15", "check_inputs": false, "cpus": 8, "max_iterations": 1250, "mesh_mm": 20.0, "n_modes": 250, "n_vectors": 500, "output_dir": "D:\\CFS-Column\\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15", "output_root": null, "resume_post": null, "skip_post": false}
+#: [15:41:48] 1/4 BUILD: geometry, mesh, contact, CAE and INP.
+#: Source inputs: {"E_MPa": 200000.0, "bolt_positions_mm": [25.0, 222.2222222, 419.4444444, 616.6666667, 813.8888889, 1011.111111, 1208.333333, 1405.555556, 1602.777778, 1800.0, 1997.222222, 2194.444444, 2391.666667, 2588.888889, 2786.111111, 2983.333333, 3180.555556, 3377.777778, 3575.0], "bolt_row_mm": 15.0, "bolt_solids_holes_contact_pretension": false, "bolts_per_seam": 19, "clear_gap_mm": 10.0, "connection_model": "BEAM_MPC", "expected_links": 76, "finish_end_mm": 25.0, "length_mm": 3600.0, "nu": 0.3, "pitch_mm": [197.2222222, 197.2222222, 197.2222223, 197.2222222, 197.2222221, 197.222222, 197.222223, 197.222222, 197.222222, 197.222222, 197.222222, 197.222223, 197.222222, 197.222222, 197.222222, 197.222223, 197.222222, 197.222222], "shell_contact": "GENERAL_STANDARD_HARD_FRICTIONLESS", "source_directory": "C:\\Users\\810200014.HAMI.000\\Documents\\CUFSM-Single\\cfs_abaqus\\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15", "start_end_mm": 25.0, "thickness_mm": 4.0}
+#: The model "BU_BOLT_L3600_M20" has been created.
+#: Partitions ready; simplifying only redundant section boundaries.
+#: Before meshing: 80 faces; edge counts [4]
+#: After meshing: 3330 nodes, 3128 elements; unmeshed=None
+#: Mesh: 80 faces, 3330 nodes, 3128 S4R per piece.
+#: The interaction property "Hard_Frictionless" has been created.
+#: The interaction "GeneralContact" has been created.
+#: The model database has been saved to "D:\CFS-Column\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15\BU_BOLT_L3600_M20.cae".
+#: BUILD COMPLETE: CAE and INP saved. No analysis submitted yet. {'length_mm': 3600.0, 'target_mesh_mm': 20.0, 'modes': 250, 'vectors': 500, 'max_iterations': 1250, 'cpus': 8, 'job_name': 'BU_BOLT_L3600_M20', 'odb': 'D:\\CFS-Column\\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15\\BU_BOLT_L3600_M20.odb', 'nodes': 13320, 'elements': 12512, 'element_type': 'S4R', 'bolts_per_seam': 19, 'rigid_links': 76, 'boundary_conditions': 9, 'loads': 8, 'reference_stress_MPa': 1.0, 'submitted': False, 'contact': {'type': 'General contact (Standard)', 'step': 'Initial', 'domain': 'All exterior surfaces, including self-contact', 'normal': 'HARD', 'tangential': 'FRICTIONLESS', 'allow_separation': True, 'buckle_limitation': 'Contact status fixed at the base state'}, 'source_inputs': {'source_directory': 'C:\\Users\\810200014.HAMI.000\\Documents\\CUFSM-Single\\cfs_abaqus\\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15', 'length_mm': 3600.0, 'thickness_mm': 4.0, 'E_MPa': 200000.0, 'nu': 0.3, 'clear_gap_mm': 10.0, 'bolt_row_mm': 15.0, 'bolts_per_seam': 19, 'start_end_mm': 25.0, 'finish_end_mm': 25.0, 'pitch_mm': [197.2222222, 197.2222222, 197.2222223, 197.2222222, 197.2222221, 197.222222, 197.222223, 197.222222, 197.222222, 197.222222, 197.222222, 197.222223, 197.222222, 197.222222, 197.222222, 197.222223, 197.222222, 197.222222], 'bolt_positions_mm': [25.0, 222.2222222, 419.4444444, 616.6666667, 813.8888889, 1011.111111, 1208.333333, 1405.555556, 1602.777778, 1800.0, 1997.222222, 2194.444444, 2391.666667, 2588.888889, 2786.111111, 2983.333333, 3180.555556, 3377.777778, 3575.0], 'expected_links': 76, 'connection_model': 'BEAM_MPC', 'bolt_solids_holes_contact_pretension': False, 'shell_contact': 'GENERAL_STANDARD_HARD_FRICTIONLESS'}}
+#: [15:42:08] 2/4 SOLVE: submitting BU_BOLT_L3600_M20
+#: [15:47:16] Solver completed successfully: Successful completion in .sta, .log; ODB present and unlocked
+#: [15:47:16] 3/4 POSTPROCESS: all modes from D:\CFS-Column\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15\BU_BOLT_L3600_M20.odb
+#: Model: D:/CFS-Column/A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15/BU_BOLT_L3600_M20.odb
+#: Number of Assemblies:         1
+#: Number of Assembly instances: 0
+#: Number of Part instances:     4
+#: Number of Meshes:             4
+#: Number of Element Sets:       9
+#: Number of Node Sets:          162
+#: Number of Steps:              1
+#: Mode 1: eigenvalue=660.74, n=27, half-wave=133.333333333333 mm, share=0.713, dominant
+#: Mode 2: eigenvalue=660.82, n=28, half-wave=128.571428571429 mm, share=0.452, mixed
+#: Mode 3: eigenvalue=663.1, n=26, half-wave=138.461538461538 mm, share=0.372, mixed
+#: Mode 4: eigenvalue=663.52, n=25, half-wave=144.0 mm, share=0.511, mixed
+#: Mode 5: eigenvalue=666.51, n=25, half-wave=144.0 mm, share=0.256, mixed
+#: Mode 6: eigenvalue=667.56, n=24, half-wave=150.0 mm, share=0.559, mixed
+#: Mode 7: eigenvalue=667.6, n=27, half-wave=133.333333333333 mm, share=0.652, mixed
+#: Mode 8: eigenvalue=667.6, n=27, half-wave=133.333333333333 mm, share=0.652, mixed
+#: Mode 9: eigenvalue=667.6, n=28, half-wave=128.571428571429 mm, share=0.596, mixed
+#: Mode 10: eigenvalue=667.6, n=28, half-wave=128.571428571429 mm, share=0.596, mixed
+#: Mode 11: eigenvalue=669.99, n=26, half-wave=138.461538461538 mm, share=0.506, mixed
+#: Mode 12: eigenvalue=669.99, n=26, half-wave=138.461538461538 mm, share=0.506, mixed
+#: Mode 13: eigenvalue=670.11, n=1, half-wave=3600.0 mm, share=0.616, mixed
+#: Mode 14: eigenvalue=670.11, n=1, half-wave=3600.0 mm, share=0.616, mixed
+#: Mode 15: eigenvalue=670.94, n=30, half-wave=120.0 mm, share=0.306, mixed
+#: Mode 16: eigenvalue=672.49, n=23, half-wave=156.521739130435 mm, share=0.559, mixed
+#: Mode 17: eigenvalue=673.1, n=1, half-wave=3600.0 mm, share=0.718, dominant
+#: Mode 18: eigenvalue=673.1, n=1, half-wave=3600.0 mm, share=0.718, dominant
+#: Mode 19: eigenvalue=673.88, n=24, half-wave=150.0 mm, share=0.443, mixed
+#: Mode 20: eigenvalue=673.88, n=24, half-wave=150.0 mm, share=0.443, mixed
+#: Mode 21: eigenvalue=675.5, n=1, half-wave=3600.0 mm, share=0.998, dominant
+#: Mode 22: eigenvalue=675.5, n=1, half-wave=3600.0 mm, share=0.998, dominant
+#: Mode 23: eigenvalue=676.67, n=31, half-wave=116.129032258065 mm, share=0.430, mixed
+#: Mode 24: eigenvalue=676.68, n=24, half-wave=150.0 mm, share=0.241, mixed
+#: Mode 25: eigenvalue=676.68, n=24, half-wave=150.0 mm, share=0.241, mixed
+#: Mode 26: eigenvalue=677.19, n=28, half-wave=128.571428571429 mm, share=0.671, mixed
+#: Mode 27: eigenvalue=677.25, n=29, half-wave=124.137931034483 mm, share=0.610, mixed
+#: Mode 28: eigenvalue=677.78, n=22, half-wave=163.636363636364 mm, share=0.497, mixed
+#: Mode 29: eigenvalue=678.2, n=1, half-wave=3600.0 mm, share=0.857, dominant
+#: Mode 30: eigenvalue=678.2, n=1, half-wave=3600.0 mm, share=0.857, dominant
+#: Mode 31: eigenvalue=680.33, n=27, half-wave=133.333333333333 mm, share=0.536, mixed
+#: Mode 32: eigenvalue=680.64, n=30, half-wave=120.0 mm, share=0.425, mixed
+#: Mode 33: eigenvalue=681.19, n=1, half-wave=3600.0 mm, share=0.878, dominant
+#: Mode 34: eigenvalue=681.19, n=1, half-wave=3600.0 mm, share=0.878, dominant
+#: Mode 35: eigenvalue=681.46, n=22, half-wave=163.636363636364 mm, share=0.356, mixed
+#: Mode 36: eigenvalue=681.46, n=22, half-wave=163.636363636364 mm, share=0.356, mixed
+#: Mode 37: eigenvalue=682.23, n=18, half-wave=200.0 mm, share=0.607, mixed
+#: Mode 38: eigenvalue=682.73, n=21, half-wave=171.428571428571 mm, share=0.383, mixed
+#: Mode 39: eigenvalue=682.96, n=21, half-wave=171.428571428571 mm, share=0.375, mixed
+#: Mode 40: eigenvalue=683.76, n=32, half-wave=112.5 mm, share=0.486, mixed
+#: Mode 41: eigenvalue=683.8, n=17, half-wave=211.764705882353 mm, share=0.374, mixed
+#: Mode 42: eigenvalue=683.8, n=17, half-wave=211.764705882353 mm, share=0.374, mixed
+#: Mode 43: eigenvalue=683.91, n=22, half-wave=163.636363636364 mm, share=0.403, mixed
+#: Mode 44: eigenvalue=684.08, n=26, half-wave=138.461538461538 mm, share=0.344, mixed
+#: Mode 45: eigenvalue=684.37, n=18, half-wave=200.0 mm, share=0.726, dominant
+#: Mode 46: eigenvalue=684.37, n=18, half-wave=200.0 mm, share=0.726, dominant
+#: Mode 47: eigenvalue=684.55, n=23, half-wave=156.521739130435 mm, share=0.306, mixed
+#: Mode 48: eigenvalue=685.48, n=23, half-wave=156.521739130435 mm, share=0.244, mixed
+#: Mode 49: eigenvalue=686.29, n=18, half-wave=200.0 mm, share=0.722, dominant
+#: Mode 50: eigenvalue=686.53, n=24, half-wave=150.0 mm, share=0.344, mixed
+#: Mode 51: eigenvalue=687.65, n=32, half-wave=112.5 mm, share=0.537, mixed
+#: Mode 52: eigenvalue=687.65, n=32, half-wave=112.5 mm, share=0.537, mixed
+#: Mode 53: eigenvalue=687.75, n=25, half-wave=144.0 mm, share=0.211, mixed
+#: Mode 54: eigenvalue=691.85, n=33, half-wave=109.090909090909 mm, share=0.602, mixed
+#: Mode 55: eigenvalue=692.22, n=32, half-wave=112.5 mm, share=0.389, mixed
+#: Mode 56: eigenvalue=694.75, n=27, half-wave=133.333333333333 mm, share=0.551, mixed
+#: Mode 57: eigenvalue=694.83, n=26, half-wave=138.461538461538 mm, share=0.458, mixed
+#: Mode 58: eigenvalue=695.25, n=1, half-wave=3600.0 mm, share=0.722, dominant
+#: Mode 59: eigenvalue=695.25, n=1, half-wave=3600.0 mm, share=0.722, dominant
+#: Mode 60: eigenvalue=696.47, n=28, half-wave=128.571428571429 mm, share=0.433, mixed
+#: Mode 61: eigenvalue=696.62, n=25, half-wave=144.0 mm, share=0.544, mixed
+#: Mode 62: eigenvalue=697.44, n=29, half-wave=124.137931034483 mm, share=0.534, mixed
+#: Mode 63: eigenvalue=699.64, n=30, half-wave=120.0 mm, share=0.538, mixed
+#: Mode 64: eigenvalue=699.88, n=34, half-wave=105.882352941176 mm, share=0.533, mixed
+#: Mode 65: eigenvalue=701.33, n=33, half-wave=109.090909090909 mm, share=0.284, mixed
+#: Mode 66: eigenvalue=702.24, n=34, half-wave=105.882352941176 mm, share=0.416, mixed
+#: Mode 67: eigenvalue=702.24, n=34, half-wave=105.882352941176 mm, share=0.416, mixed
+#: Mode 68: eigenvalue=703.27, n=24, half-wave=150.0 mm, share=0.535, mixed
+#: Mode 69: eigenvalue=703.44, n=31, half-wave=116.129032258065 mm, share=0.457, mixed
+#: Mode 70: eigenvalue=706.66, n=1, half-wave=3600.0 mm, share=0.852, dominant
+#: Mode 71: eigenvalue=707.52, n=2, half-wave=1800.0 mm, share=0.486, mixed
+#: Mode 72: eigenvalue=708.58, n=29, half-wave=124.137931034483 mm, share=0.497, mixed
+#: Mode 73: eigenvalue=708.58, n=29, half-wave=124.137931034483 mm, share=0.497, mixed
+#: Mode 74: eigenvalue=708.65, n=30, half-wave=120.0 mm, share=0.420, mixed
+#: Mode 75: eigenvalue=708.65, n=30, half-wave=120.0 mm, share=0.420, mixed
+#: Mode 76: eigenvalue=709.43, n=32, half-wave=112.5 mm, share=0.302, mixed
+#: Mode 77: eigenvalue=709.59, n=1, half-wave=3600.0 mm, share=0.915, dominant
+#: Mode 78: eigenvalue=710.61, n=28, half-wave=128.571428571429 mm, share=0.362, mixed
+#: Mode 79: eigenvalue=710.61, n=28, half-wave=128.571428571429 mm, share=0.362, mixed
+#: Mode 80: eigenvalue=711.07, n=27, half-wave=133.333333333333 mm, share=0.393, mixed
+#: Mode 81: eigenvalue=711.07, n=27, half-wave=133.333333333333 mm, share=0.393, mixed
+#: Mode 82: eigenvalue=713.14, n=1, half-wave=3600.0 mm, share=0.452, mixed
+#: Mode 83: eigenvalue=713.14, n=1, half-wave=3600.0 mm, share=0.452, mixed
+#: Mode 84: eigenvalue=713.36, n=1, half-wave=3600.0 mm, share=0.472, mixed
+#: Mode 85: eigenvalue=713.82, n=26, half-wave=138.461538461538 mm, share=0.499, mixed
+#: Mode 86: eigenvalue=713.82, n=26, half-wave=138.461538461538 mm, share=0.499, mixed
+#: Mode 87: eigenvalue=716.31, n=1, half-wave=3600.0 mm, share=0.649, mixed
+#: Mode 88: eigenvalue=716.31, n=1, half-wave=3600.0 mm, share=0.649, mixed
+#: Mode 89: eigenvalue=716.48, n=33, half-wave=109.090909090909 mm, share=0.323, mixed
+#: Mode 90: eigenvalue=717.28, n=32, half-wave=112.5 mm, share=0.373, mixed
+#: Mode 91: eigenvalue=717.28, n=32, half-wave=112.5 mm, share=0.373, mixed
+#: Mode 92: eigenvalue=717.33, n=30, half-wave=120.0 mm, share=0.522, mixed
+#: Mode 93: eigenvalue=717.5, n=29, half-wave=124.137931034483 mm, share=0.340, mixed
+#: Mode 94: eigenvalue=719.19, n=24, half-wave=150.0 mm, share=0.510, mixed
+#: Mode 95: eigenvalue=719.19, n=24, half-wave=150.0 mm, share=0.510, mixed
+#: Mode 96: eigenvalue=720.74, n=29, half-wave=124.137931034483 mm, share=0.244, mixed
+#: Mode 97: eigenvalue=720.97, n=2, half-wave=1800.0 mm, share=0.648, mixed
+#: Mode 98: eigenvalue=721.2, n=28, half-wave=128.571428571429 mm, share=0.455, mixed
+#: Mode 99: eigenvalue=723.47, n=1, half-wave=3600.0 mm, share=0.837, dominant
+#: Mode 100: eigenvalue=723.47, n=1, half-wave=3600.0 mm, share=0.837, dominant
+#: Mode 101: eigenvalue=723.66, n=22, half-wave=163.636363636364 mm, share=0.454, mixed
+#: Mode 102: eigenvalue=724.87, n=36, half-wave=100.0 mm, share=0.288, mixed
+#: Mode 103: eigenvalue=724.87, n=36, half-wave=100.0 mm, share=0.288, mixed
+#: Mode 104: eigenvalue=724.93, n=1, half-wave=3600.0 mm, share=0.400, mixed
+#: Mode 105: eigenvalue=724.93, n=1, half-wave=3600.0 mm, share=0.400, mixed
+#: Mode 106: eigenvalue=725.34, n=32, half-wave=112.5 mm, share=0.213, mixed
+#: Mode 107: eigenvalue=725.34, n=1, half-wave=3600.0 mm, share=0.846, dominant
+#: Mode 108: eigenvalue=725.63, n=27, half-wave=133.333333333333 mm, share=0.474, mixed
+#: Mode 109: eigenvalue=727.42, n=18, half-wave=200.0 mm, share=0.247, mixed
+#: Mode 110: eigenvalue=727.83, n=1, half-wave=3600.0 mm, share=0.981, dominant
+#: Mode 111: eigenvalue=727.83, n=1, half-wave=3600.0 mm, share=0.981, dominant
+#: Mode 112: eigenvalue=729.08, n=36, half-wave=100.0 mm, share=0.390, mixed
+#: Mode 113: eigenvalue=729.59, n=37, half-wave=97.2972972972973 mm, share=0.249, mixed
+#: Mode 114: eigenvalue=729.93, n=26, half-wave=138.461538461538 mm, share=0.371, mixed
+#: Mode 115: eigenvalue=731.37, n=25, half-wave=144.0 mm, share=0.362, mixed
+#: Mode 116: eigenvalue=731.78, n=22, half-wave=163.636363636364 mm, share=0.474, mixed
+#: Mode 117: eigenvalue=731.78, n=22, half-wave=163.636363636364 mm, share=0.474, mixed
+#: Mode 118: eigenvalue=733.95, n=34, half-wave=105.882352941176 mm, share=0.450, mixed
+#: Mode 119: eigenvalue=733.95, n=34, half-wave=105.882352941176 mm, share=0.450, mixed
+#: Mode 120: eigenvalue=734.57, n=13, half-wave=276.923076923077 mm, share=0.236, mixed
+#: Mode 121: eigenvalue=734.96, n=21, half-wave=171.428571428571 mm, share=0.521, mixed
+#: Mode 122: eigenvalue=736.28, n=24, half-wave=150.0 mm, share=0.403, mixed
+#: Mode 123: eigenvalue=736.62, n=1, half-wave=3600.0 mm, share=0.651, mixed
+#: Mode 124: eigenvalue=736.62, n=1, half-wave=3600.0 mm, share=0.651, mixed
+#: Mode 125: eigenvalue=740, n=15, half-wave=240.0 mm, share=0.305, mixed
+#: Mode 126: eigenvalue=740.68, n=1, half-wave=3600.0 mm, share=0.320, mixed
+#: Mode 127: eigenvalue=741.28, n=22, half-wave=163.636363636364 mm, share=0.341, mixed
+#: Mode 128: eigenvalue=742.76, n=1, half-wave=3600.0 mm, share=0.630, mixed
+#: Mode 129: eigenvalue=742.76, n=1, half-wave=3600.0 mm, share=0.630, mixed
+#: Mode 130: eigenvalue=743.8, n=16, half-wave=225.0 mm, share=0.352, mixed
+#: Mode 131: eigenvalue=744.21, n=18, half-wave=200.0 mm, share=0.470, mixed
+#: Mode 132: eigenvalue=744.21, n=18, half-wave=200.0 mm, share=0.470, mixed
+#: Mode 133: eigenvalue=744.41, n=1, half-wave=3600.0 mm, share=0.367, mixed
+#: Mode 134: eigenvalue=745.02, n=18, half-wave=200.0 mm, share=0.547, mixed
+#: Mode 135: eigenvalue=745.91, n=18, half-wave=200.0 mm, share=0.831, dominant
+#: Mode 136: eigenvalue=746.1, n=1, half-wave=3600.0 mm, share=0.720, dominant
+#: Mode 137: eigenvalue=746.92, n=2, half-wave=1800.0 mm, share=0.452, mixed
+#: Mode 138: eigenvalue=750.42, n=18, half-wave=200.0 mm, share=0.327, mixed
+#: Mode 139: eigenvalue=750.42, n=18, half-wave=200.0 mm, share=0.327, mixed
+#: Mode 140: eigenvalue=751.86, n=36, half-wave=100.0 mm, share=0.354, mixed
+#: Mode 141: eigenvalue=752.37, n=1, half-wave=3600.0 mm, share=0.395, mixed
+#: Mode 142: eigenvalue=752.88, n=1, half-wave=3600.0 mm, share=0.616, mixed
+#: Mode 143: eigenvalue=755.3, n=1, half-wave=3600.0 mm, share=0.946, dominant
+#: Mode 144: eigenvalue=755.3, n=1, half-wave=3600.0 mm, share=0.946, dominant
+#: Mode 145: eigenvalue=756.5, n=2, half-wave=1800.0 mm, share=0.368, mixed
+#: Mode 146: eigenvalue=756.5, n=2, half-wave=1800.0 mm, share=0.368, mixed
+#: Mode 147: eigenvalue=757.45, n=2, half-wave=1800.0 mm, share=0.346, mixed
+#: Mode 148: eigenvalue=761.32, n=2, half-wave=1800.0 mm, share=0.384, mixed
+#: Mode 149: eigenvalue=764.29, n=2, half-wave=1800.0 mm, share=0.285, mixed
+#: Mode 150: eigenvalue=771.2, n=1, half-wave=3600.0 mm, share=0.679, mixed
+#: Mode 151: eigenvalue=771.2, n=1, half-wave=3600.0 mm, share=0.679, mixed
+#: Mode 152: eigenvalue=771.35, n=2, half-wave=1800.0 mm, share=0.605, mixed
+#: Mode 153: eigenvalue=771.75, n=39, half-wave=92.3076923076923 mm, share=0.360, mixed
+#: Mode 154: eigenvalue=772.74, n=2, half-wave=1800.0 mm, share=0.421, mixed
+#: Mode 155: eigenvalue=772.74, n=2, half-wave=1800.0 mm, share=0.421, mixed
+#: Mode 156: eigenvalue=778.24, n=1, half-wave=3600.0 mm, share=0.530, mixed
+#: Mode 157: eigenvalue=780.04, n=39, half-wave=92.3076923076923 mm, share=0.373, mixed
+#: Mode 158: eigenvalue=783.52, n=2, half-wave=1800.0 mm, share=0.388, mixed
+#: Mode 159: eigenvalue=783.52, n=2, half-wave=1800.0 mm, share=0.388, mixed
+#: Mode 160: eigenvalue=784.51, n=1, half-wave=3600.0 mm, share=0.914, dominant
+#: Mode 161: eigenvalue=784.51, n=1, half-wave=3600.0 mm, share=0.914, dominant
+#: Mode 162: eigenvalue=786.04, n=40, half-wave=90.0 mm, share=0.286, mixed
+#: Mode 163: eigenvalue=788.87, n=3, half-wave=1200.0 mm, share=0.338, mixed
+#: Mode 164: eigenvalue=789.19, n=2, half-wave=1800.0 mm, share=0.473, mixed
+#: Mode 165: eigenvalue=796.51, n=1, half-wave=3600.0 mm, share=0.902, dominant
+#: Mode 166: eigenvalue=796.51, n=1, half-wave=3600.0 mm, share=0.902, dominant
+#: Mode 167: eigenvalue=797.63, n=40, half-wave=90.0 mm, share=0.542, mixed
+#: Mode 168: eigenvalue=798.35, n=19, half-wave=189.473684210526 mm, share=0.256, mixed
+#: Mode 169: eigenvalue=800.53, n=40, half-wave=90.0 mm, share=0.335, mixed
+#: Mode 170: eigenvalue=800.53, n=40, half-wave=90.0 mm, share=0.335, mixed
+#: Mode 171: eigenvalue=802.4, n=3, half-wave=1200.0 mm, share=0.413, mixed
+#: Mode 172: eigenvalue=803.78, n=40, half-wave=90.0 mm, share=0.240, mixed
+#: Mode 173: eigenvalue=810.5, n=40, half-wave=90.0 mm, share=0.192, mixed
+#: Mode 174: eigenvalue=813.05, n=40, half-wave=90.0 mm, share=0.407, mixed
+#: Mode 175: eigenvalue=813.05, n=40, half-wave=90.0 mm, share=0.407, mixed
+#: Mode 176: eigenvalue=815.64, n=1, half-wave=3600.0 mm, share=0.996, dominant
+#: Mode 177: eigenvalue=815.64, n=1, half-wave=3600.0 mm, share=0.996, dominant
+#: Mode 178: eigenvalue=815.82, n=41, half-wave=87.8048780487805 mm, share=0.608, mixed
+#: Mode 179: eigenvalue=817.72, n=40, half-wave=90.0 mm, share=0.416, mixed
+#: Mode 180: eigenvalue=818.1, n=41, half-wave=87.8048780487805 mm, share=0.261, mixed
+#: Mode 181: eigenvalue=818.9, n=1, half-wave=3600.0 mm, share=0.996, dominant
+#: Mode 182: eigenvalue=818.9, n=1, half-wave=3600.0 mm, share=0.996, dominant
+#: Mode 183: eigenvalue=826.35, n=41, half-wave=87.8048780487805 mm, share=0.383, mixed
+#: Mode 184: eigenvalue=830.2, n=1, half-wave=3600.0 mm, share=0.910, dominant
+#: Mode 185: eigenvalue=830.2, n=1, half-wave=3600.0 mm, share=0.910, dominant
+#: Mode 186: eigenvalue=834.37, n=41, half-wave=87.8048780487805 mm, share=0.421, mixed
+#: Mode 187: eigenvalue=834.43, n=42, half-wave=85.7142857142857 mm, share=0.347, mixed
+#: Mode 188: eigenvalue=834.82, n=42, half-wave=85.7142857142857 mm, share=0.638, mixed
+#: Mode 189: eigenvalue=835.22, n=42, half-wave=85.7142857142857 mm, share=0.516, mixed
+#: Mode 190: eigenvalue=835.22, n=42, half-wave=85.7142857142857 mm, share=0.516, mixed
+#: Mode 191: eigenvalue=844.1, n=42, half-wave=85.7142857142857 mm, share=0.455, mixed
+#: Mode 192: eigenvalue=847.33, n=42, half-wave=85.7142857142857 mm, share=0.420, mixed
+#: Mode 193: eigenvalue=847.33, n=42, half-wave=85.7142857142857 mm, share=0.420, mixed
+#: Mode 194: eigenvalue=851.81, n=42, half-wave=85.7142857142857 mm, share=0.409, mixed
+#: Mode 195: eigenvalue=852.18, n=43, half-wave=83.7209302325581 mm, share=0.367, mixed
+#: Mode 196: eigenvalue=854.2, n=43, half-wave=83.7209302325581 mm, share=0.432, mixed
+#: Mode 197: eigenvalue=854.2, n=43, half-wave=83.7209302325581 mm, share=0.432, mixed
+#: Mode 198: eigenvalue=854.58, n=43, half-wave=83.7209302325581 mm, share=0.630, mixed
+#: Mode 199: eigenvalue=862.89, n=43, half-wave=83.7209302325581 mm, share=0.507, mixed
+#: Mode 200: eigenvalue=865.26, n=43, half-wave=83.7209302325581 mm, share=0.311, mixed
+#: Mode 201: eigenvalue=865.26, n=43, half-wave=83.7209302325581 mm, share=0.311, mixed
+#: Mode 202: eigenvalue=869.5, n=43, half-wave=83.7209302325581 mm, share=0.382, mixed
+#: Mode 203: eigenvalue=870.43, n=44, half-wave=81.8181818181818 mm, share=0.343, mixed
+#: Mode 204: eigenvalue=873.32, n=44, half-wave=81.8181818181818 mm, share=0.446, mixed
+#: Mode 205: eigenvalue=873.32, n=44, half-wave=81.8181818181818 mm, share=0.446, mixed
+#: Mode 206: eigenvalue=874.73, n=44, half-wave=81.8181818181818 mm, share=0.588, mixed
+#: Mode 207: eigenvalue=882.73, n=44, half-wave=81.8181818181818 mm, share=0.591, mixed;poor_fit
+#: Mode 208: eigenvalue=883.83, n=44, half-wave=81.8181818181818 mm, share=0.472, mixed;poor_fit
+#: Mode 209: eigenvalue=883.83, n=44, half-wave=81.8181818181818 mm, share=0.472, mixed;poor_fit
+#: Mode 210: eigenvalue=887.18, n=44, half-wave=81.8181818181818 mm, share=0.370, mixed;poor_fit
+#: Mode 211: eigenvalue=888.85, n=45, half-wave=80.0 mm, share=0.305, mixed;spectral_limit
+#: Mode 212: eigenvalue=892.13, n=45, half-wave=80.0 mm, share=0.361, mixed;spectral_limit
+#: Mode 213: eigenvalue=892.13, n=45, half-wave=80.0 mm, share=0.361, mixed;spectral_limit
+#: Mode 214: eigenvalue=894.62, n=45, half-wave=80.0 mm, share=0.487, mixed;spectral_limit
+#: Mode 215: eigenvalue=903.5, n=45, half-wave=80.0 mm, share=0.629, mixed;poor_fit;spectral_limit
+#: Mode 216: eigenvalue=903.53, n=45, half-wave=80.0 mm, share=0.504, mixed;poor_fit;spectral_limit
+#: Mode 217: eigenvalue=903.53, n=45, half-wave=80.0 mm, share=0.504, mixed;poor_fit;spectral_limit
+#: Mode 218: eigenvalue=905.16, n=45, half-wave=80.0 mm, share=0.371, mixed;poor_fit;spectral_limit
+#: Mode 219: eigenvalue=907.24, n=8, half-wave=450.0 mm, share=0.293, mixed;poor_fit
+#: Mode 220: eigenvalue=910.07, n=17, half-wave=211.764705882353 mm, share=0.596, mixed
+#: Mode 221: eigenvalue=910.58, n=8, half-wave=450.0 mm, share=0.259, mixed;poor_fit
+#: Mode 222: eigenvalue=910.58, n=8, half-wave=450.0 mm, share=0.259, mixed;poor_fit
+#: Mode 223: eigenvalue=913.79, n=10, half-wave=360.0 mm, share=0.271, mixed;poor_fit
+#: Mode 224: eigenvalue=923.73, n=16, half-wave=225.0 mm, share=0.196, mixed;poor_fit
+#: Mode 225: eigenvalue=923.95, n=10, half-wave=360.0 mm, share=0.341, mixed;poor_fit
+#: Mode 226: eigenvalue=923.95, n=10, half-wave=360.0 mm, share=0.341, mixed;poor_fit
+#: Mode 227: eigenvalue=924.74, n=10, half-wave=360.0 mm, share=0.388, mixed;poor_fit
+#: Mode 228: eigenvalue=925.5, n=9, half-wave=400.0 mm, share=0.321, mixed;poor_fit
+#: Mode 229: eigenvalue=928.66, n=9, half-wave=400.0 mm, share=0.286, mixed;poor_fit
+#: Mode 230: eigenvalue=928.66, n=9, half-wave=400.0 mm, share=0.286, mixed;poor_fit
+#: Mode 231: eigenvalue=929.65, n=16, half-wave=225.0 mm, share=0.796, dominant
+#: Mode 232: eigenvalue=932.51, n=11, half-wave=327.272727272727 mm, share=0.241, mixed;poor_fit
+#: Mode 233: eigenvalue=941.29, n=17, half-wave=211.764705882353 mm, share=0.592, mixed;poor_fit
+#: Mode 234: eigenvalue=941.29, n=17, half-wave=211.764705882353 mm, share=0.592, mixed;poor_fit
+#: Mode 235: eigenvalue=942.7, n=11, half-wave=327.272727272727 mm, share=0.346, mixed;poor_fit
+#: Mode 236: eigenvalue=943.74, n=10, half-wave=360.0 mm, share=0.516, mixed;poor_fit
+#: Mode 237: eigenvalue=944.67, n=17, half-wave=211.764705882353 mm, share=0.340, mixed;poor_fit
+#: Mode 238: eigenvalue=944.67, n=17, half-wave=211.764705882353 mm, share=0.340, mixed;poor_fit
+#: Mode 239: eigenvalue=945.86, n=11, half-wave=327.272727272727 mm, share=0.487, mixed;poor_fit
+#: Mode 240: eigenvalue=946.47, n=10, half-wave=360.0 mm, share=0.410, mixed;poor_fit
+#: Mode 241: eigenvalue=946.47, n=10, half-wave=360.0 mm, share=0.410, mixed;poor_fit
+#: Mode 242: eigenvalue=950.63, n=12, half-wave=300.0 mm, share=0.335, mixed;poor_fit
+#: Mode 243: eigenvalue=953.88, n=15, half-wave=240.0 mm, share=0.878, poor_fit
+#: Mode 244: eigenvalue=960.51, n=12, half-wave=300.0 mm, share=0.578, mixed;poor_fit
+#: Mode 245: eigenvalue=961.51, n=16, half-wave=225.0 mm, share=0.760, poor_fit
+#: Mode 246: eigenvalue=961.51, n=16, half-wave=225.0 mm, share=0.760, poor_fit
+#: Mode 247: eigenvalue=962.01, n=11, half-wave=327.272727272727 mm, share=0.483, mixed;poor_fit
+#: Mode 248: eigenvalue=964.41, n=11, half-wave=327.272727272727 mm, share=0.405, mixed;poor_fit
+#: Mode 249: eigenvalue=964.41, n=11, half-wave=327.272727272727 mm, share=0.405, mixed;poor_fit
+#: Mode 250: eigenvalue=964.66, n=16, half-wave=225.0 mm, share=0.596, mixed;poor_fit
+#: Written: D:\CFS-Column\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15\BU_BOLT_L3600_M20_modal_wavelengths [.csv, _spectra.csv, .png, _report.json]
+#: [15:47:23] 4/4 ENHANCED: mode families, spectra, envelopes and interactive report.
+#: Model: D:/CFS-Column/A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15/BU_BOLT_L3600_M20.odb
+#: Number of Assemblies:         1
+#: Number of Assembly instances: 0
+#: Number of Part instances:     4
+#: Number of Meshes:             4
+#: Number of Element Sets:       9
+#: Number of Node Sets:          162
+#: Number of Steps:              1
+#: Enhanced section diagnostics: 50/250 modes
+#: Enhanced section diagnostics: 100/250 modes
+#: Enhanced section diagnostics: 150/250 modes
+#: Enhanced section diagnostics: 200/250 modes
+#: Enhanced section diagnostics: 250/250 modes
+#: ENHANCED COMPLETE: 250 modes; D:\CFS-Column\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15\BU_BOLT_L3600_M20_modal_wavelengths_enhanced.html
+#: [15:47:31] COMPLETE: D:\CFS-Column\A4784_t4_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15
+print('RT script done')
+#: RT script done

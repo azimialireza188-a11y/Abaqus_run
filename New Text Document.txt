@@ -1,0 +1,31 @@
+cd /d "D:\CFS-Column\New folder (5)"
+abaqus cae noGUI=abaqus_complete_model_m20.py
+
+
+cd /d "D:\CFS-Column\New folder (5)"
+abaqus python abaqus_modal_wavelengths.py BU_BOLT_L3600_M20.odb --modes 100 --sigma-ref 1
+
+cd /d "C:\Users\810200014.HAMI.000\Documents\CUFSM-Single\Abaqus_run"
+abaqus cae noGUI=abaqus_complete_model_m20.py -- ^
+  --builtup-dir "C:\Users\810200014.HAMI.000\Documents\CUFSM-Single\cfs_abaqus\A4784_t2_qm1_0_0_0_R8_lipR20t_lipLen60_M80_L3600_gap10_nb25_end25-25_row15" ^
+  --mesh-mm 20 ^
+  --n-modes 250 ^
+  --n-vectors 500 ^
+  --max-iterations 1250
+
+
+
+
+cd /d "D:\CFS-Column\New folder (6)"
+
+abaqus cae noGUI=abaqus_complete_model_m20.py -- ^
+  --builtup-dir "C:\Users\810200014.HAMI.000\Documents\CUFSM-Single\cfs_abaqus\A4784_t3_qm1_0_0_0_R2p5_lipS_lipLen60_M80_L3600_gap10_nb19_end25-25_row15" ^
+  --output-root "D:\CFS-Column\New folder (10)" ^
+  --mesh-mm 5 ^
+  --n-modes 250 ^
+  --n-vectors 500 ^
+  --max-iterations 1250 ^
+  --cpus 8 ^
+  --buckle-output detailed ^
+  --nodal-precision full ^
+  --modal-audit
