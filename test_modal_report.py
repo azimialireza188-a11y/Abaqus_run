@@ -14,17 +14,24 @@ class ModalReportTests(unittest.TestCase):
         shares = self.fit.shares(u[None, :, :])
         self.assertAlmostEqual(shares[0], 1., places=10)
 
-    def test_plate_bending_residual_is_local_like(self):
+    def test_plate_bending_with_fixed_fold_lines_is_local_like(self):
+        # End anchors do not translate.  A nonzero panel mean must no longer be
+        # misread as whole-section rigid translation.
         u = np.zeros((9, 2))
         u[:, 1] = np.sin(np.linspace(0, np.pi, 9))
-        y = u.ravel()
-        y -= self.fit.qglobal.dot(self.fit.qglobal.T.dot(y))
-        self.assertAlmostEqual(self.fit.shares(y.reshape(1, 9, 2))[2], 1., places=10)
+        shares = self.fit.shares(u[None, :, :])
+        self.assertGreater(shares[2], .999999)
+        self.assertLess(shares[0], 1e-10)
+        self.assertLess(shares[1], 1e-10)
 
-    def test_section_stretch_is_only_a_distortional_proxy(self):
-        # This deliberate limitation must remain documented: no cFSM strain constraints.
+    def test_section_stretch_is_other_not_distortional(self):
+        # Chord extension is a non-DSM Other/ST-like motion, not D.
         u = np.column_stack((self.xy[:, 0]-5., np.zeros(9)))
-        self.assertAlmostEqual(self.fit.shares(u[None, :, :])[1], 1., places=10)
+        d = self.fit.component_diagnostics(u[None, :, :])
+        self.assertGreater(d['other_percent'], 99.999)
+        self.assertLess(d['distortional_percent'], 1e-8)
+        self.assertEqual(report.family_label(self.fit.shares(u[None, :, :]), self.fit.supported,
+                                             other_percent=d['other_percent']), 'Other-like')
 
     def test_shares_are_scale_sign_invariant_and_sum_to_one(self):
         rng = np.random.RandomState(4)
@@ -37,16 +44,54 @@ class ModalReportTests(unittest.TestCase):
         self.assertEqual(report.family_label([.1, .1, .8], False), 'Unresolved')
         self.assertEqual(report.family_label([.9, .05, .05], False), 'Global-like')
 
-    def test_curved_panel_gets_explicit_proxy_warning(self):
+    def test_curved_mesh_without_physical_walls_is_conservative(self):
         xy = self.xy.copy()
         xy[:, 1] = .04*(xy[:, 0]-5.)**2
         fit = report.SectionProjector(xy, self.edges, ['P']*9, np.ones(9))
-        self.assertTrue(fit.supported)
-        self.assertTrue(fit.metadata['curved_panel_proxy'])
-        np.testing.assert_allclose(fit.qglobal.T.dot(fit.qdist), 0., atol=1e-10)
+        self.assertEqual(fit.metadata['wall_source'], 'mesh_straight_runs')
+        self.assertTrue(fit.metadata['curved_panel_proxy'] or not fit.supported)
+
+    def test_physical_wall_geometry_overrides_radius_mesh_bias(self):
+        # Two long physical walls connected by a short radius-like transition.
+        xy = np.array([[0.,0.],[2.5,0.],[5.,0.],[7.5,0.],[10.,0.],
+                       [10.7,.3],[11.,1.],[11.,3.],[11.,5.],[11.,7.],[11.,9.]])
+        edges=[(i,i+1) for i in range(len(xy)-1)]
+        segs={'P': [[0.,0.,10.,0.],
+                    [10.,0.,10.7,.3],[10.7,.3,11.,1.],
+                    [11.,1.,11.,9.]]}
+        fit=report.SectionProjector(xy,edges,['P']*len(xy),np.ones(len(xy)),
+                                    physical_segments=segs)
+        self.assertEqual(fit.metadata['wall_source'],'builtup_segments.csv')
+        self.assertGreaterEqual(fit.metadata['physical_wall_count'],2)
+        # Local bending on the first wall with moving end folds must remain Local.
+        u=np.zeros((len(xy),2))
+        t=np.linspace(0.,1.,5)
+        u[:5,1]=.2*t + np.sin(np.pi*t)
+        d=fit.component_diagnostics(u)
+        self.assertGreater(d['local_percent'],50.)
+        self.assertGreater(d['wall_curvature_index'],0.)
+
+    def test_linear_moving_chord_is_not_local(self):
+        u=np.zeros((9,2))
+        u[:,1]=np.linspace(-2.,3.,9)
+        d=self.fit.component_diagnostics(u)
+        self.assertLess(d['local_percent'],1e-8)
 
     def test_mixed_family_is_not_longitudinal_mixing(self):
         self.assertEqual(report.family_label([.4, .3, .3], True), 'Mixed')
+
+    def test_piece_rigid_motion_is_assembly_not_distortional(self):
+        xy = np.array([[0., 0.], [.5, 0.], [1., 0.],
+                       [0., 2.], [.5, 2.], [1., 2.]])
+        edges = [(0, 1), (1, 2), (3, 4), (4, 5)]
+        fit = report.SectionProjector(xy, edges, ['A']*3+['B']*3, np.ones(6))
+        # Opposite normal translations of the two pieces cannot be represented
+        # by one whole-section rigid motion.
+        u = np.array([[0., 1.]]*3+[[0., -1.]]*3)
+        d = fit.component_diagnostics(u)
+        self.assertGreater(d['assembly_percent'], 99.999)
+        self.assertEqual(report.family_label(fit.shares(u), fit.supported,
+                                             assembly_percent=d['assembly_percent']), 'Assembly-like')
 
     def test_envelope_uses_positive_dominant_samples_only(self):
         rows = [dict(mode=1, dominant_halfwaves=2, eigenvalue=10., quality_ok=True),

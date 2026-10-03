@@ -12,6 +12,30 @@ import abaqus_complete_model_m20 as builder
 
 
 class PipelineTests(unittest.TestCase):
+    def test_automatic_pipeline_has_no_shell_energy_stage(self):
+        self.assertFalse(hasattr(builder, 'complete_shell_report'))
+        with open(builder.__file__) as stream:
+            source = stream.read()
+        self.assertNotIn('ModalShellDiagnostics', source)
+        self.assertNotIn("variables=('S', 'E', 'SF', 'SE')", source)
+        self.assertNotIn('abaqus_modal_shell_energy', source)
+
+    def test_legacy_detailed_flag_is_accepted_but_classification_pipeline_stays_lean(self):
+        args = builder.parse_arguments(['--buckle-output', 'detailed', '--modal-audit'])
+        self.assertEqual(args.buckle_output, 'detailed')
+        self.assertEqual(args.nodal_precision, 'full')
+        self.assertTrue(args.modal_audit)
+        self.assertEqual(builder.parse_arguments(['--nodal-precision', 'single']).nodal_precision, 'single')
+
+    def test_full_run_command_accepts_longitudinal_lines_with_modal_options(self):
+        args = builder.parse_arguments(['--mesh-mm', '5', '--n-modes', '250',
+            '--n-vectors', '500', '--max-iterations', '1250', '--cpus', '8',
+            '--buckle-output', 'detailed', '--nodal-precision', 'full',
+            '--longitudinal-lines', '2', '--modal-audit'])
+        self.assertEqual(args.longitudinal_lines, 2)
+        self.assertEqual((args.buckle_output, args.nodal_precision), ('detailed', 'full'))
+        self.assertTrue(args.modal_audit)
+
     def test_output_root_uses_input_folder_name_and_preserves_previous_run(self):
         with tempfile.TemporaryDirectory() as root:
             args = builder.parse_arguments(['--builtup-dir', os.path.join(root, 'input', 'Section M80'),
@@ -117,6 +141,25 @@ class PipelineTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     builder.parse_arguments(options)
 
+    def test_input_summary_persists_physical_section_segments(self):
+        pieces = {
+            1: [(0., 0., 10., 0.)],
+            2: [(0., 0., 0., 10.)],
+            3: [(0., 0., -10., 0.)],
+            4: [(0., 0., 0., -10.)],
+        }
+        member = dict(L_mm='3600', gap_mm='10', bolt_row_mm='15')
+        data = (pieces, 3.0, 200000.0, 0.3,
+                [[1., 1., 2., 0., 0., 10., 0.],
+                 [2., 2., 3., 0., 0., 10., 0.],
+                 [3., 3., 4., 0., 0., 10., 0.],
+                 [4., 4., 1., 0., 0., 10., 0.]],
+                [25., 225.], member)
+        with mock.patch.object(builder, 'BUILTUP_DIR', os.path.abspath('source')):
+            summary = builder.input_summary(data)
+        self.assertEqual(sorted(summary['section_segments']), ['P1', 'P2', 'P3', 'P4'])
+        self.assertEqual(summary['section_segments']['P1'][0], [0., 0., 10., 0.])
+
     def test_postprocessing_uses_this_run_and_all_modes(self):
         report = dict(odb=os.path.abspath('new run/model.odb'), reference_stress_MPa=1.0)
         argv = builder.postprocess_arguments(report)
@@ -161,20 +204,30 @@ class PipelineTests(unittest.TestCase):
                             stream.write('test boundary placeholder')
                         with open(self.name+'.sta', 'w') as stream:
                             stream.write('THE ANALYSIS HAS COMPLETED SUCCESSFULLY')
-            def fake_build(inputs, cpus):
+            def fake_build(inputs, cpus, buckle_output='standard', nodal_precision='full'):
+                self.assertEqual(builder.LONGITUDINAL_LINES, 2)
+                self.assertEqual((buckle_output, nodal_precision), ('detailed', 'full'))
                 self.assertEqual((builder.MESH_MM, builder.N_MODES, builder.N_VECTORS,
                                   builder.MAX_ITERATIONS), (12.5, 100, 200, 400))
                 self.assertEqual(builder.BUILTUP_DIR, os.path.abspath(root))
                 return FakeJob(), dict(odb=os.path.abspath('CurrentRun.odb'), reference_stress_MPa=1.)
             argv = ['--builtup-dir', root, '--output-dir', output, '--mesh-mm', '12.5',
-                    '--n-modes', '100', '--n-vectors', '200', '--max-iterations', '400']
+                    '--n-modes', '100', '--n-vectors', '200', '--max-iterations', '400',
+                    '--longitudinal-lines', '2', '--buckle-output', 'detailed',
+                    '--nodal-precision', 'full', '--modal-audit']
             defaults = {k: getattr(builder, k) for k in
-                ('BUILTUP_DIR', 'MESH_MM', 'N_MODES', 'N_VECTORS', 'MAX_ITERATIONS')}
+                ('BUILTUP_DIR', 'MESH_MM', 'N_MODES', 'N_VECTORS', 'MAX_ITERATIONS',
+                 'LONGITUDINAL_LINES')}
+            def fake_audit(run_dir):
+                self.assertEqual(run_dir, output)
+                self.assertTrue(os.path.isfile(os.path.join(run_dir, 'enhanced_called.txt')))
+                return {'status': 'audit_boundary_complete'}
             with mock.patch.dict(builder.__dict__, defaults), \
                  mock.patch.object(builder, 'SCRIPT_DIR', root), \
                  mock.patch.object(builder, 'read_model_inputs', return_value=()), \
                  mock.patch.object(builder, 'input_summary', return_value={}), \
                  mock.patch.object(builder, 'build', side_effect=fake_build), \
+                 mock.patch.object(builder, 'run_modal_audit', side_effect=fake_audit), \
                  mock.patch.dict(sys.modules, {'abaqusConstants': types.SimpleNamespace(ON=True)}), \
                  contextlib.redirect_stdout(io.StringIO()):
                 if final_status in ('COMPLETED', None):
@@ -187,6 +240,8 @@ class PipelineTests(unittest.TestCase):
             if final_status in ('COMPLETED', None):
                 self.assertEqual(state['status'], 'COMPLETED')
                 self.assertEqual(state['enhanced_report']['processed_modes'], 100)
+                self.assertEqual(state['settings']['longitudinal_lines'], 2)
+                self.assertEqual(state['modal_audit']['status'], 'audit_boundary_complete')
                 self.assertTrue(os.path.isfile(os.path.join(output, 'enhanced_called.txt')))
                 with open(os.path.join(output, 'post_called.txt')) as stream:
                     self.assertEqual(stream.read(), os.path.join(output, 'CurrentRun.odb'))
@@ -209,7 +264,7 @@ class PipelineTests(unittest.TestCase):
              mock.patch.object(builder, 'read_model_inputs', side_effect=AssertionError('Unexpected CSV read')), \
              mock.patch.object(builder, 'build', side_effect=AssertionError('Unexpected rebuild')):
             self.assertEqual(builder.main(['--resume-post', 'previous run']), 'recovered')
-            resume.assert_called_once_with('previous run')
+            resume.assert_called_once_with('previous run', modal_audit=False)
 
 
 if __name__ == '__main__':

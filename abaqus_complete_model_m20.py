@@ -9,6 +9,9 @@ Recover an existing run without solving again:
 abaqus python abaqus_complete_model_m20.py --resume-post "existing run folder"
 Postprocessing uses abaqus_modal_wavelengths.py and then abaqus_modal_report.py
 beside this script. Keep all three files together when moving the workflow.
+The automatic buckling pipeline stores only the nodal mode-shape output needed
+for wavelength/family classification; shell S/E/SF/SE energy fields are not
+requested because they do not participate in the current L/D/G classifier.
 Command-line options override the defaults below for the entire pipeline.
 MESH_MM is the target in both directions; bolt rows and ends stay exact.
 BUILTUP_DIR is the source of geometry, material, thickness, member length,
@@ -18,6 +21,12 @@ General contact covers all exterior shell surfaces, including self-contact:
 hard normal contact, frictionless tangential behavior, separation allowed.
 Buckle freezes contact at the base state; it cannot enforce new contact in
 scaled eigenmode plots. Finite-deformation contact requires nonlinear analysis.
+Use --longitudinal-lines 0 for the original simplification (default), 2..99
+for up to that many internal lines per curved region, or 100 for all source
+lines. For 2..99, --longitudinal-line-min-spacing-mm can prevent optional
+added boundaries from becoming too close along the section path. Essential
+boundaries and bolt lines always remain. Lines are selected from the original
+section; no coordinates or radii are changed.
 Set --check-inputs to validate the CSV data without starting Abaqus/CAE.
 """
 import csv
@@ -45,12 +54,23 @@ MESH_MM = 20.0        # target element size (mm), both section and length; e.g. 
 N_MODES = 20          # number of requested buckling modes; e.g. 5, 10, 30 or 50
 N_VECTORS = 60       # vectors used per SUBSPACE iteration
 MAX_ITERATIONS = 300  # iteration limit for SUBSPACE, separate from mode count
+LONGITUDINAL_LINES = 0  # 0: original; 2..99: per curve; 100: all source lines
+LONGITUDINAL_LINE_MIN_SPACING_MM = 0.0  # 0: disabled; applies to optional lines for 2..99
 # Changing settings requires rebuilding the CAE/INP with this script.
 # A finer mesh increases model size; exact bolt locations may require shorter edges.
 # ====================================================================
 
 
 def validate_settings():
+    if (isinstance(LONGITUDINAL_LINES, bool) or
+            not isinstance(LONGITUDINAL_LINES, int) or
+            LONGITUDINAL_LINES not in [0] + list(range(2, 101))):
+        raise ValueError('LONGITUDINAL_LINES must be 0 or an integer from 2 to 100')
+    if (isinstance(LONGITUDINAL_LINE_MIN_SPACING_MM, bool) or
+            not isinstance(LONGITUDINAL_LINE_MIN_SPACING_MM, (int, float)) or
+            not math.isfinite(LONGITUDINAL_LINE_MIN_SPACING_MM) or
+            LONGITUDINAL_LINE_MIN_SPACING_MM < 0):
+        raise ValueError('LONGITUDINAL_LINE_MIN_SPACING_MM must be a finite nonnegative number')
     if (isinstance(MESH_MM, bool) or not isinstance(MESH_MM, (int, float)) or
             not MESH_MM > 0 or math.isinf(MESH_MM)):
         raise ValueError('MESH_MM must be a positive finite number in mm')
@@ -83,20 +103,39 @@ def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--builtup-dir', default=BUILTUP_DIR, help='Source CUFSM CSV directory')
     parser.add_argument('--mesh-mm', type=float, default=MESH_MM)
+    parser.add_argument('--longitudinal-lines', type=int, default=LONGITUDINAL_LINES,
+        help='0: original simplification; 2..99: internal lines per curved region; '
+             '100: retain all source lines (essential and bolt lines always remain)')
+    parser.add_argument('--longitudinal-line-min-spacing-mm', type=float,
+        default=LONGITUDINAL_LINE_MIN_SPACING_MM,
+        help='Minimum section-path spacing for optional lines added by --longitudinal-lines 2..99; '
+             '0 disables the filter. Mandatory/bolt boundaries are never removed; 100 still retains all source lines.')
     parser.add_argument('--n-modes', type=int, default=N_MODES)
     parser.add_argument('--n-vectors', type=int, default=None)
     parser.add_argument('--max-iterations', type=int, default=MAX_ITERATIONS)
     parser.add_argument('--cpus', type=int, default=8)
+    parser.add_argument('--buckle-output', choices=('standard', 'detailed'), default='standard',
+                        help='Legacy compatibility option. Automatic buckling now always stores classification-only nodal mode shapes; detailed no longer adds S/E/SF/SE.')
+    parser.add_argument('--nodal-precision', choices=('full', 'single'), default='full',
+                        help='Nodal ODB storage precision; does not change eigensolver accuracy')
     output_options = parser.add_mutually_exclusive_group()
     output_options.add_argument('--output-dir', help='Exact new or empty output directory')
     output_options.add_argument('--output-root',
         help='Parent output directory; creates an input-named child, with _run02 etc. if it exists')
     parser.add_argument('--build-only', action='store_true')
     parser.add_argument('--skip-post', action='store_true', help='Build and solve, without wavelength processing')
+    parser.add_argument('--modal-audit', action='store_true', help='After reports, create the direct-shape audit and graphical explorer')
     parser.add_argument('--check-inputs', action='store_true', help='Validate CSVs and settings only')
     parser.add_argument('--resume-post', metavar='RUN_DIR',
                         help='Verify completed run and postprocess its ODB; never build or submit')
     args = parser.parse_args(argv)
+    if args.longitudinal_lines not in [0] + list(range(2, 101)):
+        parser.error('--longitudinal-lines must be 0 or an integer from 2 to 100')
+    if (not math.isfinite(args.longitudinal_line_min_spacing_mm) or
+            args.longitudinal_line_min_spacing_mm < 0):
+        parser.error('--longitudinal-line-min-spacing-mm must be a finite nonnegative number')
+    if args.modal_audit and args.skip_post:
+        parser.error('--modal-audit requires postprocessing; remove --skip-post')
     if args.resume_post and (args.build_only or args.skip_post or args.check_inputs or args.output_dir or args.output_root):
         parser.error('--resume-post cannot be combined with build/check/skip/output options')
     if not math.isfinite(args.mesh_mm) or args.mesh_mm <= 0:
@@ -205,7 +244,22 @@ def enhanced_arguments(report):
     return [os.path.splitext(report['odb'])[0]+'_modal_wavelengths_report.json']
 
 
-def resume_postprocessing(run_dir):
+def run_modal_audit(run_dir):
+    import importlib.util
+    path = os.path.join(SCRIPT_DIR, 'abaqus_dsm_modal_audit.py')
+    spec = importlib.util.spec_from_file_location('pipeline_modal_audit', path)
+    audit = importlib.util.module_from_spec(spec); spec.loader.exec_module(audit)
+    output = os.path.join(run_dir, 'modal_dsm_audit')
+    number = 2
+    while os.path.exists(output):
+        output = os.path.join(run_dir, 'modal_dsm_audit_%02d' % number); number += 1
+    summary = audit.process(audit.parse_arguments(['--run-dir', run_dir, '--output-dir', output]))
+    return dict(output_dir=output, html=os.path.join(output, 'modal_explorer.html'),
+                eigenspace_validation=os.path.join(output, 'eigenspace_validation.html'),
+                mesh_shape_archive=summary.get('mesh_shape_archive'))
+
+
+def resume_postprocessing(run_dir, modal_audit=False):
     """Recover existing results without requiring source CSVs or a CAE session."""
     from types import SimpleNamespace
     run_dir = os.path.abspath(os.path.expanduser(run_dir))
@@ -240,6 +294,9 @@ def resume_postprocessing(run_dir):
         save('ENHANCED_POSTPROCESSING')
         progress('4/4 ENHANCED: mode families, spectra, envelopes and interactive report.')
         state['enhanced_report'] = enhanced.main(enhanced_arguments(report))
+        if modal_audit:
+            progress('AUDIT: direct shapes, sensitivity and graphical explorer.')
+            state['modal_audit'] = run_modal_audit(run_dir)
         save('COMPLETED')
         progress('COMPLETE: recovered postprocessing; %d modes processed.' %
                  state['postprocessing']['processed_modes'])
@@ -283,6 +340,192 @@ def monitor_analysis(stop, job_name):
 
 def xykey(point):
     return (round(point[0], 6), round(point[1], 6))
+
+
+def mandatory_longitudinal_keep(segments, bolt_points=(), sharp_angle_deg=MERGE_ANGLE_DEG):
+    """Return section lines that the spacing filter is never allowed to remove.
+
+    The two chain ends, exact bolt-row partitions and genuine sharp source
+    corners are hard constraints. Smooth/low-turn lines learned from virtual
+    topology remain useful candidates, but a positive spacing request may
+    suppress them if they would create an excessively narrow strip.
+    """
+    points = [segments[0][:2]] + [seg[2:] for seg in segments]
+    keep = {xykey(points[0]), xykey(points[-1])}
+    keep.update(xykey(point) for point in bolt_points)
+    threshold = math.radians(float(sharp_angle_deg))
+    for i in range(1, len(points)-1):
+        ux, uy = points[i][0]-points[i-1][0], points[i][1]-points[i-1][1]
+        vx, vy = points[i+1][0]-points[i][0], points[i+1][1]-points[i][1]
+        turn = math.atan2(ux*vy-uy*vx, ux*vx+uy*vy)
+        if abs(turn) >= threshold:
+            keep.add(xykey(points[i]))
+    return keep
+
+
+def select_longitudinal_lines(segments, legacy_keep, count, min_spacing_mm=0.0,
+                              mandatory_keep=None):
+    """Keep source vertices, prioritizing curvature while enforcing strip width.
+
+    With min_spacing_mm == 0 this is exactly the historical selector.
+    With a positive spacing, the filter applies to every retained SOFT section
+    line: both optional refinement lines and low-turn lines inherited from the
+    virtual-topology prepass. Only mandatory_keep may violate the spacing; in
+    the model builder those are chain ends, exact bolt lines and genuine sharp
+    corners.
+
+    Distance is section arclength, not Euclidean chord distance. This is the
+    relevant width of the strip created between neighboring longitudinal
+    partitions. Count 100 deliberately keeps every source line unchanged.
+    """
+    legacy_keep = set(legacy_keep)
+    if count == 0:
+        return legacy_keep
+    if not math.isfinite(min_spacing_mm) or min_spacing_mm < 0:
+        raise ValueError('min_spacing_mm must be finite and nonnegative')
+
+    points = [segments[0][:2]] + [seg[2:] for seg in segments]
+    keys = [xykey(point) for point in points]
+    if count == 100:
+        return legacy_keep | set(keys)
+
+    arclength = [0.0]
+    for a, b in zip(points, points[1:]):
+        arclength.append(arclength[-1] + math.hypot(b[0]-a[0], b[1]-a[1]))
+
+    def chain_position(point):
+        px, py = point
+        best_error = float('inf')
+        best_position = None
+        for j, (a, b) in enumerate(zip(points, points[1:])):
+            vx, vy = b[0]-a[0], b[1]-a[1]
+            length2 = vx*vx + vy*vy
+            if length2 <= 0:
+                continue
+            t = ((px-a[0])*vx + (py-a[1])*vy)/length2
+            t = min(1.0, max(0.0, t))
+            qx, qy = a[0]+t*vx, a[1]+t*vy
+            error = math.hypot(px-qx, py-qy)
+            if error < best_error:
+                best_error = error
+                best_position = arclength[j] + t*math.sqrt(length2)
+        tolerance = max(1e-5, 1e-8*max(arclength[-1], 1.0))
+        return best_position if best_error <= tolerance else None
+
+    turns = [0.0] * len(points)
+    regions = []
+    for i in range(1, len(points)-1):
+        ux, uy = points[i][0]-points[i-1][0], points[i][1]-points[i-1][1]
+        vx, vy = points[i+1][0]-points[i][0], points[i+1][1]-points[i][1]
+        turns[i] = math.atan2(ux*vy-uy*vx, ux*vx+uy*vy)
+        if abs(turns[i]) <= math.radians(0.001):
+            continue
+        if (not regions or regions[-1][-1] != i-1 or
+                turns[regions[-1][-1]] * turns[i] < 0):
+            regions.append([])
+        regions[-1].append(i)
+
+    adjusted_regions = []
+    region_end_keys = set()
+    for region in regions:
+        region = list(region)
+        if region[0] == 1:
+            region = [0] + region
+        if region[-1] == len(points)-2:
+            region = region + [len(points)-1]
+        adjusted_regions.append(region)
+        region_end_keys.update((keys[region[0]], keys[region[-1]]))
+
+    # Exact backward compatibility when the new spacing option is disabled.
+    if min_spacing_mm <= 0:
+        keep = set(legacy_keep)
+        keep.update((keys[0], keys[-1]))
+        keep.update(region_end_keys)
+        for region in adjusted_regions:
+            first, last = region[0], region[-1]
+            interior = region[1:-1]
+            selected = [i for i in interior if keys[i] in keep]
+            position = {first: 0.0}
+            for i in region[1:]:
+                position[i] = position[i-1] + (abs(turns[i-1])+abs(turns[i]))/2.0
+            candidates = [i for i in interior if keys[i] not in keep]
+            while candidates and len(selected) < count:
+                anchors = [first, last] + selected
+                chosen = max(candidates, key=lambda i: (
+                    min(abs(position[i]-position[j]) for j in anchors), -i))
+                keep.add(keys[chosen])
+                selected.append(chosen)
+                candidates.remove(chosen)
+        return keep
+
+    # If a caller does not distinguish hard/soft lines, preserve the older API
+    # conservatively by treating the supplied legacy set as mandatory.
+    hard = set(legacy_keep if mandatory_keep is None else mandatory_keep)
+    hard.update((keys[0], keys[-1]))
+    keep = set(hard)
+
+    key_index = {key: i for i, key in enumerate(keys)}
+    spacing_positions = []
+    unmapped_hard = []
+    for point in hard:
+        position = chain_position(point)
+        if position is None:
+            unmapped_hard.append(point)
+        else:
+            spacing_positions.append(position)
+    keep.update(unmapped_hard)
+
+    tolerance = 1e-9*max(arclength[-1], 1.0)
+
+    def point_spacing_ok(point):
+        position = chain_position(point)
+        if position is None:
+            return True
+        return all(abs(position-other)+tolerance >= min_spacing_mm
+                   for other in spacing_positions)
+
+    def accept_point(point):
+        keep.add(point)
+        position = chain_position(point)
+        if position is not None:
+            spacing_positions.append(position)
+
+    # Reconsider low-turn lines inherited from virtual topology and region
+    # endpoints. Keep the most curvature-sensitive line when several compete
+    # for the same < min_spacing_mm neighborhood.
+    soft_seed = (legacy_keep | region_end_keys) - hard
+    ranked = []
+    for point in soft_seed:
+        index = key_index.get(point)
+        importance = abs(turns[index]) if index is not None else 0.0
+        position = chain_position(point)
+        ranked.append((-importance, position if position is not None else float('inf'), point))
+    for unused_importance, unused_position, point in sorted(ranked):
+        if point_spacing_ok(point):
+            accept_point(point)
+
+    def spacing_ok_index(index):
+        return point_spacing_ok(keys[index])
+
+    for region in adjusted_regions:
+        first, last = region[0], region[-1]
+        interior = region[1:-1]
+        selected = [i for i in interior if keys[i] in keep]
+        position = {first: 0.0}
+        for i in region[1:]:
+            position[i] = position[i-1] + (abs(turns[i-1])+abs(turns[i]))/2.0
+        candidates = [i for i in interior if keys[i] not in keep]
+        while candidates and len(selected) < count:
+            eligible = [i for i in candidates if spacing_ok_index(i)]
+            if not eligible:
+                break
+            anchors = [first, last] + selected
+            chosen = max(eligible, key=lambda i: (
+                min(abs(position[i]-position[j]) for j in anchors), -i))
+            accept_point(keys[chosen])
+            selected.append(chosen)
+            candidates.remove(chosen)
+    return keep
 
 
 def read_geometry(folder):
@@ -363,7 +606,11 @@ def read_model_inputs(folder):
 
 def input_summary(data):
     pieces, thickness, young, poisson, seams, bolts, member = data
+    section_segments = {'P%d' % int(k): [[float(v) for v in seg] for seg in pieces[k]]
+                        for k in sorted(pieces)}
     return dict(source_directory=os.path.abspath(BUILTUP_DIR),
+        section_segments=section_segments,
+        section_geometry_definition='original builtup_segments.csv in global section coordinates',
         length_mm=float(member['L_mm']), thickness_mm=thickness,
         E_MPa=young, nu=poisson, clear_gap_mm=float(member['gap_mm']),
         bolt_row_mm=float(member['bolt_row_mm']), bolts_per_seam=len(bolts),
@@ -392,7 +639,7 @@ def add_general_contact(model):
         assignments=((GLOBAL, SELF, 'Hard_Frictionless'),))
 
 
-def build(inputs=None, cpus=8):
+def build(inputs=None, cpus=8, buckle_output='standard', nodal_precision='full'):
     validate_settings()
     if inputs is None:
         inputs = read_model_inputs(BUILTUP_DIR)
@@ -405,7 +652,7 @@ def build(inputs=None, cpus=8):
     from abaqusConstants import (THREE_D, DEFORMABLE_BODY, ON, OFF, CARTESIAN,
         MIDDLE_SURFACE, FROM_SECTION, XYPLANE, XZPLANE, YZPLANE, QUAD,
         STRUCTURED, FIXED, S4R, STANDARD, SUBSPACE, SET, UNIFORM, GENERAL,
-        BEAM_MPC, DOF_MODE_MPC, MEGA_BYTES)
+        BEAM_MPC, DOF_MODE_MPC, MEGA_BYTES, FULL, SINGLE)
     import mesh
     import regionToolset
     import interaction  # registers Model.MultipointConstraint in noGUI sessions
@@ -425,7 +672,8 @@ def build(inputs=None, cpus=8):
     assert hasattr(model, 'MultipointConstraint') and hasattr(mdb, 'Job')
     assert hasattr(model, 'fieldOutputRequests') and hasattr(model, 'historyOutputRequests')
     job = mdb.Job(name=MODEL_NAME, model=MODEL_NAME, numCpus=cpus, numDomains=cpus,
-                  memory=4000, memoryUnits=MEGA_BYTES)
+                  memory=24000, memoryUnits=MEGA_BYTES,
+                  nodalOutputPrecision=FULL if nodal_precision == 'full' else SINGLE)
     model.Material(name='Steel')
     model.materials['Steel'].Elastic(table=((young, poisson),))
     model.HomogeneousShellSection(name='Shell_t', material='Steel', thickness=thickness,
@@ -469,6 +717,33 @@ def build(inputs=None, cpus=8):
         part.PartitionFaceByDatumPlane(datumPlane=part.datums[plane.id], faces=face)
         keep.add(xykey((x, y)))
 
+    mandatory_keep = mandatory_longitudinal_keep(
+        pieces[1], bolt_points=bolt_xy, sharp_angle_deg=MERGE_ANGLE_DEG)
+    keep = select_longitudinal_lines(
+        pieces[1], keep, LONGITUDINAL_LINES,
+        LONGITUDINAL_LINE_MIN_SPACING_MM, mandatory_keep=mandatory_keep)
+    if LONGITUDINAL_LINES == 100:
+        # Extrusion merges collinear sketch segments into a single face, but
+        # can leave their end vertices. Restore the missing lengthwise cuts
+        # so maximum detail also has four-sided, structured-meshable faces.
+        native_lines = set()
+        for edge in part.edges:
+            vertices = edge.getVertices()
+            if len(vertices) == 2:
+                a, b = [part.vertices[i].pointOn[0] for i in vertices]
+                if xykey(a) == xykey(b):
+                    native_lines.add(xykey(a))
+        for x, y, x2, y2 in pieces[1][1:]:
+            if xykey((x, y)) in native_lines:
+                continue
+            face = part.faces.findAt(((x, y, LENGTH_MM / 2),))
+            use_x = abs(x2-x) >= abs(y2-y)
+            plane = part.DatumPlaneByPrincipalPlane(
+                principalPlane=YZPLANE if use_x else XZPLANE,
+                offset=x if use_x else y)
+            part.PartitionFaceByDatumPlane(datumPlane=part.datums[plane.id], faces=face)
+            native_lines.add(xykey((x, y)))
+
     cuts = sorted(set(round(z, 7) for z in bolts + [LENGTH_MM / 2]))
     for z in cuts:
         plane = part.DatumPlaneByPrincipalPlane(principalPlane=XYPLANE, offset=z)
@@ -488,8 +763,9 @@ def build(inputs=None, cpus=8):
         if xykey(a) == xykey(b) and xykey(a) not in keep:
             ignored_edges.append(edge)
             ignored_vertices.update(vertices)
-    part.ignoreEntity(entities=tuple(ignored_edges) +
-                      tuple(part.vertices[i] for i in sorted(ignored_vertices)))
+    if ignored_edges or ignored_vertices:
+        part.ignoreEntity(entities=tuple(ignored_edges) +
+                          tuple(part.vertices[i] for i in sorted(ignored_vertices)))
     # Native extrusion can leave extra collinear end vertices with no internal
     # longitudinal edge. Remove these too, leaving four-sided virtual regions.
     redundant = tuple(v for v in part.vertices
@@ -571,6 +847,10 @@ def build(inputs=None, cpus=8):
     assert len(model.boundaryConditions) == 9
     for name in list(model.fieldOutputRequests.keys()):
         del model.fieldOutputRequests[name]
+    # Classification/wavelength processing needs the nodal eigenmode shape only.
+    # Do not request S/E/SF/SE at every shell section point: those fields are
+    # not used by the current Local/Distortional/Global classifier and can
+    # dominate ODB size and postprocessing time for hundreds of modes.
     model.FieldOutputRequest(name='ModeShapes', createStepName='Buckle', variables=('U',))
     for name in list(model.historyOutputRequests.keys()):
         del model.historyOutputRequests[name]
@@ -581,6 +861,10 @@ def build(inputs=None, cpus=8):
         viewport.view.fitView()
     mdb.saveAs(pathName=os.path.join(os.getcwd(), MODEL_NAME+'.cae'))
     report = dict(length_mm=LENGTH_MM, target_mesh_mm=MESH_MM, modes=N_MODES,
+        longitudinal_lines=LONGITUDINAL_LINES,
+        longitudinal_line_min_spacing_mm=LONGITUDINAL_LINE_MIN_SPACING_MM,
+        mandatory_longitudinal_lines=len(mandatory_keep),
+        retained_section_lines=len(keep),
         vectors=N_VECTORS, max_iterations=MAX_ITERATIONS, cpus=cpus,
         job_name=MODEL_NAME, odb=os.path.abspath(MODEL_NAME+'.odb'),
         nodes=4*len(part.nodes), elements=4*len(part.elements), element_type='S4R',
@@ -592,6 +876,12 @@ def build(inputs=None, cpus=8):
         tangential='FRICTIONLESS', allow_separation=True,
         buckle_limitation='Contact status fixed at the base state')
     report['source_inputs'] = input_summary(inputs)
+    report['modal_output'] = dict(
+        profile='classification_only', requested_legacy_profile=buckle_output,
+        nodal_precision=nodal_precision, fields=['U'],
+        mode_shape_components='U field used for transverse nodal eigenmode shapes; shell rotations are not required by the classifier',
+        deliberately_omitted_fields=['S', 'E', 'SF', 'SE'],
+        convention='Normalized perturbation mode shapes only; shell stress/strain/force energy diagnostics are intentionally not stored in the automatic buckling stage')
     with open(MODEL_NAME+'_build.json', 'w') as f:
         json.dump(report, f, indent=2)
     print('BUILD COMPLETE: CAE and INP saved. No analysis submitted yet. '+str(report))
@@ -601,14 +891,19 @@ def build(inputs=None, cpus=8):
 
 def main(argv=None):
     global BUILTUP_DIR, MESH_MM, N_MODES, N_VECTORS, MAX_ITERATIONS
+    global LONGITUDINAL_LINES, LONGITUDINAL_LINE_MIN_SPACING_MM
     args = parse_arguments(argv)
     if args.resume_post:
-        return resume_postprocessing(args.resume_post)
+        return resume_postprocessing(args.resume_post, modal_audit=args.modal_audit)
     BUILTUP_DIR, MESH_MM = args.builtup_dir, args.mesh_mm
+    LONGITUDINAL_LINES = args.longitudinal_lines
+    LONGITUDINAL_LINE_MIN_SPACING_MM = args.longitudinal_line_min_spacing_mm
     N_MODES, N_VECTORS, MAX_ITERATIONS = args.n_modes, args.n_vectors, args.max_iterations
     validate_settings()
     inputs = read_model_inputs(BUILTUP_DIR)
     settings = vars(args).copy()
+    settings['effective_buckle_output'] = 'classification_only_U'
+    settings['automatic_shell_energy'] = False
     if args.check_inputs:
         print(json.dumps(dict(settings=settings, source_inputs=input_summary(inputs)), indent=2))
         return
@@ -636,7 +931,10 @@ def main(argv=None):
         progress('Output directory: '+output_dir)
         progress('Settings: '+json.dumps(settings, sort_keys=True))
         progress('1/4 BUILD: geometry, mesh, contact, CAE and INP.')
-        job, report = build(inputs=inputs, cpus=args.cpus)
+        if args.buckle_output == 'detailed':
+            progress('NOTE: --buckle-output detailed is retained only for command compatibility; S/E/SF/SE are no longer requested in this buckling stage.')
+        job, report = build(inputs=inputs, cpus=args.cpus,
+                            buckle_output=args.buckle_output, nodal_precision=args.nodal_precision)
         state['build'] = report
         save_state('BUILT')
         if args.build_only:
@@ -676,6 +974,9 @@ def main(argv=None):
             save_state('ENHANCED_POSTPROCESSING')
             progress('4/4 ENHANCED: mode families, spectra, envelopes and interactive report.')
             state['enhanced_report'] = enhanced.main(enhanced_arguments(report))
+            if args.modal_audit:
+                progress('AUDIT: direct shapes, sensitivity and graphical explorer.')
+                state['modal_audit'] = run_modal_audit(output_dir)
         else:
             progress('3/4 and 4/4 POSTPROCESS skipped by --skip-post.')
         save_state('COMPLETED')

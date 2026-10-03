@@ -235,10 +235,16 @@ def read_displacements(frame, lookup, count, tables=None):
                 if block.instance is None or block.instance.name not in tables:
                     continue
                 table = tables[block.instance.name]
+                system = getattr(block, 'localCoordSystem', None)
+                if system is not None and np.size(system):
+                    raise ValueError('Bulk U is not in global coordinates; inspect individual values')
                 labels = np.asarray(block.nodeLabels,dtype=int).ravel()
                 values = None
                 for attr in ('dataDouble','data'):
-                    candidate = getattr(block,attr,None)
+                    try:
+                        candidate = getattr(block,attr,None)
+                    except Exception:
+                        continue  # Abaqus raises for the accessor of the other precision.
                     if candidate is not None and np.size(candidate):
                         values = np.asarray(candidate,dtype=float).reshape(len(labels),-1)
                         break
@@ -258,6 +264,10 @@ def read_displacements(frame, lookup, count, tables=None):
             continue
         index = lookup.get((value.instance.name,value.nodeLabel))
         if index is not None:
+            system = getattr(value, 'localCoordSystemDouble' if str(value.precision)=='DOUBLE_PRECISION'
+                             else 'localCoordSystem', None)
+            if system is not None and np.size(system):
+                raise ValueError('Local-coordinate U is unsupported; global nodal output is required')
             values = value.dataDouble if str(value.precision)=='DOUBLE_PRECISION' else value.data
             data[index] = values[:3]
     if not np.all(np.isfinite(data)):
