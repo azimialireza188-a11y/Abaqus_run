@@ -126,6 +126,8 @@ def parse_arguments(argv=None):
                         help='Portable raw ODB export after solve; parquet is compact ZSTD columnar output')
     parser.add_argument('--portable-modes-per-shard', type=int, default=8,
                         help='Modes stored per portable mode-shape shard')
+    parser.add_argument('--portable-export-workers', default='auto',
+                        help='auto/all/max uses all logical CPUs for portable Parquet compression')
     parser.add_argument('--parquet-python', default=None,
                         help='Normal Python executable with pyarrow; auto-detected when omitted')
     output_options = parser.add_mutually_exclusive_group()
@@ -273,7 +275,7 @@ def portable_export_backend(output_format, parquet_python=None):
 
 def run_portable_export(odb_path, run_dir, output_format='parquet',
                         modes_per_shard=8, parquet_python=None,
-                        parquet_backend=None):
+                        parquet_backend=None, workers='auto'):
     exporter = load_portable_exporter()
     base = os.path.join(run_dir, 'portable_modal_export')
     output = base
@@ -284,7 +286,8 @@ def run_portable_export(odb_path, run_dir, output_format='parquet',
     report = exporter.export_odb_path(
         odb_path, output, output_format=output_format,
         modes_per_shard=modes_per_shard, parquet_python=parquet_python,
-        parquet_backend=parquet_backend, compression='zstd', compression_level=9)
+        parquet_backend=parquet_backend, compression='zstd', compression_level=9,
+        workers=workers)
     return dict(output_dir=report['output_dir'], manifest=os.path.join(report['output_dir'], 'modal_export.json'),
                 format=report['format'], mode_count=report['mode_count'],
                 rotations_available=report['rotations_available'], artifacts=report['artifacts'])
@@ -307,7 +310,7 @@ def run_modal_audit(run_dir):
 
 def resume_postprocessing(run_dir, modal_audit=False, portable_export='parquet',
                           portable_modes_per_shard=8, parquet_python=None,
-                          parquet_backend=None):
+                          parquet_backend=None, portable_export_workers='auto'):
     """Recover existing results without requiring source CSVs or a CAE session."""
     from types import SimpleNamespace
     run_dir = os.path.abspath(os.path.expanduser(run_dir))
@@ -339,7 +342,8 @@ def resume_postprocessing(run_dir, modal_audit=False, portable_export='parquet',
             progress('PORTABLE EXPORT: raw ODB mode shapes -> '+portable_export+'.')
             state['portable_export'] = run_portable_export(
                 report['odb'], run_dir, portable_export, portable_modes_per_shard,
-                parquet_python=parquet_python, parquet_backend=parquet_backend)
+                parquet_python=parquet_python, parquet_backend=parquet_backend,
+                workers=portable_export_workers)
         save('POSTPROCESSING')
         progress('3/4 POSTPROCESS: all modes from '+report['odb'])
         state['postprocessing'] = processor.main(postprocess_arguments(report))
@@ -956,7 +960,8 @@ def main(argv=None):
             args.resume_post, modal_audit=args.modal_audit,
             portable_export=args.portable_export,
             portable_modes_per_shard=args.portable_modes_per_shard,
-            parquet_python=args.parquet_python, parquet_backend=parquet_backend)
+            parquet_python=args.parquet_python, parquet_backend=parquet_backend,
+            portable_export_workers=args.portable_export_workers)
     BUILTUP_DIR, MESH_MM = args.builtup_dir, args.mesh_mm
     LONGITUDINAL_LINES = args.longitudinal_lines
     LONGITUDINAL_LINE_MIN_SPACING_MM = args.longitudinal_line_min_spacing_mm
@@ -1035,7 +1040,7 @@ def main(argv=None):
             state['portable_export'] = run_portable_export(
                 report['odb'], output_dir, args.portable_export,
                 args.portable_modes_per_shard, parquet_python=args.parquet_python,
-                parquet_backend=parquet_backend)
+                parquet_backend=parquet_backend, workers=args.portable_export_workers)
             save_state('SOLVED')
         if processor is not None:
             save_state('POSTPROCESSING')

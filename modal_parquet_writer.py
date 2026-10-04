@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Convert staged portable modal arrays to compact Parquet files."""
+"""Convert staged portable modal arrays to compact Parquet files in parallel."""
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
+import os
 from pathlib import Path
 import numpy as np
 
@@ -27,16 +29,26 @@ def _write(table, path, pq, compression, compression_level, dictionary=None):
     pq.write_table(table, path, **kwargs)
 
 
-def write_stage(stage_dir, compression='zstd', compression_level=9):
+def resolve_workers(value, shard_count):
+    logical = max(1, int(os.cpu_count() or 1))
+    if value is None or str(value).lower() in ('auto', 'all', 'max'):
+        requested = logical
+    else:
+        try:
+            requested = int(value)
+        except (TypeError, ValueError):
+            raise ValueError('workers must be auto/all/max or a positive integer')
+        if requested < 1:
+            raise ValueError('workers must be positive')
+    return min(requested, max(1, int(shard_count))), logical, requested
+
+
+def _write_common(root, manifest, compression, compression_level):
     pa, pq = _arrow()
-    root = Path(stage_dir)
-    with open(root / 'portable_stage.json') as stream:
-        manifest = json.load(stream)
     nodes = np.load(root / '.nodes_stage.npz', allow_pickle=False)
     elements = np.load(root / '.elements_stage.npz', allow_pickle=False)
-    float_type = np.float64 if manifest['parquet_float'] == 'float64' else np.float32
-
     node_count = len(nodes['node_labels'])
+
     node_table = pa.table({
         'node_index': np.arange(node_count, dtype=np.int64),
         'instance': nodes['node_instances'].astype(str).tolist(),
@@ -81,35 +93,80 @@ def write_stage(stage_dir, compression='zstd', compression_level=9):
     })
     _write(mode_table, root / 'modes.parquet', pq, compression,
            compression_level)
+    return node_count
 
+
+def _write_shard_job(args):
+    (root_text, shard_index, node_count, parquet_float, rotations_available,
+     source_odb_sha256, compression, compression_level) = args
+    # Each process owns one shard and one pyarrow writer. The launcher constrains
+    # native libraries to one thread per process, so N workers ~= N logical CPUs.
+    pa, pq = _arrow()
+    root = Path(root_text)
+    stage_name = '.shape_stage_%04d.npz' % shard_index
+    data = np.load(root / stage_name, allow_pickle=False)
+    float_type = np.float64 if parquet_float == 'float64' else np.float32
+    columns = {'node_index': np.arange(node_count, dtype=np.int64)}
+    mode_ids = data['modes'].astype(int).tolist()
+    for j, mode in enumerate(mode_ids):
+        for component, name in enumerate(('u1', 'u2', 'u3')):
+            columns['m%04d_%s' % (mode, name)] = data['u'][:, j, component].astype(
+                float_type, copy=False)
+        if rotations_available:
+            for component, name in enumerate(('ur1', 'ur2', 'ur3')):
+                columns['m%04d_%s' % (mode, name)] = data['ur'][:, j, component].astype(
+                    float_type, copy=False)
+    table = pa.table(columns)
+    table = _metadata(table, {
+        'modes': ','.join(str(v) for v in mode_ids),
+        'source_odb_sha256': source_odb_sha256 or '',
+        'vector_coordinate_system': 'GLOBAL',
+        'rotations_available': rotations_available,
+    })
+    filename = 'mode_shapes_%04d.parquet' % shard_index
+    _write(table, root / filename, pq, compression, compression_level)
+    return filename, mode_ids
+
+
+def write_stage(stage_dir, compression='zstd', compression_level=9, workers='auto'):
+    pa, unused_pq = _arrow()
+    root = Path(stage_dir)
+    with open(root / 'portable_stage.json') as stream:
+        manifest = json.load(stream)
+    shard_count = len(manifest['shards'])
+    effective_workers, logical_cpus, requested_workers = resolve_workers(
+        workers, shard_count)
+    node_count = _write_common(root, manifest, compression, compression_level)
+
+    jobs = [
+        (str(root), shard_index, node_count, manifest['parquet_float'],
+         bool(manifest['rotations_available']), manifest.get('source_odb_sha256'),
+         compression, compression_level)
+        for shard_index in range(1, shard_count + 1)
+    ]
+    completed = {}
+    if effective_workers == 1:
+        for job in jobs:
+            filename, modes = _write_shard_job(job)
+            completed[int(filename.split('_')[-1].split('.')[0])] = filename
+    else:
+        with ProcessPoolExecutor(max_workers=effective_workers) as pool:
+            futures = [pool.submit(_write_shard_job, job) for job in jobs]
+            for future in as_completed(futures):
+                filename, modes = future.result()
+                completed[int(filename.split('_')[-1].split('.')[0])] = filename
+
+    shard_artifacts = [completed[i] for i in range(1, shard_count + 1)]
     artifacts = ['mesh_nodes.parquet', 'raw_dof_map.parquet',
-                 'elements.parquet', 'modes.parquet']
-    for shard_index, shard in enumerate(manifest['shards'], 1):
-        stage_name = '.shape_stage_%04d.npz' % shard_index
-        data = np.load(root / stage_name, allow_pickle=False)
-        columns = {'node_index': np.arange(node_count, dtype=np.int64)}
-        mode_ids = data['modes'].astype(int).tolist()
-        for j, mode in enumerate(mode_ids):
-            for component, name in enumerate(('u1', 'u2', 'u3')):
-                columns['m%04d_%s' % (mode, name)] = data['u'][:, j, component].astype(float_type)
-            if manifest['rotations_available']:
-                for component, name in enumerate(('ur1', 'ur2', 'ur3')):
-                    columns['m%04d_%s' % (mode, name)] = data['ur'][:, j, component].astype(float_type)
-        table = pa.table(columns)
-        table = _metadata(table, {
-            'modes': ','.join(str(v) for v in mode_ids),
-            'source_odb_sha256': manifest.get('source_odb_sha256') or '',
-            'vector_coordinate_system': 'GLOBAL',
-            'rotations_available': manifest['rotations_available'],
-        })
-        filename = 'mode_shapes_%04d.parquet' % shard_index
-        _write(table, root / filename, pq, compression, compression_level)
-        artifacts.append(filename)
-
-    report = dict(format='parquet', compression=compression,
-                  compression_level=compression_level,
-                  pyarrow_version=pa.__version__, artifacts=artifacts,
-                  layout='one row per node; each shard stores mode U/UR components as columns')
+                 'elements.parquet', 'modes.parquet'] + shard_artifacts
+    report = dict(
+        format='parquet', compression=compression,
+        compression_level=compression_level,
+        pyarrow_version=pa.__version__, artifacts=artifacts,
+        workers_requested=requested_workers,
+        workers_effective=effective_workers,
+        logical_cpu_count=logical_cpus,
+        layout='one row per node; each shard stores mode U/UR components as columns')
     with open(root / 'parquet_writer_report.json', 'w') as stream:
         json.dump(report, stream, indent=2)
     return report
@@ -120,8 +177,11 @@ def main(argv=None):
     parser.add_argument('--stage-dir', required=True)
     parser.add_argument('--compression', choices=('zstd', 'snappy', 'gzip'), default='zstd')
     parser.add_argument('--compression-level', type=int, default=9)
+    parser.add_argument('--workers', default='auto',
+                        help='auto/all/max uses all logical CPUs; otherwise positive integer')
     args = parser.parse_args(argv)
-    report = write_stage(args.stage_dir, args.compression, args.compression_level)
+    report = write_stage(args.stage_dir, args.compression, args.compression_level,
+                         workers=args.workers)
     print(json.dumps(report))
 
 

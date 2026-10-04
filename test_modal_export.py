@@ -99,6 +99,36 @@ class ModalExportTests(unittest.TestCase):
         self.assertNotIn('PYTHONPATH', env)
         self.assertNotIn('PYTHONSTARTUP', env)
         self.assertEqual(env.get('KEEP_ME'), 'yes')
+        for name in ('ARROW_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
+                     'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+            self.assertEqual(env.get(name), '1')
+
+    def test_bulk_plan_maps_complete_node_blocks_once(self):
+        instance = Instance('P1')
+        class Block:
+            precision = 'DOUBLE_PRECISION'
+            localCoordSystem = None
+            localCoordSystemDouble = None
+            def __init__(self):
+                self.instance = instance
+                self.nodeLabels = np.asarray([1, 2, 3, 4], dtype=np.int64)
+                self.dataDouble = np.asarray([
+                    [1., 2., 3.], [4., 5., 6.],
+                    [7., 8., 9.], [10., 11., 12.]], dtype=np.float64)
+                self.data = self.dataDouble.astype(np.float32)
+        field = types.SimpleNamespace(bulkDataBlocks=[Block()])
+        index = {('P1', label): label - 1 for label in (1, 2, 3, 4)}
+        plan = exporter._build_bulk_plan(field, index, 4)
+        self.assertIsNotNone(plan)
+        values, precision = exporter._field_array_bulk(field, plan, 4)
+        self.assertEqual(values.shape, (4, 3))
+        self.assertEqual(precision, ['DOUBLE_PRECISION'])
+        self.assertTrue(np.allclose(values[3], [10., 11., 12.]))
+
+    def test_auto_workers_resolve_to_logical_cpu_count(self):
+        workers, logical = exporter._resolve_worker_count('auto')
+        self.assertGreaterEqual(logical, 1)
+        self.assertEqual(workers, logical)
 
     def test_new_u_ur_odb_exports_six_dofs_without_zero_fill(self):
         report = self.exercise(True, double=True)

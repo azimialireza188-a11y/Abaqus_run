@@ -21,6 +21,7 @@ abaqus cae noGUI=abaqus_complete_model_m20.py -- ^
   --longitudinal-line-min-spacing-mm 5 ^
   --portable-export parquet ^
   --portable-modes-per-shard 8 ^
+  --portable-export-workers auto ^
   --modal-audit
 ```
 
@@ -110,7 +111,8 @@ abaqus python abaqus_modal_export.py ^
   --odb "D:\CFS-Column\New folder (10)\YOUR_RUN\BU_BOLT_L3600_M5.odb" ^
   --output-dir "D:\CFS-Column\New folder (10)\YOUR_RUN\portable_modal_export_recovered" ^
   --format parquet ^
-  --modes-per-shard 8
+  --modes-per-shard 8 ^
+  --workers auto
 ```
 
 No CAE rebuild and no solver submission occur in this command. If a same-basename
@@ -126,3 +128,29 @@ This portable archive is raw modal data. It is not an mFSM operator pack and
 does not manufacture validated Local/Distortional/Global energy shares from the
 ODB. Mechanical mFSM decomposition still requires independently reviewed
 operators/evidence.
+
+
+### Performance architecture
+
+Portable export is intentionally split into two stages:
+
+1. **ODB extraction remains single-owner** because the Abaqus ODB API is not
+   treated as thread-safe. The exporter first tries the vectorized
+   `bulkDataBlocks` interface and reuses its node-row mapping across modes. If
+   an ODB does not support a stable bulk layout, it falls back automatically to
+   the original per-`FieldValue` mapping.
+2. **Parquet/ZSTD compression is process-parallel.** `--workers auto` uses all
+   logical CPUs, capped only by the number of mode shards. Each writer process
+   is constrained to one native BLAS/Arrow/OpenMP thread to avoid nested
+   oversubscription.
+
+For 250 modes with `--modes-per-shard 8`, the archive contains 32 shape
+shards because `ceil(250/8)=32`: 31 shards contain 8 modes and the final shard
+contains 2 modes. Increasing `--modes-per-shard` reduces the number of files
+but also reduces the number of independently compressible tasks. On a machine
+with many logical CPUs, 8 modes per shard is a useful compromise for a
+250-mode export because it provides 32 parallel tasks.
+
+The final console summary reports `odb_extraction_backend` and
+`parquet_workers`. The fastest expected path is
+`bulkDataBlocks` plus a worker count close to the machine's logical CPU count.

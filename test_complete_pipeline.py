@@ -28,6 +28,7 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(args.modal_audit)
         self.assertEqual(args.portable_export, 'parquet')
         self.assertEqual(args.portable_modes_per_shard, 8)
+        self.assertEqual(args.portable_export_workers, 'auto')
         self.assertEqual(builder.parse_arguments(['--nodal-precision', 'single']).nodal_precision, 'single')
 
     def test_full_run_command_accepts_longitudinal_lines_with_modal_options(self):
@@ -218,7 +219,8 @@ class PipelineTests(unittest.TestCase):
                     '--n-modes', '100', '--n-vectors', '200', '--max-iterations', '400',
                     '--longitudinal-lines', '2', '--buckle-output', 'detailed',
                     '--nodal-precision', 'full', '--portable-export', 'npz',
-                    '--portable-modes-per-shard', '4', '--modal-audit']
+                    '--portable-modes-per-shard', '4', '--portable-export-workers', '6',
+                    '--modal-audit']
             defaults = {k: getattr(builder, k) for k in
                 ('BUILTUP_DIR', 'MESH_MM', 'N_MODES', 'N_VECTORS', 'MAX_ITERATIONS',
                  'LONGITUDINAL_LINES')}
@@ -228,11 +230,12 @@ class PipelineTests(unittest.TestCase):
                 return {'status': 'audit_boundary_complete'}
             def fake_portable(odb_path, run_dir, output_format='parquet',
                               modes_per_shard=8, parquet_python=None,
-                              parquet_backend=None):
+                              parquet_backend=None, workers='auto'):
                 self.assertEqual(odb_path, os.path.join(output, 'CurrentRun.odb'))
                 self.assertEqual(run_dir, output)
                 self.assertEqual((output_format, modes_per_shard), ('npz', 4))
                 self.assertIsNone(parquet_backend)
+                self.assertEqual(workers, '6')
                 return {'status': 'portable_boundary_complete'}
             with mock.patch.dict(builder.__dict__, defaults), \
                  mock.patch.object(builder, 'SCRIPT_DIR', root), \
@@ -281,7 +284,8 @@ class PipelineTests(unittest.TestCase):
                                             '--portable-export', 'off']), 'recovered')
             resume.assert_called_once_with(
                 'previous run', modal_audit=False, portable_export='off',
-                portable_modes_per_shard=8, parquet_python=None, parquet_backend=None)
+                portable_modes_per_shard=8, parquet_python=None, parquet_backend=None,
+                portable_export_workers='auto')
 
 
 if __name__ == '__main__':
