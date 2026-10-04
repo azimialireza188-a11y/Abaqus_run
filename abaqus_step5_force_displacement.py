@@ -13,6 +13,7 @@ Outputs: CSV, JSON summary and a dependency-free SVG plot.
 No analysis is submitted and the source CAE/ODB are opened read-only.
 """
 import argparse
+import builtins as python_builtins
 import csv
 import json
 import math
@@ -99,8 +100,8 @@ def weighted_u3(field, region, weights):
         preview = ', '.join('%s:%d' % item for item in missing[:8])
         raise ValueError('U3 missing for %d weighted end nodes; first: %s' %
                          (len(missing), preview))
-    total = sum(weights.values())
-    return sum(weights[key]*found[key] for key in weights)/total
+    total = python_builtins.sum(weights.values())
+    return python_builtins.sum(weights[key]*found[key] for key in weights)/total
 
 
 def lpf_history(step):
