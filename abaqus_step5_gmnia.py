@@ -46,6 +46,9 @@ import shutil
 import struct
 import sys
 import tempfile
+import abaqus_pipeline_contract as pipeline_contract
+
+STEP4_PREFIX = 'STEP4_PIPELINE_COMPATIBLE '
 
 
 def parse_arguments(argv=None):
@@ -119,7 +122,7 @@ def mesh_digest(model, names):
     return digest.hexdigest()
 
 
-def replace_bolts(model):
+def replace_bolts(model, expected_links=None):
     from abaqusConstants import BEAM, BEAM_MPC, OFF, IMPRINT, CARTESIAN
     import numpy as np
     assembly = model.rootAssembly
@@ -128,6 +131,8 @@ def replace_bolts(model):
     bolt_names = sorted(name for name in model.constraints.keys() if name.startswith('BOLT_'))
     if not bolt_names:
         raise ValueError('No BOLT_* MPC connections found')
+    if expected_links is not None and len(bolt_names) != int(expected_links):
+        raise ValueError('BOLT_* count differs from the reference pipeline contract')
     pairs, metadata = [], {}
     for name in bolt_names:
         constraint = model.constraints[name]
@@ -140,7 +145,9 @@ def replace_bolts(model):
             raise ValueError('Bolt endpoint sets do not match the MPC: '+name)
         pairs.append((a[0], b[0]))
         metadata[name] = dict(node_a=[a[0].instanceName, a[0].label],
-                              node_b=[b[0].instanceName, b[0].label])
+                              node_b=[b[0].instanceName, b[0].label],
+                              source_connection='BEAM_MPC',
+                              stage5_connection='ASSEMBLED_BEAM_CONNECTOR')
     print('  Creating %d rigid bolt connectors...' % len(pairs)); sys.stdout.flush()
     assembly.WirePolyLine(points=tuple(pairs), mergeType=IMPRINT, meshable=OFF)
     if len(assembly.edges) != len(pairs):
@@ -170,17 +177,36 @@ def replace_bolts(model):
 def prepare_model(model, args):
     from abaqusConstants import ON, OFF, UNIFORM, GENERAL
     assembly = model.rootAssembly
-    names = sorted(assembly.instances.keys())
-    if len(names) != 4:
-        raise ValueError('Expected exactly four shell instances')
-    if any(str(e.type) != 'S4R' for name in names for e in assembly.instances[name].elements):
-        raise ValueError('This builder supports the S4R mesh from the preceding scripts')
-    if set(model.steps.keys()) != {'Initial', 'Buckle'}:
-        raise ValueError('Expected only Initial and Buckle in source')
-    if len(model.interactions) == 0:
-        raise ValueError('Source contact interaction is missing')
-    fingerprint = mesh_digest(model, names)
     prior_description = model.description
+    payload = pipeline_contract.parse_prefixed_json(prior_description, STEP4_PREFIX)
+    specification, reference = pipeline_contract.validate_step4_payload(payload)
+    names = sorted(assembly.instances.keys())
+    if tuple(names) != tuple(reference['instances']):
+        raise ValueError('STEP5 source instances differ from the reference pipeline P1..P4 contract')
+    if any(str(e.type) != reference['element_type'] for name in names
+           for e in assembly.instances[name].elements):
+        raise ValueError('STEP5 source mesh differs from the reference S4R element contract')
+    if set(model.steps.keys()) != {'Initial', 'Buckle'}:
+        raise ValueError('Expected only Initial and Buckle inherited from STEP4')
+    if 'GeneralContact' not in model.interactions or 'Hard_Frictionless' not in model.interactionProperties:
+        raise ValueError('STEP5 source lost the reference general hard/frictionless contact')
+
+    counts = specification.get('source_repository_counts') or {}
+    for key in ('boundaryConditions', 'constraints', 'interactions', 'loads', 'materials', 'sections'):
+        if key not in counts:
+            raise ValueError('STEP4 provenance lacks source repository count: '+key)
+        if len(getattr(model, key)) != int(counts[key]):
+            raise ValueError('STEP5 source repository differs from STEP4/reference for '+key)
+    if len(model.boundaryConditions) != int(reference['boundary_conditions']):
+        raise ValueError('STEP5 source boundary conditions differ from the reference pipeline')
+    if len(model.loads) != int(reference['loads']):
+        raise ValueError('STEP5 source loads differ from the reference pipeline')
+    if len(model.constraints) != int(reference['rigid_links']):
+        raise ValueError('STEP5 source BEAM_MPC count differs from the reference pipeline')
+    if reference['connection_model'] != 'BEAM_MPC':
+        raise ValueError('STEP5 requires the production BEAM_MPC reference source')
+
+    fingerprint = mesh_digest(model, names)
     coordinates = [n.coordinates for name in names for n in assembly.instances[name].nodes]
     zmin, zmax = min(p[2] for p in coordinates), max(p[2] for p in coordinates)
     length = zmax-zmin
@@ -235,7 +261,7 @@ def prepare_model(model, args):
         for key in list(repository.keys()):
             del repository[key]
     del model.steps['Buckle']
-    bolts = replace_bolts(model)
+    bolts = replace_bolts(model, expected_links=reference['expected_links'])
     print('  Defining Riks loading and response outputs...'); sys.stdout.flush()
     for side, suffix in enumerate(('BOTTOM', 'TOP')):
         assembly.SetFromNodeLabels(name='STEP5_'+suffix, nodeLabels=tuple(end_labels[side]))
@@ -274,16 +300,29 @@ def prepare_model(model, args):
     if mesh_digest(model, names) != fingerprint:
         raise RuntimeError('Source imperfect node coordinates/connectivity changed during conversion')
     print('  Imperfect mesh preserved; preparing INP.'); sys.stdout.flush()
-    info = dict(stage=5, settings=vars(args), source_step4_description=prior_description,
+    info = dict(stage=5, settings=vars(args),
+        source_step4=dict(case=payload['current_case'], specification=specification),
+        reference_pipeline=reference,
         reference_force_N_per_end=end_area[0]*args.reference_stress,
         end_area_mm2=end_area[0], end_area_weights=weights,
         force_formula='P=LPF*reference_force_N_per_end (no preload)',
         shortening_formula='area_weighted_mean(U3_bottom)-area_weighted_mean(U3_top)',
         stop_node=[bottom_name, bottom_labels[0]], stop_positive_U3_mm=stop,
         material='Elastic-perfectly-plastic; source E/nu preserved; no damage',
-        bolts=bolts, connector='Assembled BEAM; axis 1 A->B; axis 2 projected column axis',
+        bolts=bolts,
+        connection_transition=dict(
+            source='BEAM_MPC from abaqus_complete_model_m20.py',
+            stage5='Assembled BEAM connector on the exact same endpoint node pairs',
+            reason='retain rigid beam kinematic intent while enabling connector force/moment output',
+            added_compliance='none intentionally introduced'),
         source_mesh_sha256=fingerprint,
-        warning='Pilot settings; no solve/convergence or physical mode classification validated. Do not remesh.')
+        compatibility_checks=dict(
+            instances=names, element_type=reference['element_type'],
+            source_rigid_links=int(reference['rigid_links']),
+            source_boundary_conditions=int(reference['boundary_conditions']),
+            source_loads=int(reference['loads']),
+            source_contact=reference['shell_contact']),
+        warning='Pilot Riks settings; no solve/convergence or physical mode classification validated. Do not remesh.')
     model.setValues(description='STEP5_GMNIA '+json.dumps(info, ensure_ascii=True))
     return info
 
@@ -304,7 +343,7 @@ def verify_input(path, bolts):
 def build(args):
     import caeModules
     from abaqus import openMdb
-    from abaqusConstants import ON, THREADS
+    from abaqusConstants import ON, MEGA_BYTES, FULL, SINGLE
     if not os.path.isfile(args.source_cae):
         raise ValueError('Source CAE not found: '+args.source_cae)
     if os.path.exists(args.output_dir) and (not os.path.isdir(args.output_dir) or os.listdir(args.output_dir)):
@@ -334,8 +373,14 @@ def build(args):
             model = database.Model(name=name, objectToCopy=database.models[source_name])
             del database.models[source_name]
             info = prepare_model(model, args)
-            job = database.Job(name=name, model=name, numCpus=args.cpus, numDomains=args.cpus,
-                multiprocessingMode=THREADS, description='Build only; '+info['force_formula'])
+            nodal_precision = str(info['reference_pipeline'].get('nodal_precision', 'full')).lower()
+            if nodal_precision not in ('full', 'single'):
+                raise ValueError('Unsupported inherited nodal precision: '+nodal_precision)
+            job = database.Job(
+                name=name, model=name, numCpus=args.cpus, numDomains=args.cpus,
+                memory=24000, memoryUnits=MEGA_BYTES,
+                nodalOutputPrecision=FULL if nodal_precision == 'full' else SINGLE,
+                description='Build only; reference-compatible STEP5; '+info['force_formula'])
             job.writeInput(consistencyChecking=ON)
             verify_input(name+'.inp', len(info['bolts']))
             outputs.append(name+'.inp')

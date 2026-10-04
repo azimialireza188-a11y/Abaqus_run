@@ -1,3 +1,4 @@
+import ast
 import unittest
 import numpy as np
 import abaqus_step4_imperfections as step4
@@ -26,6 +27,16 @@ class ImperfectionTests(unittest.TestCase):
         args = NS(axis='z', step='Buckle', local_mode=1, dist_mode=2)
         result = namespace['read_modes_and_mesh'](NS(rootAssembly=assembly), odb, ['P1'], args)
         np.testing.assert_allclose(result[2], [[0., -1., 0.]]*4)
+
+    def test_step4_is_bound_to_reference_pipeline_contract(self):
+        with open(step4.__file__, encoding='utf-8') as stream:
+            source = stream.read()
+        tree = ast.parse(source)
+        self.assertIn('pipeline_contract.load_reference_run', source)
+        self.assertIn("STEP4_PIPELINE_COMPATIBLE ", source)
+        self.assertNotIn("glob.glob(os.path.join(run_dir, '*'+suffix))", source)
+        self.assertIn("reference['job_name']", source)
+        self.assertIn("reference['source_inputs']['expected_links']", source)
 
     def test_seven_default_cases_and_optional_signs(self):
         cases = step4.case_definitions(2., .34, .7, 1.2, 3600.)

@@ -154,3 +154,26 @@ with many logical CPUs, 8 modes per shard is a useful compromise for a
 The final console summary reports `odb_extraction_backend` and
 `parquet_workers`. The fastest expected path is
 `bulkDataBlocks` plus a worker count close to the machine's logical CPU count.
+
+
+## Stage 4 / Stage 5 compatibility contract
+
+The nonlinear workflow is downstream of the exact production eigenvalue model;
+it is not a separate geometry/model generator.
+
+- Step 3/reference: `abaqus_complete_model_m20.py`
+- Step 4: `abaqus_step4_imperfections.py`
+- Step 5: `abaqus_step5_gmnia.py`
+
+Step 4 reads `pipeline_status.json` and binds itself to the recorded
+`build.job_name`, CAE, ODB, P1..P4 instances, S4R mesh, BEAM_MPC bolt count,
+BC/load count and GeneralContact definition. It stores that provenance in every
+`STEP4_*` model.
+
+Step 5 accepts only those pipeline-compatible Step-4 models. It preserves their
+imperfect mesh, BCs and contact; adds elastic-perfectly-plastic material and a
+Static Riks step; and converts each reference BEAM_MPC into an assembled BEAM
+connector on the exact same endpoint nodes so connector force/moment output can
+be requested. The conversion is explicitly recorded in model metadata.
+
+See `README_step4_imperfections.md` and `README_step5_gmnia.md`.

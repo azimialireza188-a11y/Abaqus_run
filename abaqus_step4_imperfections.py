@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""STEP 4 ONLY: create a new CAE containing documented imperfect meshes.
+"""STEP 4 ONLY: create a new CAE containing documented imperfect meshes from the exact completed reference pipeline run.
 
-Suggestions (read existing step-3 reports; no CAE/solver needed):
+Reference identity comes from run-dir/pipeline_status.json; arbitrary CAE/ODB glob selection is forbidden.\n\nSuggestions (read existing step-3 reports; no CAE/solver needed):
   abaqus python abaqus_step4_imperfections.py --run-dir "completed run" --suggest
 
 Build after YOU confirm mode IDs and amplitudes:
@@ -43,13 +43,13 @@ uniform thickness. A matching step-3 CAE and ODB are required. Abaqus 2024/Pytho
 import argparse
 import builtins as python_builtins
 import csv
-import glob
 import json
 import math
 import os
 import re
 import sys
 import numpy as np
+import abaqus_pipeline_contract as pipeline_contract
 
 DEFAULT_CASES = ('L_low', 'L_high', 'D', 'LD_pp', 'LD_pm', 'G1000', 'G3000')
 
@@ -112,14 +112,17 @@ def parse_arguments(argv=None):
 
 
 def suggest_modes(run_dir):
-    paths = sorted(glob.glob(os.path.join(run_dir, '*_modal_wavelengths_enhanced_modes.csv')))
-    if len(paths) != 1:
-        print('NO AUTOMATIC CANDIDATES: expected one enhanced mode CSV from step 3; found %d.' % len(paths))
-        print('Inspect the step-3 ODB manually or generate its enhanced report. No CAE was created.')
+    reference = pipeline_contract.load_reference_run(run_dir, require_completed=True)
+    path = os.path.join(reference['run_dir'],
+                        reference['job_name']+'_modal_wavelengths_enhanced_modes.csv')
+    if not os.path.isfile(path):
+        print('NO AUTOMATIC CANDIDATES: the reference enhanced-mode CSV is missing: '+path)
+        print('Run the normal reference postprocessing first, or inspect the matching ODB manually. No CAE was created.')
         return
-    with open(paths[0], newline='') as stream:
+    with open(path, newline='') as stream:
         rows = list(csv.DictReader(stream))
-    print('Source: '+paths[0])
+    print('Reference job: '+reference['job_name'])
+    print('Source: '+path)
     print('Heuristic suggestions only, NOT confirmed physical mode families. Verify full shapes in the step-3 ODB.')
     for family, flag in (('Local-like', '--local-mode'), ('Distortional-like', '--dist-mode')):
         candidates = [r for r in rows if r.get('family') == family and float(r['eigenvalue']) > 0]
@@ -181,19 +184,6 @@ def global_bow(coordinates, axis, angle_degrees):
     result[:, transverse[0]] = wave*math.cos(angle)
     result[:, transverse[1]] = wave*math.sin(angle)
     return result
-
-
-def discover_path(run_dir, explicit, suffix):
-    if explicit:
-        path = os.path.abspath(os.path.expanduser(explicit))
-    else:
-        paths = glob.glob(os.path.join(run_dir, '*'+suffix))
-        if len(paths) != 1:
-            raise ValueError('Expected exactly one %s file in %s; found %d. Specify the source explicitly.' % (suffix, run_dir, len(paths)))
-        path = paths[0]
-    if not os.path.isfile(path):
-        raise ValueError('Source file not found: '+path)
-    return path
 
 
 def shell_instances(model):
@@ -260,9 +250,11 @@ def read_modes_and_mesh(model, odb, names, args):
     if args.step not in odb.steps:
         raise ValueError('Buckling step not found: '+args.step)
     for frame in odb.steps[args.step].frames:
-        match = re.search(r'\bMode\s*[:=]?\s*(\d+)', frame.description, re.I)
-        if match:
-            mode = int(match.group(1))
+        mode = int(getattr(frame, 'mode', 0) or 0)
+        if mode <= 0:
+            match = re.search(r'\bMode\s*[:=]?\s*(\d+)', str(frame.description), re.I)
+            mode = int(match.group(1)) if match else 0
+        if mode > 0:
             if mode in frames:
                 raise ValueError('Duplicate mode IDs in selected step')
             frames[mode] = frame
@@ -327,25 +319,43 @@ def apply_offsets(model, names, keys, reference_coordinates, offsets, topology):
 def build(args):
     import caeModules
     from abaqus import openMdb, session
-    from abaqusConstants import ON
+    from abaqusConstants import ON, BEAM_MPC
     from odbAccess import openOdb
-    source_cae = discover_path(args.run_dir, args.source_cae, '.cae')
-    odb_path = discover_path(args.run_dir, args.odb, '.odb')
+
+    reference = pipeline_contract.load_reference_run(args.run_dir, require_completed=True)
+    source_cae = pipeline_contract.resolve_reference_artifact(reference, args.source_cae, 'cae')
+    odb_path = pipeline_contract.resolve_reference_artifact(reference, args.odb, 'odb')
     if os.path.exists(args.output_cae):
         raise ValueError('Output CAE already exists; select a new filename: '+args.output_cae)
-    if os.path.exists(os.path.splitext(odb_path)[0]+'.lck'):
-        raise ValueError('ODB is locked; wait until the step-3 job finishes')
+
     database = openMdb(pathName=source_cae)
-    candidates = [name for name, model in database.models.items() if len(shell_instances(model)) == 4]
-    model_name = args.model
-    if model_name is None:
-        if len(candidates) != 1:
-            raise ValueError('Select --model explicitly; four-piece candidates: '+str(candidates))
-        model_name = candidates[0]
+    model_name = args.model or reference['job_name']
+    if model_name != reference['job_name']:
+        raise ValueError('STEP4 must use the reference pipeline model %s, not %s' %
+                         (reference['job_name'], model_name))
+    if model_name not in database.models:
+        raise ValueError('Reference model is missing from source CAE: '+model_name)
     source = database.models[model_name]
-    names = args.instances or shell_instances(source)
-    if len(names) != 4 or len(set(names)) != 4:
-        raise ValueError('Select exactly four distinct shell instances')
+    names = list(args.instances or reference['instances'])
+    if tuple(names) != tuple(reference['instances']):
+        raise ValueError('STEP4 instances must be exactly '+','.join(reference['instances']))
+    if shell_instances(source) != sorted(reference['instances']):
+        raise ValueError('Source CAE shell instances differ from the reference pipeline')
+
+    # Enforce the exact upstream production contract before perturbing any node.
+    if len(source.boundaryConditions) != int(reference['build']['boundary_conditions']):
+        raise ValueError('Source CAE boundary conditions differ from pipeline_status.json')
+    if len(source.loads) != int(reference['build']['loads']):
+        raise ValueError('Source CAE loads differ from pipeline_status.json')
+    if len(source.constraints) != int(reference['build']['rigid_links']):
+        raise ValueError('Source CAE bolt constraint count differs from pipeline_status.json')
+    bolt_names = sorted(name for name in source.constraints if name.startswith('BOLT_'))
+    if len(bolt_names) != int(reference['source_inputs']['expected_links']):
+        raise ValueError('Source CAE BOLT_* count differs from the exported seam/bolt definition')
+    if any(getattr(source.constraints[name], 'mpcType', None) != BEAM_MPC for name in bolt_names):
+        raise ValueError('Source CAE no longer uses the reference BEAM_MPC bolt model')
+    if 'GeneralContact' not in source.interactions or 'Hard_Frictionless' not in source.interactionProperties:
+        raise ValueError('Source CAE no longer contains the reference general hard/frictionless contact')
     thicknesses = set()
     for name in names:
         instance = source.rootAssembly.instances[name]
@@ -383,8 +393,12 @@ def build(args):
     case_names = ['STEP4_'+name for name in selected]
     if any(name in database.models for name in case_names):
         raise ValueError('STEP4 model names already exist in source; start from the perfect step-3 CAE')
+    source_counts = {key: len(getattr(source, key)) for key in
+        ('boundaryConditions', 'constraints', 'interactions', 'loads', 'materials', 'sections')}
     manifest = dict(stage=4, source_cae=source_cae, source_model=model_name, source_odb=odb_path,
         source_odb_size=os.path.getsize(odb_path), source_odb_mtime=os.path.getmtime(odb_path),
+        reference_pipeline=pipeline_contract.reference_snapshot(reference, include_hashes=True),
+        source_repository_counts=source_counts,
         settings=vars(args), thickness_mm=thickness, length_mm=length, source_frames=descriptions,
         local_normalization=local_meta, distortional_normalization=dist_meta,
         global_shape='Analytical half-sine bow; prescribed transverse direction, not inferred weak axis',
@@ -392,8 +406,7 @@ def build(args):
         scope='Imperfection specimens only. Existing elastic steps/loads retained as reference; no GMNIA setup or solver jobs.',
         measurement_warning='0.34t is the plan input, not proof of statistical equivalence. Select a relevant local gauge.',
         mesh_warning='Imperfections are in node coordinates. Show mesh. Do not remesh.', cases={})
-    counts = {key: len(getattr(source, key)) for key in
-              ('boundaryConditions', 'constraints', 'interactions', 'loads', 'materials', 'sections')}
+    counts = dict(source_counts)
     for case_name in selected:
         a_local, a_dist, a_global = cases[case_name]
         offsets = a_local*local+a_dist*dist+a_global*global_shape
@@ -409,12 +422,12 @@ def build(args):
             actual_max_normal_offset_mm=float(np.max(np.abs(np.sum(offsets*normals, axis=1)))))
         manifest['cases'][name] = item
     for name in case_names:
-        database.models[name].setValues(description='STEP 4 IMPERFECT MESH ONLY. '+json.dumps(
+        database.models[name].setValues(description='STEP4_PIPELINE_COMPATIBLE '+json.dumps(
             dict(specification=manifest, current_case=manifest['cases'][name]), ensure_ascii=True))
     # Remove jobs only in the new in-memory database; source disk file is unchanged.
     for name in list(database.jobs.keys()):
         del database.jobs[name]
-    source.setValues(description=source.description+'\nSTEP4_MANIFEST='+json.dumps(manifest, ensure_ascii=True))
+    source.setValues(description=str(source.description or '')+'\nSTEP4_MANIFEST='+json.dumps(manifest, ensure_ascii=True))
     os.makedirs(os.path.dirname(args.output_cae), exist_ok=True)
     if session.viewports:
         viewport = session.viewports[session.currentViewportName]

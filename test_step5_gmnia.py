@@ -15,6 +15,22 @@ class Step5Tests(unittest.TestCase):
         args = step5.parse_arguments(base+['--fy', '350'])
         self.assertEqual(args.reference_stress, 350.)
 
+    def test_step5_requires_pipeline_compatible_step4_provenance(self):
+        with open(step5.__file__, encoding='utf-8') as stream:
+            source = stream.read()
+        self.assertIn("STEP4_PREFIX = 'STEP4_PIPELINE_COMPATIBLE '", source)
+        self.assertIn('pipeline_contract.validate_step4_payload', source)
+        self.assertIn("reference['expected_links']", source)
+        self.assertIn("source='BEAM_MPC from abaqus_complete_model_m20.py'", source)
+        self.assertIn("added_compliance='none intentionally introduced'", source)
+
+    def test_step5_job_inherits_reference_nodal_precision_contract(self):
+        with open(step5.__file__, encoding='utf-8') as stream:
+            source = stream.read()
+        self.assertIn("nodal_precision = str(info['reference_pipeline'].get('nodal_precision'", source)
+        self.assertIn('memory=24000', source)
+        self.assertIn('nodalOutputPrecision=FULL if nodal_precision', source)
+
     def test_end_weights_and_reference_force_use_one_end(self):
         # A shell 10 mm wide, 100 mm long, 2 mm thick.
         xyz = {1: (0., 0., 0.), 2: (10., 0., 0.),
