@@ -38,6 +38,12 @@ class ImperfectionTests(unittest.TestCase):
         self.assertIn("reference['job_name']", source)
         self.assertIn("reference['source_inputs']['expected_links']", source)
 
+    def test_abaqus_repositories_are_iterated_via_keys(self):
+        with open(step4.__file__, encoding='utf-8') as stream:
+            source = stream.read()
+        self.assertIn("source.constraints.keys()", source)
+        self.assertNotIn("for name in source.constraints if", source)
+
     def test_seven_default_cases_and_optional_signs(self):
         cases = step4.case_definitions(2., .34, .7, 1.2, 3600.)
         self.assertEqual(len(step4.DEFAULT_CASES), 7)

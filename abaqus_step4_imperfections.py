@@ -349,7 +349,7 @@ def build(args):
         raise ValueError('Source CAE loads differ from pipeline_status.json')
     if len(source.constraints) != int(reference['build']['rigid_links']):
         raise ValueError('Source CAE bolt constraint count differs from pipeline_status.json')
-    bolt_names = sorted(name for name in source.constraints if name.startswith('BOLT_'))
+    bolt_names = sorted(name for name in source.constraints.keys() if name.startswith('BOLT_'))
     if len(bolt_names) != int(reference['source_inputs']['expected_links']):
         raise ValueError('Source CAE BOLT_* count differs from the exported seam/bolt definition')
     if any(getattr(source.constraints[name], 'mpcType', None) != BEAM_MPC for name in bolt_names):
