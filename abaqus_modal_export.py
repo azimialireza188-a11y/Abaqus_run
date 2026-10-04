@@ -207,6 +207,14 @@ def _stage_npz(stage, mesh, dofs_per_node, shards):
             modes=data['modes'], eigenvalues=data['eigenvalues'])
 
 
+def _external_python_env():
+    """Launch normal Python without Abaqus' embedded-Python path contamination."""
+    env = os.environ.copy()
+    for name in ('PYTHONHOME', 'PYTHONPATH', 'PYTHONSTARTUP'):
+        env.pop(name, None)
+    return env
+
+
 def _candidate_commands(explicit=None):
     result = []
     if explicit:
@@ -238,7 +246,8 @@ def resolve_parquet_backend(explicit=None):
     for cmd in _candidate_commands(explicit):
         try:
             run = subprocess.run(cmd + ['-c', probe], stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, timeout=20)
+                                 stderr=subprocess.PIPE, text=True, timeout=20,
+                                 env=_external_python_env())
         except Exception as error:
             failures.append('%s: %s' % (' '.join(cmd), error))
             continue
@@ -247,7 +256,8 @@ def resolve_parquet_backend(explicit=None):
                         pyarrow_version=run.stdout.strip() or 'unknown')
         failures.append('%s: %s' % (' '.join(cmd), run.stderr.strip()[-240:]))
     raise RuntimeError(
-        'Parquet export requires Python with pyarrow. Install it in normal Python '
+        'Parquet export requires a normal Python with pyarrow. Abaqus PYTHONHOME/PYTHONPATH '
+        'are removed automatically for the external interpreter. Install pyarrow in normal Python '
         '(for example: py -3 -m pip install pyarrow) or pass --parquet-python PATH. '
         'Probes: ' + ' | '.join(failures))
 
@@ -268,7 +278,7 @@ def _write_parquet(stage, backend, compression='zstd', compression_level=9):
     command = list(backend['command']) + [script, '--stage-dir', str(stage),
         '--compression', compression, '--compression-level', str(compression_level)]
     run = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True)
+                         text=True, env=_external_python_env())
     if run.returncode != 0:
         raise RuntimeError('Parquet writer failed: ' + run.stderr[-2000:])
     report_path = stage / 'parquet_writer_report.json'

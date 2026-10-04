@@ -3,6 +3,7 @@ import os
 import tempfile
 import types
 import unittest
+from unittest import mock
 import numpy as np
 import abaqus_modal_export as exporter
 
@@ -86,6 +87,18 @@ class ModalExportTests(unittest.TestCase):
             self.assertEqual(first['vectors'].shape, (4 * (6 if with_ur else 3), 1))
             self.assertEqual(first['modes'].tolist(), [1])
             return report
+
+    def test_external_python_environment_drops_abaqus_python_paths(self):
+        with mock.patch.dict(os.environ, {
+                'PYTHONHOME': r'C:\SIMULIA\fake',
+                'PYTHONPATH': r'C:\SIMULIA\fake\lib',
+                'PYTHONSTARTUP': r'C:\SIMULIA\fake\startup.py',
+                'KEEP_ME': 'yes'}, clear=False):
+            env = exporter._external_python_env()
+        self.assertNotIn('PYTHONHOME', env)
+        self.assertNotIn('PYTHONPATH', env)
+        self.assertNotIn('PYTHONSTARTUP', env)
+        self.assertEqual(env.get('KEEP_ME'), 'yes')
 
     def test_new_u_ur_odb_exports_six_dofs_without_zero_fill(self):
         report = self.exercise(True, double=True)
