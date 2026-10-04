@@ -131,19 +131,56 @@ def lpf_history(step):
     return reference
 
 
-def lpf_for_frame(frame_value, history):
-    candidates = sorted(history, key=lambda pair: abs(pair[0]-frame_value))
-    if not candidates:
-        raise ValueError('Empty LPF history')
-    x, lpf = candidates[0]
-    tolerance = 1e-8*max(1.0, abs(frame_value), abs(x))
-    if abs(x-frame_value) > tolerance:
-        if abs(frame_value) <= tolerance and abs(x) <= tolerance:
-            return float(lpf)
+def align_lpf_history(frames, history):
+    """Align automatic Riks LPF history to field-output frames by sequence.
+
+    In Abaqus/Standard Riks output the history abscissa and ODB frameValue can
+    be offset by an increment even though the samples describe the same ordered
+    converged increments. Therefore numeric nearest-x matching is not valid.
+    This function accepts only the three auditable count patterns expected with
+    frequency=1: same count, one missing initial history sample, or one extra
+    initial zero history sample.
+    """
+    frames = list(frames)
+    history = list(history)
+    nf, nh = len(frames), len(history)
+    if not nf or not nh:
+        raise ValueError('Empty Riks frame sequence or LPF history')
+
+    if nh == nf:
+        offset = 0
+        mode = 'same_count_by_sequence'
+        pairs = [(history[i][0], history[i][1]) for i in range(nf)]
+    elif nh == nf-1:
+        first_value = float(frames[0].frameValue)
+        if abs(first_value) > 1e-10*max(1.0, abs(first_value)):
+            raise ValueError('LPF history has one fewer sample but the first field frame is not the initial frame')
+        offset = -1
+        mode = 'synthesized_initial_zero_then_sequence'
+        pairs = [(first_value, 0.0)] + [(history[i][0], history[i][1]) for i in range(nh)]
+    elif nh == nf+1:
+        hx, hy = history[0]
+        tolerance = 1e-10*max(1.0, abs(hx), abs(hy))
+        if abs(hx) > tolerance or abs(hy) > tolerance:
+            raise ValueError('LPF history has one extra sample but it is not an initial zero sample')
+        offset = 1
+        mode = 'skipped_extra_initial_zero_then_sequence'
+        pairs = [(history[i+1][0], history[i+1][1]) for i in range(nf)]
+    else:
         raise ValueError(
-            'Could not align ODB frame value %.12g with automatic LPF history; nearest %.12g' %
-            (frame_value, x))
-    return float(lpf)
+            'Cannot align Riks LPF history to field frames by sequence: %d frames, %d LPF samples' %
+            (nf, nh))
+
+    diagnostics = []
+    for i, (history_x, lpf) in enumerate(pairs):
+        frame_value = float(frames[i].frameValue)
+        if not all(math.isfinite(v) for v in (frame_value, float(history_x), float(lpf))):
+            raise ValueError('Non-finite Riks frame/LPF data at sequence index %d' % i)
+        diagnostics.append(abs(frame_value-float(history_x)))
+    return [float(pair[1]) for pair in pairs], dict(
+        mode=mode, frame_count=nf, history_count=nh, history_index_offset=offset,
+        max_abs_frameValue_minus_historyX=max(diagnostics),
+        final_abs_frameValue_minus_historyX=diagnostics[-1])
 
 
 def curve_rows(odb, step_name, info):
@@ -167,12 +204,13 @@ def curve_rows(odb, step_name, info):
     reference_stress = float(info.get('settings', {}).get('reference_stress', float('nan')))
 
     lpf_data = lpf_history(step)
+    aligned_lpf, lpf_alignment = align_lpf_history(step.frames, lpf_data)
     rows = []
     for index, frame in enumerate(step.frames):
         if 'U' not in frame.fieldOutputs:
             raise ValueError('Frame %d has no U field output' % index)
         frame_value = float(frame.frameValue)
-        lpf = lpf_for_frame(frame_value, lpf_data)
+        lpf = aligned_lpf[index]
         u3_bottom = weighted_u3(frame.fieldOutputs['U'], bottom, bottom_weights)
         u3_top = weighted_u3(frame.fieldOutputs['U'], top, top_weights)
         shortening = u3_bottom-u3_top
@@ -184,7 +222,7 @@ def curve_rows(odb, step_name, info):
             shortening_mm=shortening,
             force_N=force_n, force_kN=force_n/1000.0,
             nominal_stress_MPa=nominal_stress))
-    return rows
+    return rows, lpf_alignment
 
 
 def peak_summary(rows):
@@ -305,7 +343,7 @@ def extract(args):
 
     odb = openOdb(path=args.odb, readOnly=True)
     try:
-        rows = curve_rows(odb, args.step, info)
+        rows, lpf_alignment = curve_rows(odb, args.step, info)
     finally:
         odb.close()
 
@@ -328,7 +366,8 @@ def extract(args):
         shortening_convention=info.get('shortening_formula'),
         reference_force_N_per_end=info.get('reference_force_N_per_end'),
         end_area_mm2=info.get('end_area_mm2'),
-        frames=len(rows), lpf_source='Automatic ODB history output LPF', peak=peak,
+        frames=len(rows), lpf_source='Automatic ODB history output LPF',
+        lpf_alignment=lpf_alignment, peak=peak,
         csv=csv_path, svg=svg_path)
     with open(json_path, 'w', encoding='utf-8') as stream:
         json.dump(summary, stream, indent=2, allow_nan=False)
@@ -336,6 +375,10 @@ def extract(args):
 
     print('FORCE-DISPLACEMENT EXTRACTED')
     print('Frames : %d' % len(rows))
+    print('LPF map: %s; frames=%d history=%d; max |frameValue-historyX|=%.6g' %
+          (lpf_alignment['mode'], lpf_alignment['frame_count'],
+           lpf_alignment['history_count'],
+           lpf_alignment['max_abs_frameValue_minus_historyX']))
     print('Peak   : %.6g kN at %.6g mm (LPF %.6g)' %
           (peak['force_kN'], peak['shortening_mm'], peak['lpf']))
     print('CSV    : '+csv_path)

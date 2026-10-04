@@ -30,10 +30,28 @@ class ForceDisplacementTests(unittest.TestCase):
         weights = {('P1', 1): 1.0, ('P1', 2): 3.0}
         self.assertAlmostEqual(namespace['weighted_u3'](field, object(), weights), 3.5)
 
-    def test_lpf_for_frame_matches_history_abscissa_not_frame_value_as_lpf(self):
-        history = [(0.0, 0.0), (0.1, 0.75), (0.2, 1.10)]
-        self.assertAlmostEqual(fd.lpf_for_frame(0.1, history), 0.75)
-        self.assertAlmostEqual(fd.lpf_for_frame(0.2, history), 1.10)
+    def test_lpf_history_alignment_uses_sequence_when_abscissae_are_offset(self):
+        from types import SimpleNamespace as NS
+        frames = [NS(frameValue=0.0), NS(frameValue=0.10), NS(frameValue=0.20)]
+        history = [(0.0, 0.0), (0.05, 0.75), (0.15, 1.10)]
+        values, meta = fd.align_lpf_history(frames, history)
+        self.assertEqual(values, [0.0, 0.75, 1.10])
+        self.assertEqual(meta['mode'], 'same_count_by_sequence')
+        self.assertAlmostEqual(meta['max_abs_frameValue_minus_historyX'], 0.05)
+
+    def test_lpf_history_alignment_accepts_missing_initial_sample(self):
+        from types import SimpleNamespace as NS
+        frames = [NS(frameValue=0.0), NS(frameValue=0.10), NS(frameValue=0.20)]
+        history = [(0.05, 0.75), (0.15, 1.10)]
+        values, meta = fd.align_lpf_history(frames, history)
+        self.assertEqual(values, [0.0, 0.75, 1.10])
+        self.assertEqual(meta['mode'], 'synthesized_initial_zero_then_sequence')
+
+    def test_lpf_history_alignment_rejects_ambiguous_count(self):
+        from types import SimpleNamespace as NS
+        frames = [NS(frameValue=0.0), NS(frameValue=0.10), NS(frameValue=0.20)]
+        with self.assertRaises(ValueError):
+            fd.align_lpf_history(frames, [(0.0, 0.0)])
 
     def test_peak_summary_uses_maximum_force(self):
         rows = [
