@@ -88,3 +88,42 @@ Model description مدل‌های `STEP4_*` ذخیره می‌کند. Step 5 ب�
 Jobهای Step 5 نیز precision خروجی nodal را از run مرجع به ارث می‌برند و همان
 الگوی حافظهٔ 24000 MB کد مرجع را استفاده می‌کنند. CAE و INP هر مدل از یک Model/Job
 واحد تولید می‌شوند؛ نسخهٔ نمایشی جدا از مدل تحلیل وجود ندارد.
+
+
+## Force-displacement extraction
+
+For a solved STEP5 ODB, use `abaqus_step5_force_displacement.py` rather than
+plotting a single nodal RF3. The STEP5 end nodes are not axially constrained,
+and the reference load is applied as shell edge traction, so an end-node RF3 is
+not the column load.
+
+The extractor uses exactly the conventions stored by the STEP5 builder:
+
+`P = LPF * reference_force_N_per_end`
+
+and
+
+`delta = area_weighted_mean(U3_bottom) - area_weighted_mean(U3_top)`.
+
+It reads the reference force and end-area weights from the matching STEP5 CAE,
+then reads LPF and U3 from the solved ODB for every GMNIA frame. It writes CSV,
+JSON and a dependency-free SVG curve, and reports the peak load.
+
+Example:
+
+```bat
+cd /d "C:\Users\810200014.HAMI.000\Documents\Abaqus_run"
+
+abaqus cae noGUI=abaqus_step5_force_displacement.py -- ^
+  --cae "D:\CFS-Column\New folder (7)\New folder\Step5_GMNIA_FY240\Step5_GMNIA_FY240.cae" ^
+  --odb "D:\CFS-Column\New folder (7)\New folder\Step5_GMNIA_FY240\STEP5_D_FY240.odb"
+```
+
+The default output directory is the ODB directory. Expected files are:
+
+- `STEP5_D_FY240_force_displacement.csv`
+- `STEP5_D_FY240_force_displacement.json`
+- `STEP5_D_FY240_force_displacement.svg`
+
+The SVG is publication-friendly vector output. The CSV can be imported directly
+into Excel, Origin, MATLAB or Python for final figure styling.
