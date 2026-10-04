@@ -45,6 +45,8 @@ def parse_arguments(argv=None):
     p.add_argument('--model', help='STEP5 model name; default is ODB basename')
     p.add_argument('--step', default='GMNIA')
     p.add_argument('--output-dir', help='Default: directory containing the ODB')
+    p.add_argument('--allow-partial', action='store_true',
+                   help='Allow extraction from an in-progress ODB by using only the common complete frame/LPF prefix')
     args = p.parse_args(argv)
     args.cae = os.path.abspath(os.path.expanduser(args.cae))
     args.odb = os.path.abspath(os.path.expanduser(args.odb))
@@ -183,7 +185,7 @@ def align_lpf_history(frames, history):
         final_abs_frameValue_minus_historyX=diagnostics[-1])
 
 
-def curve_rows(odb, step_name, info):
+def curve_rows(odb, step_name, info, allow_partial=False):
     if step_name not in odb.steps:
         raise ValueError('ODB step not found: '+step_name)
     step = odb.steps[step_name]
@@ -204,9 +206,32 @@ def curve_rows(odb, step_name, info):
     reference_stress = float(info.get('settings', {}).get('reference_stress', float('nan')))
 
     lpf_data = lpf_history(step)
-    aligned_lpf, lpf_alignment = align_lpf_history(step.frames, lpf_data)
+    frames = list(step.frames)
+    partial = False
+    dropped_field_frames = 0
+    if len(frames) > len(lpf_data)+1:
+        if not allow_partial:
+            raise ValueError(
+                'ODB appears in-progress or incompletely flushed: %d field frames but %d LPF samples. '
+                'Re-run after the job finishes, or pass --allow-partial to extract only the common complete prefix.' %
+                (len(frames), len(lpf_data)))
+        partial = True
+        # Preserve the initial field frame plus one frame per available LPF sample when
+        # the LPF history omits the initial zero sample. If the first LPF sample is zero
+        # and counts align differently, fall back to an equal-length common prefix.
+        first_lpf_zero = False
+        if lpf_data:
+            hx0, hy0 = lpf_data[0]
+            tol0 = 1e-10*max(1.0, abs(hx0), abs(hy0))
+            first_lpf_zero = abs(hx0) <= tol0 and abs(hy0) <= tol0
+        target = len(lpf_data) if first_lpf_zero else min(len(frames), len(lpf_data)+1)
+        dropped_field_frames = len(frames)-target
+        frames = frames[:target]
+    aligned_lpf, lpf_alignment = align_lpf_history(frames, lpf_data)
+    lpf_alignment['partial'] = partial
+    lpf_alignment['dropped_field_frames'] = dropped_field_frames
     rows = []
-    for index, frame in enumerate(step.frames):
+    for index, frame in enumerate(frames):
         if 'U' not in frame.fieldOutputs:
             raise ValueError('Frame %d has no U field output' % index)
         frame_value = float(frame.frameValue)
@@ -343,7 +368,7 @@ def extract(args):
 
     odb = openOdb(path=args.odb, readOnly=True)
     try:
-        rows, lpf_alignment = curve_rows(odb, args.step, info)
+        rows, lpf_alignment = curve_rows(odb, args.step, info, allow_partial=args.allow_partial)
     finally:
         odb.close()
 
@@ -366,7 +391,8 @@ def extract(args):
         shortening_convention=info.get('shortening_formula'),
         reference_force_N_per_end=info.get('reference_force_N_per_end'),
         end_area_mm2=info.get('end_area_mm2'),
-        frames=len(rows), lpf_source='Automatic ODB history output LPF',
+        frames=len(rows), partial=bool(lpf_alignment.get('partial')),
+        lpf_source='Automatic ODB history output LPF',
         lpf_alignment=lpf_alignment, peak=peak,
         csv=csv_path, svg=svg_path)
     with open(json_path, 'w', encoding='utf-8') as stream:
@@ -374,11 +400,15 @@ def extract(args):
     write_svg(svg_path, rows, peak, model_name+' — Riks force-shortening')
 
     print('FORCE-DISPLACEMENT EXTRACTED')
+    print('Status : %s' % ('PARTIAL / IN-PROGRESS' if lpf_alignment.get('partial') else 'COMPLETE'))
     print('Frames : %d' % len(rows))
     print('LPF map: %s; frames=%d history=%d; max |frameValue-historyX|=%.6g' %
           (lpf_alignment['mode'], lpf_alignment['frame_count'],
            lpf_alignment['history_count'],
            lpf_alignment['max_abs_frameValue_minus_historyX']))
+    if lpf_alignment.get('partial'):
+        print('Partial: dropped %d newest field frame(s) lacking synchronized LPF history' %
+              lpf_alignment.get('dropped_field_frames', 0))
     print('Peak   : %.6g kN at %.6g mm (LPF %.6g)' %
           (peak['force_kN'], peak['shortening_mm'], peak['lpf']))
     print('CSV    : '+csv_path)

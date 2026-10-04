@@ -53,6 +53,45 @@ class ForceDisplacementTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fd.align_lpf_history(frames, [(0.0, 0.0)])
 
+    def test_partial_live_odb_uses_only_synchronized_prefix(self):
+        from types import SimpleNamespace as NS
+
+        class FakeField:
+            def __init__(self, values):
+                self.values = values
+            def getSubset(self, region=None):
+                return self
+
+        instance = NS(name='P1')
+        value = NS(instance=instance, nodeLabel=1, precision='SINGLE_PRECISION', data=(0.0, 0.0, 0.0))
+        frames = []
+        for i in range(6):
+            frames.append(NS(frameValue=float(i), fieldOutputs={'U': FakeField([value])}))
+        history = [(0.0, 0.0), (1.0, 0.1), (2.0, 0.2), (3.0, 0.3), (4.0, 0.4)]
+
+        step = NS(frames=frames, historyRegions={})
+        odb = NS(
+            steps={'GMNIA': step},
+            rootAssembly=NS(nodeSets={'STEP5_BOTTOM': object(), 'STEP5_TOP': object()}))
+
+        original_lpf_history = fd.lpf_history
+        original_weighted_u3 = fd.weighted_u3
+        try:
+            fd.lpf_history = lambda _step: history
+            fd.weighted_u3 = lambda field, region, weights: 0.0
+            info = {
+                'end_area_weights': [[['P1', 1, 1.0]], [['P1', 1, 1.0]]],
+                'reference_force_N_per_end': 1000.0,
+                'settings': {'reference_stress': 240.0},
+            }
+            rows, meta = fd.curve_rows(odb, 'GMNIA', info, allow_partial=True)
+            self.assertTrue(meta['partial'])
+            self.assertEqual(meta['dropped_field_frames'], 1)
+            self.assertEqual(len(rows), 5)
+        finally:
+            fd.lpf_history = original_lpf_history
+            fd.weighted_u3 = original_weighted_u3
+
     def test_peak_summary_uses_maximum_force(self):
         rows = [
             dict(frame=0, lpf=0.0, force_N=0.0, force_kN=0.0, shortening_mm=0.0,
