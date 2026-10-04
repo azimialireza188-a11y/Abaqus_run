@@ -103,6 +103,48 @@ def weighted_u3(field, region, weights):
     return sum(weights[key]*found[key] for key in weights)/total
 
 
+def lpf_history(step):
+    """Return automatic Static-Riks LPF history as (frameValue, LPF) pairs."""
+    matches = []
+    for region_name in step.historyRegions.keys():
+        region = step.historyRegions[region_name]
+        for output_name in region.historyOutputs.keys():
+            output = region.historyOutputs[output_name]
+            key = str(output_name).strip().upper()
+            description = str(getattr(output, 'description', '')).upper()
+            if key == 'LPF' or 'LOAD PROPORTIONALITY FACTOR' in description:
+                data = [(float(x), float(y)) for x, y in output.data]
+                if data:
+                    matches.append((str(region_name), str(output_name), data))
+    if not matches:
+        raise ValueError('Automatic Riks LPF history output was not found in the ODB')
+    reference = matches[0][2]
+    for region_name, output_name, data in matches[1:]:
+        if len(data) != len(reference):
+            raise ValueError('Multiple inconsistent LPF histories found in the ODB')
+        for (xa, ya), (xb, yb) in zip(reference, data):
+            tol_x = 1e-10*max(1.0, abs(xa), abs(xb))
+            tol_y = 1e-10*max(1.0, abs(ya), abs(yb))
+            if abs(xa-xb) > tol_x or abs(ya-yb) > tol_y:
+                raise ValueError('Multiple inconsistent LPF histories found in the ODB')
+    return reference
+
+
+def lpf_for_frame(frame_value, history):
+    candidates = sorted(history, key=lambda pair: abs(pair[0]-frame_value))
+    if not candidates:
+        raise ValueError('Empty LPF history')
+    x, lpf = candidates[0]
+    tolerance = 1e-8*max(1.0, abs(frame_value), abs(x))
+    if abs(x-frame_value) > tolerance:
+        if abs(frame_value) <= tolerance and abs(x) <= tolerance:
+            return float(lpf)
+        raise ValueError(
+            'Could not align ODB frame value %.12g with automatic LPF history; nearest %.12g' %
+            (frame_value, x))
+    return float(lpf)
+
+
 def curve_rows(odb, step_name, info):
     if step_name not in odb.steps:
         raise ValueError('ODB step not found: '+step_name)
@@ -123,18 +165,20 @@ def curve_rows(odb, step_name, info):
         raise ValueError('Invalid reference_force_N_per_end in STEP5 metadata')
     reference_stress = float(info.get('settings', {}).get('reference_stress', float('nan')))
 
+    lpf_data = lpf_history(step)
     rows = []
     for index, frame in enumerate(step.frames):
         if 'U' not in frame.fieldOutputs:
             raise ValueError('Frame %d has no U field output' % index)
-        lpf = float(frame.frameValue)
+        frame_value = float(frame.frameValue)
+        lpf = lpf_for_frame(frame_value, lpf_data)
         u3_bottom = weighted_u3(frame.fieldOutputs['U'], bottom, bottom_weights)
         u3_top = weighted_u3(frame.fieldOutputs['U'], top, top_weights)
         shortening = u3_bottom-u3_top
         force_n = lpf*pref
         nominal_stress = lpf*reference_stress if math.isfinite(reference_stress) else None
         rows.append(dict(
-            frame=index, lpf=lpf,
+            frame=index, frame_value=frame_value, lpf=lpf,
             u3_bottom_mm=u3_bottom, u3_top_mm=u3_top,
             shortening_mm=shortening,
             force_N=force_n, force_kN=force_n/1000.0,
@@ -269,7 +313,7 @@ def extract(args):
     csv_path = os.path.join(args.output_dir, stem+'.csv')
     json_path = os.path.join(args.output_dir, stem+'.json')
     svg_path = os.path.join(args.output_dir, stem+'.svg')
-    fields = ['frame', 'lpf', 'u3_bottom_mm', 'u3_top_mm', 'shortening_mm',
+    fields = ['frame', 'frame_value', 'lpf', 'u3_bottom_mm', 'u3_top_mm', 'shortening_mm',
               'force_N', 'force_kN', 'nominal_stress_MPa']
     with open(csv_path, 'w', newline='', encoding='utf-8-sig') as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -283,7 +327,7 @@ def extract(args):
         shortening_convention=info.get('shortening_formula'),
         reference_force_N_per_end=info.get('reference_force_N_per_end'),
         end_area_mm2=info.get('end_area_mm2'),
-        frames=len(rows), peak=peak,
+        frames=len(rows), lpf_source='Automatic ODB history output LPF', peak=peak,
         csv=csv_path, svg=svg_path)
     with open(json_path, 'w', encoding='utf-8') as stream:
         json.dump(summary, stream, indent=2, allow_nan=False)

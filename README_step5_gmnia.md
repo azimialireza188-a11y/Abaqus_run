@@ -106,7 +106,9 @@ and
 `delta = area_weighted_mean(U3_bottom) - area_weighted_mean(U3_top)`.
 
 It reads the reference force and end-area weights from the matching STEP5 CAE,
-then reads LPF and U3 from the solved ODB for every GMNIA frame. It writes CSV,
+then reads the automatic Static-Riks `LPF` history output and U3 from the solved
+ODB for every GMNIA frame. The ODB frame value is used only to align the frame
+with its LPF history sample; it is not assumed to equal LPF. It writes CSV,
 JSON and a dependency-free SVG curve, and reports the peak load.
 
 Example:
