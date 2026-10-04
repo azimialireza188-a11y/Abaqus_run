@@ -104,10 +104,13 @@ class ModalExportTests(unittest.TestCase):
                     {'odb_path': 'fake.odb', 'odb_sha256': 'abc'},
                     output_format='npz')
 
-    def test_mode_value_uses_full_frame_value_when_available(self):
+    def test_mode_value_uses_full_frame_value_only_when_consistent(self):
         frame = types.SimpleNamespace(mode=7, frameValue=12.345678901,
             description='Mode 7: EigenValue = 12.346')
         self.assertEqual(exporter.frame_eigen(frame), (7, 12.345678901))
+        inconsistent = types.SimpleNamespace(mode=7, frameValue=7.0,
+            description='Mode 7: EigenValue = 12.346')
+        self.assertEqual(exporter.frame_eigen(inconsistent), (7, 12.346))
 
 
 if __name__ == '__main__':

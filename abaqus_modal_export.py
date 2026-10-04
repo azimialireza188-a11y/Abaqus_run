@@ -52,24 +52,33 @@ def _unchanged(path, before, check_lock=False):
         raise ValueError('Source changed during export: ' + os.path.abspath(path))
 
 
+def _description_resolution(description):
+    match = _EIGEN.search(str(description))
+    if not match or not (match.group(2) or match.group(3)):
+        return None
+    return .5 * 10. ** (int(match.group(4) or 0) - len(match.group(3)))
+
+
 def frame_eigen(frame):
     mode = int(getattr(frame, 'mode', 0))
     if mode <= 0:
         return None
     description = str(getattr(frame, 'description', ''))
     match = _EIGEN.search(description)
-    printed = None
-    if match and (match.group(2) or match.group(3)):
-        printed = float(match.group(1).replace('D', 'E').replace('d', 'e'))
+    if not match or not (match.group(2) or match.group(3)):
+        raise ValueError('Missing eigenvalue in mode %d description' % mode)
+    printed = float(match.group(1).replace('D', 'E').replace('d', 'e'))
+    if not math.isfinite(printed):
+        raise ValueError('Nonfinite eigenvalue for mode %d' % mode)
     try:
         exact = float(frame.frameValue)
     except (AttributeError, TypeError, ValueError):
-        exact = None
-    if exact is not None and math.isfinite(exact):
-        return mode, exact
-    if printed is not None and math.isfinite(printed):
         return mode, printed
-    raise ValueError('Missing/nonfinite eigenvalue for mode %d' % mode)
+    resolution = _description_resolution(description)
+    if (math.isfinite(exact) and resolution is not None and
+            abs(exact - printed) <= 1.01 * resolution):
+        return mode, exact
+    return mode, printed
 
 
 def _vector(value):
