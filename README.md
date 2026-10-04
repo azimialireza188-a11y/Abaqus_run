@@ -19,6 +19,8 @@ abaqus cae noGUI=abaqus_complete_model_m20.py -- ^
   --nodal-precision full ^
   --longitudinal-lines 6 ^
   --longitudinal-line-min-spacing-mm 5 ^
+  --portable-export parquet ^
+  --portable-modes-per-shard 8 ^
   --modal-audit
 ```
 
@@ -50,3 +52,77 @@ Use `--build-only` when you want to inspect the actual CAE and INP without submi
 ## Regression checks
 
 The repository includes regression tests for the longitudinal-line selector, spacing filter, modal pipeline, audit, validation, visuals, and physical-wall helper. In particular, the longitudinal tests verify that inherited soft lines are filtered by the requested spacing while bolt lines and sharp corners remain mandatory.
+
+
+## Portable Parquet modal archive
+
+The full solver pipeline now requests both nodal `U` and `UR`. After a successful
+solve it creates a portable archive before the heavier report/audit stages. The
+default portable format is Parquet; use `--portable-export off` to disable it,
+`npz` for the NumPy-only archive, or `both` to keep both forms.
+
+Parquet uses ZSTD compression (level 9) and is stored in
+`portable_modal_export` under the run directory. The layout is deliberately
+columnar and compact:
+
+- `modal_export.json`: provenance, hashes, mode/eigenvalue metadata, precision,
+  field availability and artifact list.
+- `mesh_nodes.parquet`: one row per mesh node with instance, label and global
+  undeformed coordinates.
+- `raw_dof_map.parquet`: compact raw-index -> node-index/DOF mapping.
+- `elements.parquet`: S4R connectivity.
+- `modes.parquet`: one row per buckling mode.
+- `mode_shapes_0001.parquet`, ...: one row per node; each shard stores several
+  mode-component columns such as `m0001_u1` through `m0001_ur3`. This avoids
+  repeating instance/label metadata for every mode/node pair.
+
+The exporter preserves FP64 when the ODB nodal field is double precision. It
+uses FP32 only when the source field explicitly reports single precision; it
+does not down-cast unknown precision.
+
+### Parquet dependency
+
+ODB extraction is performed by Abaqus Python, but Parquet encoding can be
+delegated automatically to normal Python with `pyarrow`. Install once, for
+example:
+
+```bat
+py -3 -m pip install pyarrow numpy
+```
+
+If auto-detection cannot find that Python, add the exact interpreter:
+
+```bat
+--parquet-python "C:\Path\To\python.exe" ^
+```
+
+The Parquet backend is checked before an expensive solver run when Parquet is
+requested.
+
+### Export an older ODB without rebuilding or solving
+
+The same raw archive can be created later from an ODB produced by this workflow:
+
+```bat
+cd /d "C:\Users\810200014.HAMI.000\Documents\Abaqus_run"
+
+abaqus python abaqus_modal_export.py ^
+  --odb "D:\CFS-Column\New folder (10)\YOUR_RUN\BU_BOLT_L3600_M5.odb" ^
+  --output-dir "D:\CFS-Column\New folder (10)\YOUR_RUN\portable_modal_export_recovered" ^
+  --format parquet ^
+  --modes-per-shard 8
+```
+
+No CAE rebuild and no solver submission occur in this command. If a same-basename
+INP is present, its SHA256 is recorded; the ODB itself is sufficient for the raw
+mesh/mode archive.
+
+Older ODBs created when the builder requested only `U` remain exportable. The
+archive then contains only U1/U2/U3 and records
+`rotations_available=false`; UR is never filled with zeros or reconstructed.
+New runs request `U + UR`, so they produce the six-DOF portable map.
+
+This portable archive is raw modal data. It is not an mFSM operator pack and
+does not manufacture validated Local/Distortional/Global energy shares from the
+ODB. Mechanical mFSM decomposition still requires independently reviewed
+operators/evidence.

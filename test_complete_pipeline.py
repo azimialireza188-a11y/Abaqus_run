@@ -19,12 +19,15 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn('ModalShellDiagnostics', source)
         self.assertNotIn("variables=('S', 'E', 'SF', 'SE')", source)
         self.assertNotIn('abaqus_modal_shell_energy', source)
+        self.assertIn("variables=('U', 'UR')", source)
 
     def test_legacy_detailed_flag_is_accepted_but_classification_pipeline_stays_lean(self):
         args = builder.parse_arguments(['--buckle-output', 'detailed', '--modal-audit'])
         self.assertEqual(args.buckle_output, 'detailed')
         self.assertEqual(args.nodal_precision, 'full')
         self.assertTrue(args.modal_audit)
+        self.assertEqual(args.portable_export, 'parquet')
+        self.assertEqual(args.portable_modes_per_shard, 8)
         self.assertEqual(builder.parse_arguments(['--nodal-precision', 'single']).nodal_precision, 'single')
 
     def test_full_run_command_accepts_longitudinal_lines_with_modal_options(self):
@@ -214,7 +217,8 @@ class PipelineTests(unittest.TestCase):
             argv = ['--builtup-dir', root, '--output-dir', output, '--mesh-mm', '12.5',
                     '--n-modes', '100', '--n-vectors', '200', '--max-iterations', '400',
                     '--longitudinal-lines', '2', '--buckle-output', 'detailed',
-                    '--nodal-precision', 'full', '--modal-audit']
+                    '--nodal-precision', 'full', '--portable-export', 'npz',
+                    '--portable-modes-per-shard', '4', '--modal-audit']
             defaults = {k: getattr(builder, k) for k in
                 ('BUILTUP_DIR', 'MESH_MM', 'N_MODES', 'N_VECTORS', 'MAX_ITERATIONS',
                  'LONGITUDINAL_LINES')}
@@ -222,12 +226,21 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(run_dir, output)
                 self.assertTrue(os.path.isfile(os.path.join(run_dir, 'enhanced_called.txt')))
                 return {'status': 'audit_boundary_complete'}
+            def fake_portable(odb_path, run_dir, output_format='parquet',
+                              modes_per_shard=8, parquet_python=None,
+                              parquet_backend=None):
+                self.assertEqual(odb_path, os.path.join(output, 'CurrentRun.odb'))
+                self.assertEqual(run_dir, output)
+                self.assertEqual((output_format, modes_per_shard), ('npz', 4))
+                self.assertIsNone(parquet_backend)
+                return {'status': 'portable_boundary_complete'}
             with mock.patch.dict(builder.__dict__, defaults), \
                  mock.patch.object(builder, 'SCRIPT_DIR', root), \
                  mock.patch.object(builder, 'read_model_inputs', return_value=()), \
                  mock.patch.object(builder, 'input_summary', return_value={}), \
                  mock.patch.object(builder, 'build', side_effect=fake_build), \
                  mock.patch.object(builder, 'run_modal_audit', side_effect=fake_audit), \
+                 mock.patch.object(builder, 'run_portable_export', side_effect=fake_portable), \
                  mock.patch.dict(sys.modules, {'abaqusConstants': types.SimpleNamespace(ON=True)}), \
                  contextlib.redirect_stdout(io.StringIO()):
                 if final_status in ('COMPLETED', None):
@@ -242,6 +255,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(state['enhanced_report']['processed_modes'], 100)
                 self.assertEqual(state['settings']['longitudinal_lines'], 2)
                 self.assertEqual(state['modal_audit']['status'], 'audit_boundary_complete')
+                self.assertEqual(state['portable_export']['status'], 'portable_boundary_complete')
                 self.assertTrue(os.path.isfile(os.path.join(output, 'enhanced_called.txt')))
                 with open(os.path.join(output, 'post_called.txt')) as stream:
                     self.assertEqual(stream.read(), os.path.join(output, 'CurrentRun.odb'))
@@ -263,8 +277,11 @@ class PipelineTests(unittest.TestCase):
         with mock.patch.object(builder, 'resume_postprocessing', return_value='recovered') as resume, \
              mock.patch.object(builder, 'read_model_inputs', side_effect=AssertionError('Unexpected CSV read')), \
              mock.patch.object(builder, 'build', side_effect=AssertionError('Unexpected rebuild')):
-            self.assertEqual(builder.main(['--resume-post', 'previous run']), 'recovered')
-            resume.assert_called_once_with('previous run', modal_audit=False)
+            self.assertEqual(builder.main(['--resume-post', 'previous run',
+                                            '--portable-export', 'off']), 'recovered')
+            resume.assert_called_once_with(
+                'previous run', modal_audit=False, portable_export='off',
+                portable_modes_per_shard=8, parquet_python=None, parquet_backend=None)
 
 
 if __name__ == '__main__':

@@ -27,6 +27,9 @@ lines. For 2..99, --longitudinal-line-min-spacing-mm can prevent optional
 added boundaries from becoming too close along the section path. Essential
 boundaries and bolt lines always remain. Lines are selected from the original
 section; no coordinates or radii are changed.
+Portable modal export can be generated after the same solver run, or later
+from an existing ODB, without rebuilding the model. New runs retain both U
+and UR; old U-only ODBs are exported without inventing rotations.
 Set --check-inputs to validate the CSV data without starting Abaqus/CAE.
 """
 import csv
@@ -118,6 +121,13 @@ def parse_arguments(argv=None):
                         help='Legacy compatibility option. Automatic buckling now always stores classification-only nodal mode shapes; detailed no longer adds S/E/SF/SE.')
     parser.add_argument('--nodal-precision', choices=('full', 'single'), default='full',
                         help='Nodal ODB storage precision; does not change eigensolver accuracy')
+    parser.add_argument('--portable-export', choices=('off', 'parquet', 'npz', 'both'),
+                        default='parquet',
+                        help='Portable raw ODB export after solve; parquet is compact ZSTD columnar output')
+    parser.add_argument('--portable-modes-per-shard', type=int, default=8,
+                        help='Modes stored per portable mode-shape shard')
+    parser.add_argument('--parquet-python', default=None,
+                        help='Normal Python executable with pyarrow; auto-detected when omitted')
     output_options = parser.add_mutually_exclusive_group()
     output_options.add_argument('--output-dir', help='Exact new or empty output directory')
     output_options.add_argument('--output-root',
@@ -142,6 +152,8 @@ def parse_arguments(argv=None):
         parser.error('--mesh-mm must be positive and finite')
     if min(args.n_modes, args.max_iterations, args.cpus) < 1:
         parser.error('--n-modes, --max-iterations and --cpus must be positive')
+    if args.portable_modes_per_shard < 1:
+        parser.error('--portable-modes-per-shard must be positive')
     if args.n_vectors is None:
         args.n_vectors = max(N_VECTORS, min(2*args.n_modes, args.n_modes+8))
     if args.n_vectors < args.n_modes:
@@ -244,6 +256,40 @@ def enhanced_arguments(report):
     return [os.path.splitext(report['odb'])[0]+'_modal_wavelengths_report.json']
 
 
+def load_portable_exporter():
+    import importlib.util
+    path = os.path.join(SCRIPT_DIR, 'abaqus_modal_export.py')
+    spec = importlib.util.spec_from_file_location('pipeline_modal_export', path)
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    return exporter
+
+
+def portable_export_backend(output_format, parquet_python=None):
+    if output_format not in ('parquet', 'both'):
+        return None
+    return load_portable_exporter().resolve_parquet_backend(parquet_python)
+
+
+def run_portable_export(odb_path, run_dir, output_format='parquet',
+                        modes_per_shard=8, parquet_python=None,
+                        parquet_backend=None):
+    exporter = load_portable_exporter()
+    base = os.path.join(run_dir, 'portable_modal_export')
+    output = base
+    number = 2
+    while os.path.exists(output):
+        output = base + '_%02d' % number
+        number += 1
+    report = exporter.export_odb_path(
+        odb_path, output, output_format=output_format,
+        modes_per_shard=modes_per_shard, parquet_python=parquet_python,
+        parquet_backend=parquet_backend, compression='zstd', compression_level=9)
+    return dict(output_dir=report['output_dir'], manifest=os.path.join(report['output_dir'], 'modal_export.json'),
+                format=report['format'], mode_count=report['mode_count'],
+                rotations_available=report['rotations_available'], artifacts=report['artifacts'])
+
+
 def run_modal_audit(run_dir):
     import importlib.util
     path = os.path.join(SCRIPT_DIR, 'abaqus_dsm_modal_audit.py')
@@ -259,7 +305,9 @@ def run_modal_audit(run_dir):
                 mesh_shape_archive=summary.get('mesh_shape_archive'))
 
 
-def resume_postprocessing(run_dir, modal_audit=False):
+def resume_postprocessing(run_dir, modal_audit=False, portable_export='parquet',
+                          portable_modes_per_shard=8, parquet_python=None,
+                          parquet_backend=None):
     """Recover existing results without requiring source CSVs or a CAE session."""
     from types import SimpleNamespace
     run_dir = os.path.abspath(os.path.expanduser(run_dir))
@@ -285,8 +333,14 @@ def resume_postprocessing(run_dir, modal_audit=False):
         state['solver_api_status'] = state.get('solver_api_status', state.get('solver_status'))
         state['solver_status'] = 'COMPLETED'
         state['completion_evidence'] = evidence
-        save('POSTPROCESSING')
         progress('RESUME: '+evidence+'. No model rebuild or solver submission.')
+        if portable_export != 'off':
+            save('PORTABLE_EXPORTING')
+            progress('PORTABLE EXPORT: raw ODB mode shapes -> '+portable_export+'.')
+            state['portable_export'] = run_portable_export(
+                report['odb'], run_dir, portable_export, portable_modes_per_shard,
+                parquet_python=parquet_python, parquet_backend=parquet_backend)
+        save('POSTPROCESSING')
         progress('3/4 POSTPROCESS: all modes from '+report['odb'])
         state['postprocessing'] = processor.main(postprocess_arguments(report))
         if state['postprocessing']['available_modes'] < state['settings']['n_modes']:
@@ -851,7 +905,7 @@ def build(inputs=None, cpus=8, buckle_output='standard', nodal_precision='full')
     # Do not request S/E/SF/SE at every shell section point: those fields are
     # not used by the current Local/Distortional/Global classifier and can
     # dominate ODB size and postprocessing time for hundreds of modes.
-    model.FieldOutputRequest(name='ModeShapes', createStepName='Buckle', variables=('U',))
+    model.FieldOutputRequest(name='ModeShapes', createStepName='Buckle', variables=('U', 'UR'))
     for name in list(model.historyOutputRequests.keys()):
         del model.historyOutputRequests[name]
     job.writeInput(consistencyChecking=ON)
@@ -878,8 +932,8 @@ def build(inputs=None, cpus=8, buckle_output='standard', nodal_precision='full')
     report['source_inputs'] = input_summary(inputs)
     report['modal_output'] = dict(
         profile='classification_only', requested_legacy_profile=buckle_output,
-        nodal_precision=nodal_precision, fields=['U'],
-        mode_shape_components='U field used for transverse nodal eigenmode shapes; shell rotations are not required by the classifier',
+        nodal_precision=nodal_precision, fields=['U', 'UR'],
+        mode_shape_components='Global U and UR retained; U drives current screening while UR preserves portable/mFSM-ready nodal rotations',
         deliberately_omitted_fields=['S', 'E', 'SF', 'SE'],
         convention='Normalized perturbation mode shapes only; shell stress/strain/force energy diagnostics are intentionally not stored in the automatic buckling stage')
     with open(MODEL_NAME+'_build.json', 'w') as f:
@@ -893,8 +947,16 @@ def main(argv=None):
     global BUILTUP_DIR, MESH_MM, N_MODES, N_VECTORS, MAX_ITERATIONS
     global LONGITUDINAL_LINES, LONGITUDINAL_LINE_MIN_SPACING_MM
     args = parse_arguments(argv)
+    parquet_backend = None
+    if (args.portable_export in ('parquet', 'both') and
+            not args.build_only and not args.check_inputs):
+        parquet_backend = portable_export_backend(args.portable_export, args.parquet_python)
     if args.resume_post:
-        return resume_postprocessing(args.resume_post, modal_audit=args.modal_audit)
+        return resume_postprocessing(
+            args.resume_post, modal_audit=args.modal_audit,
+            portable_export=args.portable_export,
+            portable_modes_per_shard=args.portable_modes_per_shard,
+            parquet_python=args.parquet_python, parquet_backend=parquet_backend)
     BUILTUP_DIR, MESH_MM = args.builtup_dir, args.mesh_mm
     LONGITUDINAL_LINES = args.longitudinal_lines
     LONGITUDINAL_LINE_MIN_SPACING_MM = args.longitudinal_line_min_spacing_mm
@@ -902,8 +964,10 @@ def main(argv=None):
     validate_settings()
     inputs = read_model_inputs(BUILTUP_DIR)
     settings = vars(args).copy()
-    settings['effective_buckle_output'] = 'classification_only_U'
+    settings['effective_buckle_output'] = 'classification_U_plus_portable_UR'
     settings['automatic_shell_energy'] = False
+    if parquet_backend is not None:
+        settings['portable_parquet_backend'] = parquet_backend
     if args.check_inputs:
         print(json.dumps(dict(settings=settings, source_inputs=input_summary(inputs)), indent=2))
         return
@@ -965,6 +1029,14 @@ def main(argv=None):
             raise RuntimeError('Solver completed but expected ODB is missing: '+report['odb'])
         save_state('SOLVED')
         progress('Solver completed successfully: '+state['completion_evidence'])
+        if args.portable_export != 'off':
+            save_state('PORTABLE_EXPORTING')
+            progress('PORTABLE EXPORT: raw ODB mode shapes -> '+args.portable_export+'.')
+            state['portable_export'] = run_portable_export(
+                report['odb'], output_dir, args.portable_export,
+                args.portable_modes_per_shard, parquet_python=args.parquet_python,
+                parquet_backend=parquet_backend)
+            save_state('SOLVED')
         if processor is not None:
             save_state('POSTPROCESSING')
             progress('3/4 POSTPROCESS: all modes from '+report['odb'])
