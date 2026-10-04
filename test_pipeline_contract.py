@@ -83,7 +83,7 @@ class PipelineContractTests(unittest.TestCase):
         wrong = os.path.join(root, 'different.odb')
         with open(wrong, 'wb') as stream:
             stream.write(b'wrong')
-        with self.assertRaisesRegex(ValueError, 'expected basename'):
+        with self.assertRaisesRegex(ValueError, 'exact artifact'):
             contract.resolve_reference_artifact(loaded, wrong, 'odb')
 
     def test_step4_payload_requires_reference_provenance(self):

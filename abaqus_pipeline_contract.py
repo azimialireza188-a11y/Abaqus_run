@@ -131,10 +131,10 @@ def resolve_reference_artifact(contract, explicit, kind):
     expected = contract['paths'][kind]
     if explicit:
         path = os.path.abspath(os.path.expanduser(explicit))
-        if os.path.basename(path).lower() != os.path.basename(expected).lower():
+        if os.path.normcase(path) != os.path.normcase(os.path.abspath(expected)):
             raise ValueError(
-                'Explicit %s must belong to reference job %s; expected basename %s' %
-                (kind.upper(), contract['job_name'], os.path.basename(expected)))
+                'Explicit %s must be the exact artifact recorded by --run-dir: %s' %
+                (kind.upper(), expected))
     else:
         path = expected
     if not os.path.isfile(path):
