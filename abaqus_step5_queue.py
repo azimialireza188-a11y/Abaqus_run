@@ -23,6 +23,10 @@ import abaqus_step5_force_displacement as fd
 import abaqus_pipeline_contract as contract
 import runtime_resources as resources
 
+# Capture the executing filename before entering the run directory.
+SCRIPT_PATH = os.path.abspath(
+    globals().get('__file__', sys._getframe().f_code.co_filename))
+
 
 def crossing(values, ratio):
     if not 0 < ratio < 1:
@@ -281,7 +285,7 @@ def run(args):
         path=os.path.join(args.run_dir,'run_step5_queue_70_pct.bat')
         if os.path.exists(path):
             shutil.copy2(path,path+'.backup_'+time.strftime('%Y%m%d_%H%M%S'))
-        write_queue_batch(path,names,'auto',cae=cae,script=os.path.abspath(__file__),
+        write_queue_batch(path,names,'auto',cae=cae,script=SCRIPT_PATH,
                           ratio=args.ratio,stop_method=args.stop_method)
         print('REPAIRED: '+path+'; inputs and CAE preserved; no analysis submitted')
         return

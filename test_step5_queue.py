@@ -8,6 +8,14 @@ from types import SimpleNamespace
 
 
 class QueueTests(unittest.TestCase):
+    def test_nogui_without_file_resolves_runner_path(self):
+        q=self.queue()
+        with open(q.__file__, encoding='utf-8') as f:
+            source=f.read()
+        namespace={'__name__':'nogui_queue_test'}
+        exec(compile(source,q.__file__,'exec'),namespace)
+        self.assertEqual(namespace.get('SCRIPT_PATH'), os.path.abspath(q.__file__))
+
     def queue(self):
         self.assertIsNotNone(importlib.util.find_spec('abaqus_step5_queue'), 'compiler-free queue is missing')
         import abaqus_step5_queue

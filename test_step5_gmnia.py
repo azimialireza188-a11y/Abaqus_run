@@ -6,6 +6,25 @@ import abaqus_step5_gmnia as step5
 
 
 class Step5Tests(unittest.TestCase):
+    def test_nogui_without_file_resolves_queue_path_before_chdir(self):
+        import os
+        import tempfile
+        with open(step5.__file__, encoding='utf-8') as stream:
+            source = stream.read()
+        namespace = {'__name__': 'nogui_test'}
+        exec(compile(source, step5.__file__, 'exec'), namespace)
+        self.assertEqual(namespace['SCRIPT_DIR'], os.path.dirname(os.path.abspath(step5.__file__)))
+        previous = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                os.chdir(d)
+                namespace['write_queue_batch']('queue.bat', ['STEP5_D_FY240'])
+                with open('queue.bat') as f:
+                    text = f.read()
+                self.assertIn(os.path.join(namespace['SCRIPT_DIR'], 'abaqus_step5_queue.py'), text)
+            finally:
+                os.chdir(previous)
+
     def test_fy_is_required_and_arc_limits_are_consistent(self):
         base = ['--source-cae', 'source.cae', '--output-dir', 'out']
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

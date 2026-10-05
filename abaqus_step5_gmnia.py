@@ -56,7 +56,10 @@ import sys
 import tempfile
 import abaqus_pipeline_contract as pipeline_contract
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Abaqus/CAE noGUI can execute the script without a __file__ global.
+# Resolve before build changes cwd to its temporary workspace.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(
+    globals().get('__file__', sys._getframe().f_code.co_filename)))
 STEP4_PREFIX = 'STEP4_PIPELINE_COMPATIBLE '
 
 
@@ -630,4 +633,3 @@ def build(args):
 
 if __name__ == '__main__':
     build(parse_arguments())
-
