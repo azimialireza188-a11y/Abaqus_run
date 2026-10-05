@@ -208,7 +208,7 @@ class PipelineTests(unittest.TestCase):
                             stream.write('test boundary placeholder')
                         with open(self.name+'.sta', 'w') as stream:
                             stream.write('THE ANALYSIS HAS COMPLETED SUCCESSFULLY')
-            def fake_build(inputs, cpus, buckle_output='standard', nodal_precision='full'):
+            def fake_build(inputs, cpus, buckle_output='standard', nodal_precision='full', gpus=0):
                 self.assertEqual(builder.LONGITUDINAL_LINES, 2)
                 self.assertEqual((buckle_output, nodal_precision), ('detailed', 'full'))
                 self.assertEqual((builder.MESH_MM, builder.N_MODES, builder.N_VECTORS,
@@ -290,3 +290,4 @@ class PipelineTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

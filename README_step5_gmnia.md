@@ -1,6 +1,6 @@
 # گام ۵: ساخت مدل GMNIA بدون اجرای تحلیل
 
-اسکریپت `abaqus_step5_gmnia.py` فقط CAE مرحلهٔ چهارِ تولیدشده از همین pipeline مرجع را می‌پذیرد و یک فایل CAE و یک INP برای هر مدل انتخاب‌شده تحویل می‌دهد. هیچ Job ارسال نمی‌شود. مش، مختصات دارای نقص، شرایط مرزی و تماس قبلی حفظ می‌شوند. مدل بدون نقصِ مرجع وارد خروجی این مرحله نمی‌شود. Provenance مرحلهٔ چهار داخل Model description خوانده و قبل از هر تغییر با قرارداد `abaqus_complete_model_m20.py` کنترل می‌شود.
+اسکریپت `abaqus_step5_gmnia.py` فقط CAE مرحلهٔ چهارِ تولیدشده از همین pipeline مرجع را می‌پذیرد و یک فایل CAE و یک INP برای هر مدل انتخاب‌شده تحویل می‌دهد. هیچ Job ارسال نمی‌شود. مش، مختصات دارای نقص، شرایط مرزی و تماس قبلی حفظ می‌شوند. مدل بدون نقصِ مرجع نیز به‌طور پیش‌فرض وارد خروجی این مرحله می‌شود. Provenance مرحلهٔ چهار داخل Model description خوانده و قبل از هر تغییر با قرارداد `abaqus_complete_model_m20.py` کنترل می‌شود.
 
 ## دستور اجرا
 
@@ -14,7 +14,7 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
   --fy 350
 ```
 
-با این دستور هر هفت مدل `STEP4_*` تبدیل می‌شوند. برای شروع با یک مدل، به دستور اضافه کنید:
+با این دستور هر هفت مدل `STEP4_*` و یک مدل بدون نقص ساخته می‌شوند. برای شروع با یک مدل، به دستور اضافه کنید:
 
 ```bat
   --models STEP4_L_low
@@ -43,7 +43,7 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
 | `--max-increments` | 1000 |
 | `--max-end-displacement-mm` | 0.01L؛ برای L=3600 برابر 36 mm |
 | `--field-frequency` | 1؛ هر Increment |
-| `--cpus` | 8 |
+| `--cpus` | همهٔ CPUهای در دسترس |
 
 شرط جابه‌جایی مربوط به **U3 مثبت یک گره در انتهای پایین** است؛ کوتاه‌شدگی کل ستون نیست. گره پایش در Set به نام `STEP5_STOP` مشخص است. اندازهٔ مش از مرحلهٔ چهار می‌آید و اینجا تغییر نمی‌کند. طول‌قوس، زمان فیزیکی تحلیل نیست. معیارهای تعادل پیش‌فرض Abaqus ضعیف نشده‌اند و پایدارسازی مصنوعی اضافه نشده است.
 
@@ -86,7 +86,7 @@ Model description مدل‌های `STEP4_*` ذخیره می‌کند. Step 5 ب�
 نسخهٔ جدید Step 4 دوباره ساخته شود.
 
 Jobهای Step 5 نیز precision خروجی nodal را از run مرجع به ارث می‌برند و همان
-الگوی حافظهٔ 24000 MB کد مرجع را استفاده می‌کنند. CAE و INP هر مدل از یک Model/Job
+تنظیم حافظهٔ ۱۰۰٪ بدون رزرو و همهٔ CPUهای در دسترس را استفاده می‌کنند. CAE و INP هر مدل از یک Model/Job
 واحد تولید می‌شوند؛ نسخهٔ نمایشی جدا از مدل تحلیل وجود ندارد.
 
 
@@ -159,42 +159,83 @@ preload and uses `P = LPF * P_ref`, this is exactly equivalent to:
 LPF <= 0.70 * LPF_peak
 ```
 
-The builder writes `step5_postpeak_stop.for`, an Abaqus/Standard `URDFIL`
-routine. A minimal `*NODE FILE, NSET=STEP5_STOP, FREQUENCY=1` request is
-injected into every INP so URDFIL is called after every converged increment.
-URDFIL tracks the largest LPF reached and sets `LSTOP=1` at the first
-post-peak increment satisfying the 70% rule.
+The default queue now uses **compiler-free ODB monitoring**. It reads converged
+LPF history every second and invokes native `abaqus terminate job=...` after the
+first observed post-peak crossing. No `user=` is passed, so `ifort` is not needed.
+This is external monitoring, not an increment callback: ODB flush/poll/command
+latency can let extra increments run. The status JSON records the observed
+crossing, termination request, launcher exit code, and crossing verified from the
+final synchronized curve. Do not claim exact first-increment termination for
+monitor mode. Native termination cannot be resumed as a suspended job.
 
-The ratio is configurable, but the publication default is 0.70:
+`--stop-method urdfil` retains the exact increment callback option and requires
+a compatible Intel Fortran + Visual Studio Abaqus user-subroutine environment.
+The routine reads actual LPF from `.fil` record 2000 attribute 9 rather than
+assuming the URDFIL step-time argument is LPF. The builder still supplies the
+Fortran file and minimal frequency=1 NODE FILE request for this option.
+
+The default maximum is 5000 increments, with no displacement stop unless
+`--max-end-displacement-mm` is explicitly given. Nonconvergence and other solver
+failures remain failures; they are not converted into successful completion.
+
+## Repair an existing queue after the ifort error
+
+Pull the latest repository. In the directory containing your existing eight
+`STEP5_*.inp` files and `Step5_GMNIA_FY240.cae`, run:
 
 ```bat
---postpeak-stop-ratio 0.70
-```
-
-The builder also writes a sequential batch file such as:
-
-```text
+abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue.py" -- --run-dir . --repair-only
 run_step5_queue_70_pct.bat
 ```
 
-Each Abaqus command in that queue explicitly includes:
+Repair backs up the previous BAT, validates the CAE metadata and rewrites the
+queue; it does not rebuild/modify CAE or INP and does not submit jobs. The new BAT
+references the repository runner by absolute path. Keep that repository path
+available. Existing ODBs and live locks are never overwritten/deleted by this
+runner. Residual solver files from failed compilation are moved into a unique
+per-job backup directory before submission, preserving their diagnostics. For completed/failed existing ODBs, preserve results and replot using:
 
-```text
-user="step5_postpeak_stop.for"
+```bat
+abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue.py" -- --run-dir . --extract-only
 ```
 
-and the next job is attempted even if the preceding job exits with an error.
+If several STEP5 CAEs are present, specify the exact `--cae` path. Use `--jobs`
+to restrict the exact jobs intentionally. A failed earlier job does not prevent
+attempting the remaining queue, except that preflight conflicts stop submission
+before any job starts. Solver stdout/stderr is saved per job as
+`STEP5_*_queue_solver.log`.
 
-The 70% rule is the primary desired post-peak completion criterion. To keep it
-from competing with an unrelated finishing condition, the Step-5 builder no
-longer activates a default displacement stop. A displacement limit is used only
-when `--max-end-displacement-mm` is supplied explicitly. The default maximum
-increment count is increased to 5000 as a high safety cap. A job can still
-terminate earlier because of genuine nonconvergence, licensing, or another solver
-error; such a case must be reported as not reaching the common post-peak
-criterion and should not be treated as a complete publication run.
+## Automatic plots and resource requests
 
-Abaqus/Standard user-subroutine compilation must be configured on the machine
-for the URDFIL-controlled jobs. The CAE jobs store the generated Fortran file as
-their user subroutine, and the generated queue passes it explicitly on the
-command line.
+The queue extracts each finished/terminated readable ODB with its own matching
+CAE model metadata. It writes per-job CSV, JSON, SVG and PNG. It updates these
+comparison outputs after each attempted job and at the end:
+
+- `STEP5_all_force_displacement_combined.png` (Matplotlib 300 dpi when available)
+- `STEP5_all_force_displacement_combined.svg`
+- `STEP5_peak_summary.csv`
+- `STEP5_queue_status.json`
+
+Plots use shortening in mm, compression in kN, a legend including PERFECT and
+an `AsFy` reference computed from the model end area and its actual fy. Cases
+that do not reach the 70% drop or have solver errors are labeled accordingly.
+No strain/displacement sorting is applied to Riks snap-back paths. All cases
+must have field_frequency=1 for audited sequence alignment with automatic LPF
+history. The builder enforces this; existing sparse-output models are rejected.
+
+If Matplotlib is unavailable in Abaqus Python, PNG uses the native CAE XY plotting
+engine; SVG always uses the standard library. No pip installation is required.
+Native Abaqus/Windows execution and PNG fallback require verification on your
+machine; unit tests here cover numerical logic, resource commands and mocked
+process boundaries, not an actual GMNIA solve.
+
+New reference buckling and Step5 jobs default to all visible CPUs, memory=100%
+with getMemoryFromAnalysis disabled, and all detected NVIDIA GPUs requested
+through documented Abaqus CLI/environment settings (not an unsupported Job
+constructor keyword). Step5 requests standard_parallel=all. Buckling retains
+standard_parallel=solver because that procedure does not support parallel
+Standard element operations. Explicit --cpus/--gpus overrides remain available
+for deliberate use; omit old --cpus 8 commands to use the automatic default.
+No fixed RAM reserve or worker cap is imposed. The solver only uses hardware
+supported by its procedure and installed drivers; 100% utilization of every
+resource throughout a solve is not guaranteed.

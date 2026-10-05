@@ -29,7 +29,9 @@ class Step5Tests(unittest.TestCase):
     def test_urdfil_tracks_peak_and_stops_at_ratio(self):
         source = step5.render_postpeak_urdfil(0.70)
         self.assertIn('SUBROUTINE URDFIL', source)
-        self.assertIn('CURRLPF=TIME(1)', source)
+        self.assertIn('CALL POSFIL(KSTEP,KINC,ARRAY,JRCD)', source)
+        self.assertIn('JRRAY(1,2).EQ.2000', source)
+        self.assertIn('CURRLPF=ARRAY(11)', source)
         self.assertIn('PEAKLPF=CURRLPF', source)
         self.assertIn('CURRLPF.LE.RATIO*PEAKLPF', source)
         self.assertIn('LSTOP=1', source)
@@ -72,7 +74,7 @@ class Step5Tests(unittest.TestCase):
         with open(step5.__file__, encoding='utf-8') as stream:
             source = stream.read()
         self.assertIn("nodal_precision = str(info['reference_pipeline'].get('nodal_precision'", source)
-        self.assertIn('memory=24000', source)
+        self.assertIn('memory=100, memoryUnits=PERCENTAGE, getMemoryFromAnalysis=False', source)
         self.assertIn('nodalOutputPrecision=FULL if nodal_precision', source)
 
     def test_end_weights_and_reference_force_use_one_end(self):

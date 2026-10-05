@@ -116,7 +116,8 @@ def parse_arguments(argv=None):
     parser.add_argument('--n-modes', type=int, default=N_MODES)
     parser.add_argument('--n-vectors', type=int, default=None)
     parser.add_argument('--max-iterations', type=int, default=MAX_ITERATIONS)
-    parser.add_argument('--cpus', type=int, default=8)
+    parser.add_argument('--cpus', type=int, default=None, help='Default: all available CPUs')
+    parser.add_argument('--gpus', default='auto')
     parser.add_argument('--buckle-output', choices=('standard', 'detailed'), default='standard',
                         help='Legacy compatibility option. Automatic buckling now always stores classification-only nodal mode shapes; detailed no longer adds S/E/SF/SE.')
     parser.add_argument('--nodal-precision', choices=('full', 'single'), default='full',
@@ -141,6 +142,12 @@ def parse_arguments(argv=None):
     parser.add_argument('--resume-post', metavar='RUN_DIR',
                         help='Verify completed run and postprocess its ODB; never build or submit')
     args = parser.parse_args(argv)
+    import runtime_resources
+    try:
+        policy = runtime_resources.resolve_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
+    except ValueError as error:
+        parser.error(str(error))
+    args.cpus, args.gpus = policy.cpus, policy.gpus
     if args.longitudinal_lines not in [0] + list(range(2, 101)):
         parser.error('--longitudinal-lines must be 0 or an integer from 2 to 100')
     if (not math.isfinite(args.longitudinal_line_min_spacing_mm) or
@@ -697,7 +704,10 @@ def add_general_contact(model):
         assignments=((GLOBAL, SELF, 'Hard_Frictionless'),))
 
 
-def build(inputs=None, cpus=8, buckle_output='standard', nodal_precision='full'):
+def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='full', gpus='auto'):
+    import runtime_resources
+    policy = runtime_resources.resolve_policy(runtime_resources.detect_resources(), cpus, gpus)
+    cpus, gpus = policy.cpus, policy.gpus
     validate_settings()
     if inputs is None:
         inputs = read_model_inputs(BUILTUP_DIR)
@@ -710,7 +720,7 @@ def build(inputs=None, cpus=8, buckle_output='standard', nodal_precision='full')
     from abaqusConstants import (THREE_D, DEFORMABLE_BODY, ON, OFF, CARTESIAN,
         MIDDLE_SURFACE, FROM_SECTION, XYPLANE, XZPLANE, YZPLANE, QUAD,
         STRUCTURED, FIXED, S4R, STANDARD, SUBSPACE, SET, UNIFORM, GENERAL,
-        BEAM_MPC, DOF_MODE_MPC, MEGA_BYTES, FULL, SINGLE)
+        BEAM_MPC, DOF_MODE_MPC, PERCENTAGE, FULL, SINGLE)
     import mesh
     import regionToolset
     import interaction  # registers Model.MultipointConstraint in noGUI sessions
@@ -730,7 +740,7 @@ def build(inputs=None, cpus=8, buckle_output='standard', nodal_precision='full')
     assert hasattr(model, 'MultipointConstraint') and hasattr(mdb, 'Job')
     assert hasattr(model, 'fieldOutputRequests') and hasattr(model, 'historyOutputRequests')
     job = mdb.Job(name=MODEL_NAME, model=MODEL_NAME, numCpus=cpus, numDomains=cpus,
-                  memory=24000, memoryUnits=MEGA_BYTES,
+                  memory=100, memoryUnits=PERCENTAGE, getMemoryFromAnalysis=False,
                   nodalOutputPrecision=FULL if nodal_precision == 'full' else SINGLE)
     model.Material(name='Steel')
     model.materials['Steel'].Elastic(table=((young, poisson),))
@@ -997,13 +1007,15 @@ def main(argv=None):
         # Eigenvalue buckling supports solver parallelism, not element-loop parallelism.
         with open('abaqus_v6.env', 'w') as stream:
             stream.write('standard_parallel = SOLVER\n')
+            stream.write('gpus = %d\n' % args.gpus)
+            stream.write('memory = \"100%%\"\ncpus = %d\n' % args.cpus)
         progress('Output directory: '+output_dir)
         progress('Settings: '+json.dumps(settings, sort_keys=True))
         progress('1/4 BUILD: geometry, mesh, contact, CAE and INP.')
         if args.buckle_output == 'detailed':
             progress('NOTE: --buckle-output detailed is retained only for command compatibility; S/E/SF/SE are no longer requested in this buckling stage.')
         job, report = build(inputs=inputs, cpus=args.cpus,
-                            buckle_output=args.buckle_output, nodal_precision=args.nodal_precision)
+                            buckle_output=args.buckle_output, nodal_precision=args.nodal_precision, gpus=args.gpus)
         state['build'] = report
         save_state('BUILT')
         if args.build_only:
@@ -1070,3 +1082,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+

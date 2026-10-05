@@ -165,6 +165,8 @@ def align_lpf_history(frames, history):
         tolerance = 1e-10*max(1.0, abs(hx), abs(hy))
         if abs(hx) > tolerance or abs(hy) > tolerance:
             raise ValueError('LPF history has one extra sample but it is not an initial zero sample')
+        if abs(history[1][1]) > 1e-10:
+            raise ValueError('Extra LPF history would assign nonzero load to the initial field frame')
         offset = 1
         mode = 'skipped_extra_initial_zero_then_sequence'
         pairs = [(history[i+1][0], history[i+1][1]) for i in range(nf)]
@@ -186,6 +188,8 @@ def align_lpf_history(frames, history):
 
 
 def curve_rows(odb, step_name, info, allow_partial=False):
+    if int(info.get('settings', {}).get('field_frequency', 1)) != 1:
+        raise ValueError('field_frequency must be 1 for auditable LPF/field alignment')
     if step_name not in odb.steps:
         raise ValueError('ODB step not found: '+step_name)
     step = odb.steps[step_name]
@@ -209,7 +213,8 @@ def curve_rows(odb, step_name, info, allow_partial=False):
     frames = list(step.frames)
     partial = False
     dropped_field_frames = 0
-    if len(frames) > len(lpf_data)+1:
+    initial_history_zero = bool(lpf_data and abs(lpf_data[0][0]) <= 1e-10 and abs(lpf_data[0][1]) <= 1e-10)
+    if len(frames) > len(lpf_data)+(0 if initial_history_zero else 1):
         if not allow_partial:
             raise ValueError(
                 'ODB appears in-progress or incompletely flushed: %d field frames but %d LPF samples. '
@@ -423,3 +428,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+

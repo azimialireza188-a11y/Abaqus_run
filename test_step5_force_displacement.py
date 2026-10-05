@@ -105,6 +105,15 @@ class ForceDisplacementTests(unittest.TestCase):
         self.assertAlmostEqual(peak['force_kN'], 12.0)
         self.assertAlmostEqual(peak['shortening_mm'], 2.0)
 
+    def test_sparse_metadata_is_rejected_before_reading_odb(self):
+        with self.assertRaisesRegex(ValueError, 'field_frequency'):
+            fd.curve_rows(None,'GMNIA',{'settings':{'field_frequency':2}})
+
+    def test_extra_nonzero_history_cannot_be_assigned_to_initial_frame(self):
+        from types import SimpleNamespace as NS
+        with self.assertRaisesRegex(ValueError, 'initial'):
+            fd.align_lpf_history([NS(frameValue=0),NS(frameValue=2)],[(0,0),(1,1.2),(2,.7)])
+
     def test_ticks_are_finite_and_ordered(self):
         ticks = fd._nice_ticks(0.0, 13.0)
         self.assertTrue(ticks)

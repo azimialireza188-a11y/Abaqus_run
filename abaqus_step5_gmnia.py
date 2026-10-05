@@ -30,7 +30,7 @@ Primary post-peak stop: at the first converged increment after the peak for whic
 P <= postpeak_stop_ratio*Pu (default 0.70), implemented by URDFIL using the Riks
 LPF and LSTOP=1. Because P=LPF*P_ref with no preload, the force ratio is exactly
 the LPF ratio. A minimal NODE FILE request at every increment triggers URDFIL.
-The generated queue passes the supplied Fortran routine to every job.
+The default queue monitors ODB LPF without compiling Fortran; URDFIL is optional.
 
 The positive-U3 monitor is disabled by default so it cannot compete with the
 common 70% criterion; it is enabled only when --max-end-displacement-mm is
@@ -56,6 +56,7 @@ import sys
 import tempfile
 import abaqus_pipeline_contract as pipeline_contract
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STEP4_PREFIX = 'STEP4_PIPELINE_COMPATIBLE '
 
 
@@ -85,10 +86,18 @@ def parse_arguments(argv=None):
     p.add_argument('--max-increments', type=int, default=5000)
     p.add_argument('--max-end-displacement-mm', type=float)
     p.add_argument('--field-frequency', type=int, default=1)
-    p.add_argument('--cpus', type=int, default=8)
+    p.add_argument('--cpus', type=int, default=None, help='Default: all available CPUs')
+    p.add_argument('--gpus', default='auto')
+    p.add_argument('--stop-method', choices=['monitor', 'urdfil'], default='monitor')
     p.add_argument('--postpeak-stop-ratio', type=float, default=.70,
                    help='Stop at first converged post-peak increment with P <= ratio*Pu (default 0.70)')
     args = p.parse_args(argv)
+    import runtime_resources
+    try:
+        policy = runtime_resources.resolve_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
+    except ValueError as error:
+        p.error(str(error))
+    args.cpus, args.gpus = policy.cpus, policy.gpus
     if args.reference_stress is None:
         args.reference_stress = args.fy
     for name in ('fy', 'reference_stress', 'initial_arc', 'min_arc', 'max_arc', 'max_end_displacement_mm'):
@@ -97,6 +106,8 @@ def parse_arguments(argv=None):
             p.error('--%s must be positive and finite' % name.replace('_', '-'))
     if not args.min_arc <= args.initial_arc <= args.max_arc:
         p.error('Require min-arc <= initial-arc <= max-arc')
+    if args.field_frequency != 1:
+        p.error('--field-frequency must be 1 for auditable LPF/field alignment and automatic plots')
     if min(args.cpus, args.max_increments, args.field_frequency) < 1:
         p.error('cpus, max-increments and field-frequency must be positive')
     if (not math.isfinite(args.postpeak_stop_ratio)
@@ -148,7 +159,7 @@ def render_postpeak_urdfil(ratio):
     return """      SUBROUTINE URDFIL(LSTOP,LOVRWRT,KSTEP,KINC,DTIME,TIME)
 C
 C     STEP5 GMNIA POST-PEAK STOP
-C     In a Static Riks step TIME(1) is the load proportionality factor.
+C     Read LPF from increment record 2000, attribute 9 (ARRAY(11)).
 C     With no preload, P/Pu = LPF/LPF_peak. Stop at the first converged
 C     post-peak increment satisfying LPF <= RATIO*LPF_peak.
 C
@@ -157,7 +168,7 @@ C
       EQUIVALENCE (ARRAY(1),JRRAY(1,1))
       DOUBLE PRECISION PEAKLPF,CURRLPF,RATIO
       INTEGER PEAKINC
-      LOGICAL PEAKSET
+      LOGICAL PEAKSET,FOUND
       SAVE PEAKLPF,PEAKINC,PEAKSET
       DATA PEAKLPF /-1.D99/
       DATA PEAKINC /-1/
@@ -166,7 +177,24 @@ C
       RATIO=%s
       LSTOP=0
       LOVRWRT=0
-      CURRLPF=TIME(1)
+      FOUND=.FALSE.
+      CALL POSFIL(KSTEP,KINC,ARRAY,JRCD)
+      IF (JRCD.EQ.0 .AND. JRRAY(1,2).EQ.2000) THEN
+         CURRLPF=ARRAY(11)
+         FOUND=.TRUE.
+      END IF
+      DO WHILE (.NOT.FOUND .AND. JRCD.EQ.0)
+         CALL DBFILE(0,ARRAY,JRCD)
+         IF (JRCD.EQ.0 .AND. JRRAY(1,2).EQ.2000) THEN
+            CURRLPF=ARRAY(11)
+            FOUND=.TRUE.
+         END IF
+      END DO
+      IF (.NOT.FOUND) THEN
+         WRITE(7,*) 'STEP5 STOP ERROR: LPF RECORD NOT FOUND'
+         LSTOP=1
+         RETURN
+      END IF
 C
       IF (.NOT.PEAKSET .OR. CURRLPF.GT.PEAKLPF) THEN
          PEAKLPF=CURRLPF
@@ -206,33 +234,20 @@ def inject_urdfil_trigger(path):
         stream.write(text)
 
 
-def write_queue_batch(path, job_names, cpus, subroutine_name=STOP_SUBROUTINE_NAME):
-    """Sequential unattended queue; every next job starts even if the previous fails."""
-    lines = [
-        '@echo off',
-        'setlocal',
-        'cd /d "%~dp0"',
-        'echo ============================================================',
-        'echo STEP5 GMNIA SEQUENTIAL QUEUE - 70%% POST-PEAK RULE',
-        'echo ============================================================',
-    ]
-    for index, name in enumerate(job_names, 1):
-        lines.extend([
-            'echo.',
-            'echo [%d/%d] %s' % (index, len(job_names), name),
-            'call abaqus job=%s input=%s.inp user="%s" cpus=%d interactive' %
-                (name, name, subroutine_name, cpus),
-            'echo Finished %s with exit code %%ERRORLEVEL%%' % name,
-        ])
-    lines.extend([
-        'echo.',
-        'echo ============================================================',
-        'echo ALL QUEUED JOBS HAVE BEEN ATTEMPTED',
-        'echo ============================================================',
-        'endlocal',
-        '',
-    ])
-    with open(path, 'w') as stream:
+def write_queue_batch(path, job_names, cpus='auto', subroutine_name=STOP_SUBROUTINE_NAME,
+                      cae=None, script=None, ratio=.70, stop_method='monitor'):
+    """One CAE runner handles monitoring, per-job plots and final comparison."""
+    script = script or os.path.join(SCRIPT_DIR, 'abaqus_step5_queue.py')
+    command = ('call abaqus cae noGUI="%s" -- --run-dir "%%~dp0." '
+               '--cpus %s --gpus auto --ratio %g --stop-method %s --jobs %s' %
+               (script, cpus, ratio, stop_method, ' '.join(job_names)))
+    if cae:
+        command += ' --cae "%s"' % cae
+    lines = ['@echo off', 'setlocal', 'cd /d "%~dp0"',
+             'echo STEP5 GMNIA QUEUE - POST-PEAK MONITOR AND AUTOMATIC PLOTS',
+             command, 'set "QUEUE_EXIT=%ERRORLEVEL%"',
+             'echo Queue exit code: %QUEUE_EXIT%', 'endlocal & exit /b %QUEUE_EXIT%', '']
+    with open(path, 'w', newline='') as stream:
         stream.write('\r\n'.join(lines))
 
 
@@ -460,7 +475,8 @@ def prepare_model(model, args):
             ratio=args.postpeak_stop_ratio,
             criterion='first converged post-peak increment with P <= ratio*Pu',
             equivalent_lpf_criterion='LPF <= ratio*max_previous_LPF because P=LPF*P_ref and P0=0',
-            implementation='URDFIL LSTOP=1 triggered by NODE FILE frequency=1',
+            implementation=('ODB LPF polling and native Abaqus terminate; first observed crossing'
+                            if args.stop_method == 'monitor' else 'URDFIL LSTOP=1 triggered by NODE FILE frequency=1'),
             user_subroutine=STOP_SUBROUTINE_NAME),
         stop_node=[bottom_name, bottom_labels[0]], stop_positive_U3_mm=stop,
         material='Elastic-perfectly-plastic; source E/nu preserved; no damage',
@@ -500,7 +516,7 @@ def verify_input(path, bolts):
 def build(args):
     import caeModules
     from abaqus import openMdb
-    from abaqusConstants import ON, MEGA_BYTES, FULL, SINGLE
+    from abaqusConstants import ON, PERCENTAGE, FULL, SINGLE
     if not os.path.isfile(args.source_cae):
         raise ValueError('Source CAE not found: '+args.source_cae)
     if os.path.exists(args.output_dir) and (not os.path.isdir(args.output_dir) or os.listdir(args.output_dir)):
@@ -543,6 +559,9 @@ def build(args):
         with open(STOP_SUBROUTINE_NAME, 'w') as stream:
             stream.write(render_postpeak_urdfil(args.postpeak_stop_ratio))
         outputs.append(STOP_SUBROUTINE_NAME)
+        with open('abaqus_v6.env','w') as stream:
+            stream.write('standard_parallel = ALL\ngpus = %d\ncpus = %d\nmemory = \"100%%\"\n' % (args.gpus,args.cpus))
+        outputs.append('abaqus_v6.env')
 
         for i, source_name in enumerate(selected, 1):
             if source_name == PERFECT_TOKEN:
@@ -561,9 +580,9 @@ def build(args):
                 raise ValueError('Unsupported inherited nodal precision: '+nodal_precision)
             job = database.Job(
                 name=name, model=name, numCpus=args.cpus, numDomains=args.cpus,
-                memory=24000, memoryUnits=MEGA_BYTES,
+                memory=100, memoryUnits=PERCENTAGE, getMemoryFromAnalysis=False,
                 nodalOutputPrecision=FULL if nodal_precision == 'full' else SINGLE,
-                userSubroutine=final_user_subroutine,
+                userSubroutine=final_user_subroutine if args.stop_method == 'urdfil' else '',
                 description='Build only; reference-compatible STEP5; '+info['force_formula'])
             job.writeInput(consistencyChecking=ON)
             inject_urdfil_trigger(name+'.inp')
@@ -581,7 +600,7 @@ def build(args):
 
         ratio_tag = ('%g' % (100.*args.postpeak_stop_ratio)).replace('.', 'p')
         queue_name = 'run_step5_queue_'+ratio_tag+'_pct.bat'
-        write_queue_batch(queue_name, job_names, args.cpus)
+        write_queue_batch(queue_name, job_names, 'auto', ratio=args.postpeak_stop_ratio, stop_method=args.stop_method)
         outputs.append(queue_name)
 
         cae_name = 'Step5_GMNIA_FY'+tag+'.cae'
@@ -611,3 +630,4 @@ def build(args):
 
 if __name__ == '__main__':
     build(parse_arguments())
+
