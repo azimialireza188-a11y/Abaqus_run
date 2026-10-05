@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Run/repair existing Step5 inputs, monitor 70% drop, extract and compare curves.
 
-abaqus cae noGUI=abaqus_step5_queue.py -- --run-dir DIR --repair-only
+abaqus cae noGUI=abaqus_step5_queue_nogui.py -- --run-dir DIR --repair-only
 Then run the regenerated run_step5_queue_70_pct.bat. No model rebuild needed.
 Monitor mode needs no Fortran compiler; it stops at first OBSERVED crossing.
 """
@@ -289,7 +289,8 @@ def run(args):
         path=os.path.join(args.run_dir,'run_step5_queue_70_pct.bat')
         if os.path.exists(path):
             shutil.copy2(path,path+'.backup_'+time.strftime('%Y%m%d_%H%M%S'))
-        write_queue_batch(path,names,'auto',cae=cae,script=SCRIPT_PATH,
+        write_queue_batch(path,names,'auto',cae=cae,
+                          script=os.path.join(SCRIPT_DIR,'abaqus_step5_queue_nogui.py'),
                           ratio=args.ratio,stop_method=args.stop_method)
         print('REPAIRED: '+path+'; inputs and CAE preserved; no analysis submitted')
         return
@@ -362,6 +363,17 @@ def main():
     argv=sys.argv[1:]
     if '--' in argv:
         argv=argv[argv.index('--')+1:]
+    elif '-cae' in argv:
+        # Match the existing builder's handling of CAE launcher arguments.
+        clean, i = [], 0
+        while i < len(argv):
+            if argv[i] == '-cae':
+                i += 1
+            elif argv[i] in ('-noGUI', '-tmpdir', '-lmlog'):
+                i += 2
+            else:
+                clean.append(argv[i]); i += 1
+        argv = clean
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-dir',required=True)
     p.add_argument('--cae')

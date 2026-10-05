@@ -240,7 +240,7 @@ def inject_urdfil_trigger(path):
 def write_queue_batch(path, job_names, cpus='auto', subroutine_name=STOP_SUBROUTINE_NAME,
                       cae=None, script=None, ratio=.70, stop_method='monitor'):
     """One CAE runner handles monitoring, per-job plots and final comparison."""
-    script = script or os.path.join(SCRIPT_DIR, 'abaqus_step5_queue.py')
+    script = script or os.path.join(SCRIPT_DIR, 'abaqus_step5_queue_nogui.py')
     command = ('call abaqus cae noGUI="%s" -- --run-dir "%%~dp0." '
                '--cpus %s --gpus auto --ratio %g --stop-method %s --jobs %s' %
                (script, cpus, ratio, stop_method, ' '.join(job_names)))

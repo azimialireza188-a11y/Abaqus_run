@@ -21,7 +21,7 @@ class Step5Tests(unittest.TestCase):
                 namespace['write_queue_batch']('queue.bat', ['STEP5_D_FY240'])
                 with open('queue.bat') as f:
                     text = f.read()
-                self.assertIn(os.path.join(namespace['SCRIPT_DIR'], 'abaqus_step5_queue.py'), text)
+                self.assertIn(os.path.join(namespace['SCRIPT_DIR'], 'abaqus_step5_queue_nogui.py'), text)
             finally:
                 os.chdir(previous)
 

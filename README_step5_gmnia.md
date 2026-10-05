@@ -184,7 +184,7 @@ Pull the latest repository. In the directory containing your existing eight
 `STEP5_*.inp` files and `Step5_GMNIA_FY240.cae`, run:
 
 ```bat
-abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue.py" -- --run-dir . --repair-only
+abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue_nogui.py" -- --run-dir . --repair-only
 run_step5_queue_70_pct.bat
 ```
 
@@ -196,7 +196,7 @@ runner. Residual solver files from failed compilation are moved into a unique
 per-job backup directory before submission, preserving their diagnostics. For completed/failed existing ODBs, preserve results and replot using:
 
 ```bat
-abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue.py" -- --run-dir . --extract-only
+abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue_nogui.py" -- --run-dir . --extract-only
 ```
 
 If several STEP5 CAEs are present, specify the exact `--cae` path. Use `--jobs`
@@ -239,3 +239,10 @@ for deliberate use; omit old --cpus 8 commands to use the automatic default.
 No fixed RAM reserve or worker cap is imposed. The solver only uses hardware
 supported by its procedure and installed drivers; 100% utilization of every
 resource throughout a solve is not guaranteed.
+
+The BAT now launches `abaqus_step5_queue_nogui.py`, an explicit CAE entry script
+that calls the reusable runner main even when CAE does not set `__name__` to
+`__main__`. Existing output BATs are generated artifacts and are not modified by
+`git pull`: run the repair-only command once after this launcher update. A fresh
+run must print `STEP5 NOGUI DRIVER STARTED`, then its resource request and job
+progress; exit code zero alone is not evidence that the queue executed.

@@ -8,6 +8,37 @@ from types import SimpleNamespace
 
 
 class QueueTests(unittest.TestCase):
+    def test_nogui_driver_calls_main_even_in_nonmain_namespace(self):
+        from pathlib import Path
+        q=self.queue()
+        driver=Path(q.__file__).with_name('abaqus_step5_queue_nogui.py')
+        self.assertTrue(driver.is_file(), 'explicit noGUI driver missing')
+        calls=[]
+        with mock.patch.object(q,'main',side_effect=lambda: calls.append('called')):
+            exec(compile(driver.read_text(),str(driver),'exec'),{'__name__':'abaqus'})
+        self.assertEqual(calls,['called'])
+
+    def test_driver_executes_in_isolated_foreign_cwd_without_main_namespace(self):
+        import subprocess
+        import sys
+        from pathlib import Path
+        q=self.queue()
+        driver=str(Path(q.__file__).with_name('abaqus_step5_queue_nogui.py'))
+        code="import sys; from pathlib import Path; p=%r; sys.argv=['abaqus','--','--help']; exec(compile(Path(p).read_text(),p,'exec'),{'__name__':'abaqus'})" % driver
+        with tempfile.TemporaryDirectory() as d:
+            result=subprocess.run([sys.executable,'-I','-c',code],cwd=d,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('STEP5 NOGUI DRIVER STARTED',result.stdout)
+        self.assertIn('--run-dir',result.stdout)
+
+    def test_main_accepts_cae_launcher_flags_without_separator(self):
+        import sys
+        q=self.queue()
+        with mock.patch.object(sys,'argv',['abaqus','-cae','-noGUI',q.__file__,'--run-dir','folder','--repair-only']), mock.patch.object(q,'run') as run:
+            q.main()
+        self.assertTrue(run.call_args.args[0].repair_only)
+        self.assertEqual(run.call_args.args[0].run_dir,os.path.abspath('folder'))
+
     def test_absolute_nogui_script_imports_siblings_from_another_directory(self):
         import subprocess
         import sys
@@ -62,7 +93,7 @@ class QueueTests(unittest.TestCase):
             build.write_queue_batch(p, ['STEP5_D_FY240'], 24)
             with open(p) as f:
                 s = f.read()
-            self.assertIn('abaqus_step5_queue.py', s)
+            self.assertIn('abaqus_step5_queue_nogui.py', s)
             self.assertNotIn('user="step5_postpeak_stop.for"', s)
 
     def test_comparison_contains_all_curves_and_yield_line(self):
