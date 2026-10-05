@@ -20,7 +20,7 @@ import abaqus_modal_wavelengths as base
 from abaqus_modal_report import SectionProjector, load_physical_segments
 from runtime_resources import detect_resources, resolve_policy, available_memory
 
-VERSION = 'fast-curved-wall-screening-1'
+VERSION = 'fast-curved-wall-screening-2'
 FAMILIES = ('GLOBAL', 'DISTORTIONAL', 'LOCAL')
 KEYS = ('G', 'A', 'D', 'L', 'O')
 LIMITATION = ('Geometric displacement screening, not energy/modal participation or DSM acceptance. '
@@ -209,6 +209,32 @@ def flag_clusters(rows, relative_gap=2e-4):
                 row['global_subtype'] = None
 
 
+def wall_mapping_status(metadata, names, coordinate_tolerance):
+    """Separate coordinate precision from bounded discretization of a fold.
+
+    Free section ends must match coordinates. An interior physical boundary
+    can lie between mesh nodes: nearest-node snapping is accepted only within
+    half its local adjacent mesh interval. Approximation remains diagnostic.
+    """
+    numeric=10*coordinate_tolerance
+    checks=[]; snapped=False; reasons=[]
+    expected=sum(len(v['walls']) for v in metadata['source_wall_layouts'].values())
+    if not metadata['geometry_supported']: reasons.append('unsupported_section_topology')
+    if set(metadata['source_wall_layouts'])!=set(names): reasons.append('missing_piece_wall_layout')
+    if expected==0 or metadata['physical_wall_count']!=expected: reasons.append('missing_or_collapsed_physical_walls')
+    endpoints=metadata.get('wall_endpoint_mapping',[])
+    if not endpoints: reasons.append('endpoint_mapping_missing')
+    for endpoint in endpoints:
+        allowance=numeric if endpoint['piece_end'] else .5*endpoint['adjacent_edge_mm']+numeric
+        accepted=endpoint['error_mm']<=allowance
+        checks.append(dict(endpoint,allowed_error_mm=allowance,accepted=accepted))
+        if not accepted: reasons.append('endpoint_outside_local_mesh_interval')
+        if endpoint['error_mm']>numeric: snapped=True
+    return dict(supported=not reasons,mesh_snapped=snapped,checks=checks,
+                reasons=sorted(set(reasons)),coordinate_tolerance_mm=coordinate_tolerance,
+                definition='exact free ends; nearest-node interior boundaries within half local adjacent edge')
+
+
 def prepare_geometry(odb, names, axis, run_dir, physical_segments=None):
     tracks, mesh, keys, areas, origin, length, tol = base.collect_tracks(odb, names, axis, 1e-5)
     if any(m['coverage'] < .98 for m in mesh):
@@ -236,12 +262,13 @@ def prepare_geometry(odb, names, axis, run_dir, physical_segments=None):
     source = physical_segments if physical_segments is not None else load_physical_segments(run_dir)
     fit = SectionProjector(xy, sorted(edges), [t['instance'] for t in tracks],
                            [t['weight'] for t in tracks], physical_segments=source, compute_bases=False)
-    mapped = fit.metadata['source_wall_layouts']
-    supported = (fit.supported and source is not None and set(mapped)==set(names) and
-                 fit.metadata['maximum_wall_mapping_error_mm'] <= 10*tol)
+    mapping=wall_mapping_status(fit.metadata,names,tol)
+    fit.metadata['fast_wall_mapping']=mapping
+    supported=source is not None and mapping['supported']
     warnings = []
     if source is None: warnings.append('source_walls_missing_mesh_fallback')
     if not supported: warnings.append('physical_wall_mapping_unconfirmed')
+    elif mapping['mesh_snapped']: warnings.append('wall_boundary_mesh_snapped')
     if fit.metadata['curved_panel_proxy']: warnings.append('limited_physical_wall_coverage')
     # Keep only compiled sparse/fold operators and metadata. Release the dense
     # temporary projector before reading mode fields or choosing batch capacity.
@@ -309,6 +336,13 @@ def write_report(path, report):
 def print_report(report, cached=False):
     print('FAST ODB SHAPE SCREENING%s | %s' % (' (cache)' if cached else '',VERSION))
     print(LIMITATION)
+    mapping=report['geometry'].get('fast_wall_mapping',{})
+    print('Wall mapping: supported=%s, max error=%.6g mm, mesh-snapped=%s'%
+          (mapping.get('supported'),report['geometry']['maximum_wall_mapping_error_mm'],
+           mapping.get('mesh_snapped')))
+    for item in [c for c in mapping.get('checks',[]) if not c['accepted']][:3]:
+        print('  failed boundary: piece=%s node=%s error=%.6g mm allowed=%.6g mm'%
+              (item['piece'],item['node'],item['error_mm'],item['allowed_error_mm']))
     for family in FAMILIES:
         rows=sorted((r for r in report['modes'] if r['family']==family and r['status']=='CANDIDATE'
                      and r['eigenvalue']>0), key=lambda r:r['eigenvalue'])

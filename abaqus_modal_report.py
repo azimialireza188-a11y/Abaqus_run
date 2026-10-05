@@ -128,6 +128,15 @@ class SectionProjector:
             ia, ib=chain.index(aa), chain.index(bb)
             return chain[ia:ib+1] if ia<=ib else list(reversed(chain[ib:ia+1]))
 
+        def endpoint_mapping(name, chain, node, point, source_index, source_count):
+            k=chain.index(node)
+            neighbors=chain[max(0,k-1):k]+chain[k+1:k+2]
+            spacing=max([float(np.linalg.norm(self.xy[node]-self.xy[j])) for j in neighbors] or [0.])
+            return dict(piece=name,node=int(node),source_index=int(source_index),
+                        source_xy=np.asarray(point,float).tolist(),mesh_xy=self.xy[node].tolist(),
+                        error_mm=float(np.linalg.norm(self.xy[node]-point)),
+                        adjacent_edge_mm=spacing,piece_end=source_index in (0,source_count-1))
+
         chains={str(name): piece_chain(name) for name in sorted(set(self.pieces))}
         perimeter=sum(np.linalg.norm(self.xy[bb]-self.xy[aa]) for aa,bb in edges)
         edge_lengths=[np.linalg.norm(self.xy[bb]-self.xy[aa]) for aa,bb in edges]
@@ -162,6 +171,9 @@ class SectionProjector:
                     if len(path)>=3:
                         walls.append(dict(piece=name,path=path,
                             source_length=float(layout['arclength'][b]-layout['arclength'][a]),
+                            endpoint_mapping=[
+                                endpoint_mapping(name,chains[name],a0,points[a],a,len(points)),
+                                endpoint_mapping(name,chains[name],a1,points[b],b,len(points))],
                             mapping_error_mm=max(float(np.linalg.norm(self.xy[a0]-points[a])),
                                                  float(np.linalg.norm(self.xy[a1]-points[b])))))
 
@@ -353,6 +365,7 @@ class SectionProjector:
             bend_radius_fraction=bend_radius_fraction, bend_zones=bend_zones,
             source_wall_layouts=source_wall_layouts,
             maximum_wall_mapping_error_mm=max([w.get("mapping_error_mm",0.) for w in walls] or [0.]),
+            wall_endpoint_mapping=[item for w in walls for item in w.get('endpoint_mapping',[])],
             fold_nodes=fold_nodes, physical_wall_count=len(walls),
             physical_walls=[dict(piece=w['piece'],start=w['path'][0],end=w['path'][-1],
                                  node_count=len(w['path']),length_mm=float(np.sum(np.linalg.norm(

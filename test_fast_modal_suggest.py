@@ -128,6 +128,47 @@ class FastSuggestTests(unittest.TestCase):
         for name in ('plocal','pglobal','passembly','pdist','pother'):
             np.testing.assert_allclose(getattr(self.fit,name),getattr(full,name),atol=1e-12)
 
+    def test_mapping_uses_local_mesh_spacing_not_float_tolerance(self):
+        metadata=dict(geometry_supported=True,source_wall_layouts={'P1':dict(walls=[{}])},
+                      physical_wall_count=1,wall_endpoint_mapping=[
+            dict(piece='P1',error_mm=5.212650233111133,adjacent_edge_mm=20.,
+                 piece_end=False)])
+        result=fast.wall_mapping_status(metadata,['P1'],.0036)
+        self.assertTrue(result['supported'])
+        self.assertTrue(result['mesh_snapped'])
+        self.assertAlmostEqual(result['checks'][0]['allowed_error_mm'],10.036)
+
+    def test_mapping_rejects_large_or_free_end_offsets(self):
+        for error,piece_end in ((11.,False),(5.2,True)):
+            metadata=dict(geometry_supported=True,source_wall_layouts={'P1':dict(walls=[{}])},
+                          physical_wall_count=1,wall_endpoint_mapping=[
+                dict(piece='P1',error_mm=error,adjacent_edge_mm=20.,piece_end=piece_end)])
+            self.assertFalse(fast.wall_mapping_status(metadata,['P1'],.0036)['supported'])
+
+    def test_missing_wall_mapping_not_accepted(self):
+        metadata=dict(geometry_supported=True,source_wall_layouts={'P1':dict(walls=[{},{}])},
+                      physical_wall_count=1,wall_endpoint_mapping=[])
+        self.assertFalse(fast.wall_mapping_status(metadata,['P1'],.0036)['supported'])
+
+    def test_coarse_curved_mesh_accepts_between_node_boundary_but_not_shifted_source(self):
+        a=np.linspace(-np.pi/2.,0.,25)
+        source_xy=np.vstack((np.c_[np.linspace(0.,100.,31),np.zeros(31)],
+            np.c_[100.+5.*np.cos(a[1:]),5.+5.*np.sin(a[1:])],
+            np.c_[np.full(30,105.),np.linspace(5.,105.,31)[1:]]))
+        xy=np.array([[0.,0.],[25.,0.],[50.,0.],[75.,0.],[99.,0.],
+                     [102.5,.669872981],[104.330127019,2.5],[105.,5.],
+                     [105.,30.],[105.,55.],[105.,80.],[105.,105.]])
+        def mapping(points):
+            p=SectionProjector(xy,[(i,i+1) for i in range(len(xy)-1)],['P1']*len(xy),
+                               np.ones(len(xy)),physical_segments={'P1':np.c_[points[:-1],points[1:]].tolist()},
+                               compute_bases=False)
+            return p,fast.wall_mapping_status(p.metadata,['P1'],.0036)
+        p,result=mapping(source_xy)
+        self.assertGreater(p.metadata['maximum_wall_mapping_error_mm'],.036)
+        self.assertTrue(result['supported']);self.assertTrue(result['mesh_snapped'])
+        unused,wrong=mapping(source_xy+[1.,0.])
+        self.assertFalse(wrong['supported'])
+
     def test_explicit_odb_source_configures_startup_threads(self):
         import runpy
         import abaqus_step4_imperfections as step4

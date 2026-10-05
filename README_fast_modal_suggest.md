@@ -19,6 +19,16 @@ identity before screening and records its provenance without hashing the entire
 ODB. The Step-4 model builder, Step-5 PERFECT case and 70% post-peak stop remain
 unchanged.
 
+Version 2 separates coordinate precision from cross-section discretization.
+Free piece ends must match source coordinates within the numeric tolerance.
+Interior physical wall boundaries may lie between mesh nodes; nearest-node
+mapping is accepted within half the local adjacent mesh interval plus numeric
+tolerance, with `wall_boundary_mesh_snapped` retained as an informational flag.
+All expected physical walls must still be present and topology/rank checks must
+pass. The JSON records each endpoint's source/mesh position, error, allowance
+and pass/fail result. This permits approximate geometric screening, not exact
+physical fold reconstruction or a mesh-convergence claim.
+
 ## What changes
 
 The old suggestion routine only read the enhanced CSV family labels. The default
@@ -35,7 +45,7 @@ The existing physical-wall method is reused:
 - Independent rigid motion of the four pieces and extension/other residuals
   are diagnostics, never additional physical buckling families.
 
-The report always retains the dominant G/D/L family, but only unflagged
+The report always retains the dominant G/D/L family, but only
 `CANDIDATE` rows appear in the family suggestion list. `UNRESOLVED` is a diagnostic
 status. Dominance must be at least 80% of the L/D/G component self-norm sum;
 piece-relative or other self-norm at/above 25% blocks a suggestion. These
@@ -62,7 +72,8 @@ when automatic discovery is ambiguous.
 
 Validated `source_inputs.section_segments` from the reference
 `pipeline_status.json` defines physical walls. Extra historical build JSON
-files cannot override this reference geometry. Source endpoint mapping must agree with the ODB.
+files cannot override this reference geometry. Source endpoint mapping must pass
+the documented local mesh checks.
 Missing/unconfirmed source walls permit conservative mesh diagnostics, but
 Local/Distortional suggestions remain unresolved. Limited physical wall coverage
 is flagged. The source bend detector remains a geometric screening assumption;
