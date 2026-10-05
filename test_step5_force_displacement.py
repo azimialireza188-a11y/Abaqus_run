@@ -1,9 +1,102 @@
 import math
 import unittest
-import abaqus_step5_force_displacement as fd
+import abaqus_step5_force_displacement_core as fd
 
 
 class ForceDisplacementTests(unittest.TestCase):
+    def test_live_snapshot_writes_four_outputs_without_changing_sources(self):
+        import contextlib, io, json, os, tempfile
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            model='STEP5_PERFECT_FY240'
+            cae=os.path.join(d,'step5.cae'); odb_path=os.path.join(d,model+'.odb')
+            lock=os.path.join(d,model+'.lck')
+            for path in (cae,odb_path,lock):
+                with open(path,'w') as stream: stream.write('source unchanged')
+            info={'settings':{'fy':240,'reference_stress':240,'field_frequency':1},
+                  'end_area_mm2':4,'reference_force_N_per_end':1000,
+                  'end_area_weights':[[['P1',1,1]],[['P1',2,1]]]}
+            bottom=object(); top=object(); instance=NS(name='P1')
+            def field(i):
+                def subset(region):
+                    label=1 if region is bottom else 2
+                    return NS(values=[NS(instance=instance,nodeLabel=label,
+                        precision='SINGLE_PRECISION',data=(0,0,0 if label==1 else -i))])
+                return NS(getSubset=subset)
+            frames=[NS(frameValue=i,fieldOutputs={'U':field(i)}) for i in range(3)]
+            step=NS(frames=frames,historyRegions={'Assembly':NS(historyOutputs={
+                'LPF':NS(data=[(0,0),(1,1),(2,.6)])})})
+            odb=NS(steps={'GMNIA':step},rootAssembly=NS(nodeSets={
+                'STEP5_BOTTOM':bottom,'STEP5_TOP':top}),close=mock.Mock())
+            db=NS(models={model:NS(description=fd.STEP5_PREFIX+json.dumps(info))},close=mock.Mock())
+            opener=mock.Mock(return_value=odb)
+            args=NS(cae=cae,odb=odb_path,model=None,step='GMNIA',output_dir=d,allow_partial=True)
+            modules={'caeModules':NS(),'abaqus':NS(openMdb=lambda **kw:db),
+                     'odbAccess':NS(openOdb=opener)}
+            with mock.patch.dict('sys.modules',modules), contextlib.redirect_stdout(io.StringIO()):
+                summary=fd.extract(args)
+            opener.assert_called_once_with(path=odb_path,readOnly=True)
+            self.assertTrue(summary['partial'])
+            self.assertEqual(summary['peak']['force_kN'],1)
+            self.assertEqual(summary['peak']['shortening_mm'],1)
+            for extension in ('csv','json','svg','png'):
+                path=os.path.join(d,model+'_force_displacement_partial.'+extension)
+                self.assertGreater(os.path.getsize(path),100)
+            for path in (cae,odb_path,lock):
+                with open(path) as stream: self.assertEqual(stream.read(),'source unchanged')
+            db.close.assert_called_once(); odb.close.assert_called_once()
+
+    def test_partial_flag_allows_readonly_locked_odb(self):
+        import contextlib
+        import io
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cae=os.path.join(d,'x.cae');odb=os.path.join(d,'x.odb')
+            for path in (cae,odb,os.path.join(d,'x.lck')):
+                with open(path,'w') as f: f.write('')
+            args=fd.parse_arguments(['--cae',cae,'--odb',odb,'--allow-partial'])
+            self.assertTrue(args.allow_partial)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                fd.parse_arguments(['--cae',cae,'--odb',odb])
+
+    def test_live_history_ahead_of_fields_uses_synchronized_prefix(self):
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        frames=[NS(frameValue=i,fieldOutputs={'U':object()}) for i in (0,1)]
+        step=NS(frames=frames)
+        odb=NS(steps={'GMNIA':step},rootAssembly=NS(nodeSets={'STEP5_BOTTOM':object(),'STEP5_TOP':object()}))
+        info={'reference_force_N_per_end':1000,'settings':{'reference_stress':240},'end_area_weights':[[['P1',1,1]],[['P1',2,1]]]}
+        with mock.patch.object(fd,'lpf_history',return_value=[(0,0),(1,1),(2,.8)]), mock.patch.object(fd,'weighted_u3',return_value=0):
+            rows,meta=fd.curve_rows(odb,'GMNIA',info,allow_partial=True)
+        self.assertEqual([r['lpf'] for r in rows],[0,1])
+        self.assertTrue(meta['partial'])
+        self.assertEqual(meta['dropped_history_samples'],1)
+
+    def test_live_history_without_initial_sample_can_lead_at_equal_counts(self):
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        frames=[NS(frameValue=i,fieldOutputs={'U':object()}) for i in (0,1,2)]
+        odb=NS(steps={'GMNIA':NS(frames=frames)},rootAssembly=NS(nodeSets={
+            'STEP5_BOTTOM':object(),'STEP5_TOP':object()}))
+        info={'reference_force_N_per_end':1000,'settings':{'reference_stress':240},
+              'end_area_weights':[[['P1',1,1]],[['P1',2,1]]]}
+        with mock.patch.object(fd,'lpf_history',return_value=[(1,.4),(2,.8),(3,.9)]), mock.patch.object(fd,'weighted_u3',return_value=0):
+            rows,meta=fd.curve_rows(odb,'GMNIA',info,allow_partial=True)
+        self.assertEqual([r['lpf'] for r in rows],[0,.4,.8])
+        self.assertTrue(meta['partial'])
+        self.assertEqual(meta['dropped_history_samples'],1)
+
+    def test_extractor_entry_runs_without_main_namespace_or_file(self):
+        from pathlib import Path
+        from unittest import mock
+        entry=Path(fd.__file__).with_name('abaqus_step5_force_displacement.py')
+        calls=[]
+        with mock.patch.object(fd,'main',side_effect=lambda: calls.append(1)):
+            exec(compile(entry.read_text(),str(entry),'exec'),{'__name__':'abaqus'})
+        self.assertEqual(calls,[1])
+
     def test_weight_map_rejects_duplicate_and_nonpositive(self):
         self.assertEqual(fd.weight_map([['P1', 1, 2.0]]), {('P1', 1): 2.0})
         with self.assertRaises(ValueError):

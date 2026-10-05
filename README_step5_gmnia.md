@@ -109,7 +109,7 @@ It reads the reference force and end-area weights from the matching STEP5 CAE,
 then reads the automatic Static-Riks `LPF` history output and U3 from the solved
 ODB for every GMNIA frame. The ODB frame value is used only to align the frame
 with its LPF history sample; it is not assumed to equal LPF. It writes CSV,
-JSON and a dependency-free SVG curve, and reports the peak load.
+JSON, PNG and a dependency-free SVG curve, and reports the maximum recorded load.
 
 Example:
 
@@ -126,9 +126,24 @@ The default output directory is the ODB directory. Expected files are:
 - `STEP5_D_FY240_force_displacement.csv`
 - `STEP5_D_FY240_force_displacement.json`
 - `STEP5_D_FY240_force_displacement.svg`
+- `STEP5_D_FY240_force_displacement.png`
 
 The SVG is publication-friendly vector output. The CSV can be imported directly
 into Excel, Origin, MATLAB or Python for final figure styling.
+
+For an analysis still running, append `--allow-partial`. The ODB is opened
+read-only even when its `.lck` exists; no analysis is submitted or terminated.
+Only the synchronized prefix of LPF history and displacement frames is plotted.
+Live snapshots use `_force_displacement_partial.csv/.json/.svg/.png` names and
+the chart is labelled `PARTIAL SNAPSHOT`. The recorded peak may change as the
+analysis continues. Run the command again to refresh the snapshot. If the ODB
+or its first LPF/U outputs have not yet been flushed, retry after more increments.
+After completion, rerun without `--allow-partial` to produce final filenames.
+
+`abaqus_step5_force_displacement.py` is the noGUI entry script and invokes
+the extractor explicitly even in Abaqus execution namespaces other than
+`__main__`. Python callers should import `abaqus_step5_force_displacement_core`.
+PNG uses Matplotlib when available, with native CAE plotting as fallback.
 
 
 ## Perfect reference and 70% post-peak stop

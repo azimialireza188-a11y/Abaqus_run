@@ -27,7 +27,7 @@ SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-import abaqus_step5_force_displacement as fd
+import abaqus_step5_force_displacement_core as fd
 import abaqus_pipeline_contract as contract
 import runtime_resources as resources
 
@@ -326,7 +326,7 @@ def run(args):
                 if os.path.exists(os.path.splitext(path)[0]+'.lck'):
                     raise ValueError('ODB remains locked: '+path)
                 summary=fd.extract(SimpleNamespace(cae=cae,odb=path,model=name,step='GMNIA',
-                                    output_dir=args.run_dir,allow_partial=True))
+                                    output_dir=args.run_dir,allow_partial=True,skip_png=True))
                 with open(summary['csv'],encoding='utf-8-sig') as f:
                     rows=list(csv.DictReader(f))
                 points=[(float(r['shortening_mm']),float(r['force_kN'])) for r in rows]
