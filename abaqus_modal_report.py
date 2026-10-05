@@ -76,7 +76,8 @@ class SectionProjector:
     """
 
     def __init__(self, xy, edges, pieces, weights, corner_angle=15.,
-                 physical_segments=None, wall_angle_deg=3.0, bend_radius_fraction=.04):
+                 physical_segments=None, wall_angle_deg=3.0, bend_radius_fraction=.04,
+                 compute_bases=True):
         self.xy = np.asarray(xy, dtype=float)
         self.weights = np.asarray(weights, dtype=float)
         self.pieces = np.asarray(pieces)
@@ -261,8 +262,12 @@ class SectionProjector:
             return op,rank
 
         residual_after_local=eye-self.pwalllocal
+        fold_rows=np.array([2*i+j for i in fold_nodes for j in (0,1)],dtype=int)
+        if not compute_bases and np.any(self.pwalllocal[fold_rows]):
+            raise ValueError('Overlapping physical walls place local residuals on fold anchors')
         self.pglobal,global_fold_rank=rigid_fit_operator(fold_nodes)
-        self.pglobal=self.pglobal@residual_after_local
+        if compute_bases:
+            self.pglobal=self.pglobal@residual_after_local
         after_global=residual_after_local-self.pglobal
 
         piece_total=np.zeros((ndof,ndof)); piece_fold_ranks={}
@@ -272,7 +277,8 @@ class SectionProjector:
             op,rank=rigid_fit_operator(nodes,mask)
             piece_fold_ranks[str(name)]=rank
             piece_total+=op
-        self.passembly=piece_total@after_global
+        self.passembly=(piece_total@after_global if compute_bases else
+                        piece_total-piece_total[:,fold_rows]@self.pglobal[fold_rows])
         after_assembly=after_global-self.passembly
 
         fold_ids={node:i for i,node in enumerate(fold_nodes)}
@@ -317,20 +323,26 @@ class SectionProjector:
         else:
             crank=0; pd=np.eye(2*len(fold_nodes)); po=np.zeros_like(pd)
 
-        fold_residual=gather@after_assembly
+        fold_residual=gather@after_assembly if compute_bases else after_assembly[fold_rows]
         self.pdist=interpolation@pd@fold_residual
-        coarse_other=interpolation@po@fold_residual
-        remainder=eye-self.pwalllocal-self.pglobal-self.passembly-self.pdist-coarse_other
+        coarse_other=interpolation@po@fold_residual if compute_bases else None
+        remainder=eye-self.pwalllocal-self.pglobal-self.passembly-self.pdist
+        if compute_bases: remainder-=coarse_other
         # Any non-chord, non-fold residual is membrane/shear/corner-zone motion,
         # not plate bending. Keep it out of L and report it as Other.
-        self.pother=coarse_other+remainder
+        self.pother=coarse_other+remainder if compute_bases else remainder
         self.plocal=self.pwalllocal
 
         to_weighted=np.diag(self.sqrtw); from_weighted=np.diag(1./self.sqrtw)
-        self.qassembly=orth(to_weighted@self.passembly@from_weighted)
-        self.qdist=orth(to_weighted@self.pdist@from_weighted)
-        self.qother=orth(to_weighted@self.pother@from_weighted)
-        self.qlocal=orth(to_weighted@self.plocal@from_weighted)
+        # Fast suggestion uses the displacement operators directly. Dense SVD
+        # bases/ranks are required by the audit, but add no screening information.
+        if compute_bases:
+            self.qassembly=orth(to_weighted@self.passembly@from_weighted)
+            self.qdist=orth(to_weighted@self.pdist@from_weighted)
+            self.qother=orth(to_weighted@self.pother@from_weighted)
+            self.qlocal=orth(to_weighted@self.plocal@from_weighted)
+        else:
+            self.qassembly=self.qdist=self.qother=self.qlocal=None
 
         piece_ranks_ok=all(rank>=3 for rank in piece_fold_ranks.values())
         self.supported=bool(len(walls)>=2 and len(fold_nodes)>=2 and global_fold_rank>=3 and
@@ -351,9 +363,12 @@ class SectionProjector:
             geometry_supported=self.supported,
             curved_panel_proxy=(not physical_segments or self.flat_fraction<.6),
             global_anchor_rank=global_fold_rank, piece_anchor_ranks=piece_fold_ranks,
-            global_rank=self.qglobal.shape[1], assembly_rank=self.qassembly.shape[1],
-            coarse_deformation_rank=self.qdist.shape[1], other_extension_rank=self.qother.shape[1],
-            local_rank=self.qlocal.shape[1], wall_bending_rank=int(np.linalg.matrix_rank(self.pwalllocal)),
+            global_rank=self.qglobal.shape[1],
+            assembly_rank=self.qassembly.shape[1] if compute_bases else None,
+            coarse_deformation_rank=self.qdist.shape[1] if compute_bases else None,
+            other_extension_rank=self.qother.shape[1] if compute_bases else None,
+            local_rank=self.qlocal.shape[1] if compute_bases else None,
+            wall_bending_rank=int(np.linalg.matrix_rank(self.pwalllocal)) if compute_bases else len(local_rows),
             panel_extension_constraint_rank=crank,
             maximum_panel_arc_length=float(max(wall_lengths) if wall_lengths else 0.),
             split_definition='normal wall bending relative to rigid-exact moving curved reference first; fold-driven G/A/O/D; tangential and compact-bend residual assigned to Other')

@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 """STEP 4 ONLY: create a new CAE containing documented imperfect meshes from the exact completed reference pipeline run.
 
-Reference identity comes from run-dir/pipeline_status.json; arbitrary CAE/ODB glob selection is forbidden.\n\nSuggestions (read existing step-3 reports; no CAE/solver needed):
+Reference identity comes from run-dir/pipeline_status.json; arbitrary CAE/ODB glob selection is forbidden.
+
+Suggestions (screen actual step-3 ODB shapes; no CAE/solver needed):
   abaqus python abaqus_step4_imperfections.py --run-dir "completed run" --suggest
+
+The default fast screen reads U and persisted physical walls, with geometric
+G/L/D candidates and separate relative-piece/QC diagnostics. --suggest-source csv
+retains the old report-only routine. See README_fast_modal_suggest.md.
 
 Build after YOU confirm mode IDs and amplitudes:
   abaqus cae noGUI=abaqus_step4_imperfections.py -- --run-dir "completed run"
@@ -48,6 +54,14 @@ import math
 import os
 import re
 import sys
+# Configure before NumPy loads: use CPU workers across modes without nesting
+# all-core BLAS teams. The total worker count still uses all available CPUs.
+if '--suggest' in sys.argv and not (
+        '--suggest-source=csv' in sys.argv or
+        any(a == '--suggest-source' and i+1 < len(sys.argv) and sys.argv[i+1] == 'csv'
+            for i,a in enumerate(sys.argv))):
+    from runtime_resources import configure_threads
+    configure_threads(1)
 import numpy as np
 import abaqus_pipeline_contract as pipeline_contract
 
@@ -71,7 +85,11 @@ def parse_arguments(argv=None):
         argv = clean
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--run-dir', required=True)
-    p.add_argument('--suggest', action='store_true', help='Report candidates only; never select a mode automatically')
+    p.add_argument('--suggest', action='store_true', help='Screen actual ODB shapes; never select a mode automatically')
+    p.add_argument('--suggest-source', choices=('odb','csv'), default='odb')
+    p.add_argument('--suggest-cpus', default='auto', help='Use all available logical CPUs by default')
+    p.add_argument('--suggest-gpus', default='auto', help='Benchmark compatible GPUs against parallel CPU')
+    p.add_argument('--suggest-refresh', action='store_true', help='Ignore cached geometric screening')
     p.add_argument('--source-cae', help='Optional explicit reference CAE path; must equal the artifact resolved from --run-dir')
     p.add_argument('--odb', help='Optional explicit reference ODB path; must equal the artifact resolved from --run-dir')
     p.add_argument('--model', help='Optional explicit model name; must equal pipeline_status build.job_name')
@@ -90,6 +108,13 @@ def parse_arguments(argv=None):
     p.add_argument('--cases', default=','.join(DEFAULT_CASES))
     p.add_argument('--output-cae')
     args = p.parse_args(argv)
+    for name, minimum in (('suggest_cpus',1),('suggest_gpus',0)):
+        value=getattr(args,name)
+        if value != 'auto':
+            try:
+                if int(value)<minimum: raise ValueError()
+            except ValueError:
+                p.error('--%s must be auto or an integer >= %d'%(name.replace('_','-'),minimum))
     args.run_dir = os.path.abspath(os.path.expanduser(args.run_dir))
     if not args.suggest:
         for name in ('local_mode', 'dist_mode', 'local_high_t', 'dist_mm', 'output_cae'):
@@ -442,7 +467,21 @@ def build(args):
 def main(argv=None):
     args = parse_arguments(argv)
     if args.suggest:
-        return suggest_modes(args.run_dir)
+        if args.suggest_source == 'csv':
+            return suggest_modes(args.run_dir)
+        # Preserve the exact upstream identity/provenance contract used by
+        # Step 4/5; do not redirect to an arbitrary ODB in the folder.
+        reference=pipeline_contract.load_reference_run(args.run_dir,require_completed=True)
+        args.odb=pipeline_contract.resolve_reference_artifact(reference,args.odb,'odb')
+        if args.model and args.model != reference['job_name']:
+            raise ValueError('Suggestion model must match the reference pipeline')
+        if args.instances and tuple(args.instances) != tuple(reference['instances']):
+            raise ValueError('Suggestion instances must match the reference pipeline')
+        args.instances=list(reference['instances'])
+        args.suggest_reference=pipeline_contract.reference_snapshot(reference,include_hashes=False)
+        args.suggest_section_segments=reference['source_inputs']['section_segments']
+        from abaqus_fast_modal_suggest import suggest
+        return suggest(args)
     return build(args)
 
 

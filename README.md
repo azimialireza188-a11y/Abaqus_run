@@ -1,5 +1,10 @@
 # Abaqus_run
 
+Step 4 now supports fast geometric G/L/D suggestions directly from the
+reference ODB through the existing `--suggest` command. See
+[fast screening and execution](README_fast_modal_suggest.md). The exact
+reference-pipeline provenance and Step-5 behavior are preserved.
+
 This repository contains the single-model Abaqus buckling pipeline used to build the CAE/INP, submit the eigenvalue buckling job, postprocess the ODB, and optionally run the modal audit.
 
 ## Requested production command
