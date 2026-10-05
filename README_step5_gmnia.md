@@ -229,7 +229,7 @@ Native Abaqus/Windows execution and PNG fallback require verification on your
 machine; unit tests here cover numerical logic, resource commands and mocked
 process boundaries, not an actual GMNIA solve.
 
-New reference buckling and Step5 jobs default to all visible CPUs, memory=100%
+New reference buckling and Step5 jobs default to all physical CPU cores, memory=100%
 with getMemoryFromAnalysis disabled, and all detected NVIDIA GPUs requested
 through documented Abaqus CLI/environment settings (not an unsupported Job
 constructor keyword). Step5 requests standard_parallel=all. Buckling retains
@@ -246,3 +246,10 @@ that calls the reusable runner main even when CAE does not set `__name__` to
 `git pull`: run the repair-only command once after this launcher update. A fresh
 run must print `STEP5 NOGUI DRIVER STARTED`, then its resource request and job
 progress; exit code zero alone is not evidence that the queue executed.
+
+Abaqus on the target Windows machine reports 12 available solver CPUs despite
+24 logical SMT processors. Solver auto mode therefore uses all physical cores
+(12 on this machine); Python mode screening still uses all logical processors
+(24). No core is reserved. Queue CLI CPU settings override older generated env
+files, so existing CAE/INP/BAT files need not be rebuilt for this change. A launcher
+exit code zero with no ODB now reports the actual solver log as SOLVER_ERROR.

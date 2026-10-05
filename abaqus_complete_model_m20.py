@@ -116,7 +116,7 @@ def parse_arguments(argv=None):
     parser.add_argument('--n-modes', type=int, default=N_MODES)
     parser.add_argument('--n-vectors', type=int, default=None)
     parser.add_argument('--max-iterations', type=int, default=MAX_ITERATIONS)
-    parser.add_argument('--cpus', type=int, default=None, help='Default: all available CPUs')
+    parser.add_argument('--cpus', type=int, default=None, help='Default: all physical cores available to the solver')
     parser.add_argument('--gpus', default='auto')
     parser.add_argument('--buckle-output', choices=('standard', 'detailed'), default='standard',
                         help='Legacy compatibility option. Automatic buckling now always stores classification-only nodal mode shapes; detailed no longer adds S/E/SF/SE.')
@@ -144,7 +144,7 @@ def parse_arguments(argv=None):
     args = parser.parse_args(argv)
     import runtime_resources
     try:
-        policy = runtime_resources.resolve_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
+        policy = runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
     except ValueError as error:
         parser.error(str(error))
     args.cpus, args.gpus = policy.cpus, policy.gpus
@@ -706,7 +706,7 @@ def add_general_contact(model):
 
 def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='full', gpus='auto'):
     import runtime_resources
-    policy = runtime_resources.resolve_policy(runtime_resources.detect_resources(), cpus, gpus)
+    policy = runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(), cpus, gpus)
     cpus, gpus = policy.cpus, policy.gpus
     validate_settings()
     if inputs is None:

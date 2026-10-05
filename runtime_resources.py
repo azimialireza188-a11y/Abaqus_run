@@ -96,6 +96,16 @@ def resolve_policy(inventory, cpu_override=None, gpu_override=None):
     return ResourcePolicy(cpus,gpus,inventory)
 
 
+def resolve_solver_policy(inventory, cpu_override=None, gpu_override=None):
+    """Abaqus solver CPU availability can count cores rather than SMT threads.
+
+    Use every physical core by default; keep the logical CPU policy for Python
+    postprocessing. This imposes no reserve or fixed worker/memory ceiling.
+    """
+    solver_cpus = inventory.physical_cores if cpu_override in (None,'auto') else cpu_override
+    return resolve_policy(inventory, solver_cpus, gpu_override)
+
+
 def batch_capacity(available, bytes_per_item, fixed_bytes=0):
     if bytes_per_item<=0 or fixed_bytes<0:
         raise ValueError('Invalid batch working-set estimate')

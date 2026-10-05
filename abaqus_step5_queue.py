@@ -256,6 +256,11 @@ def run_job(name, args, policy):
             raise
         result['solver_exit_code'] = process.returncode
         result['termination_requested'] = requested
+    if not os.path.isfile(path):
+        with open(name+'_queue_solver.log',errors='replace') as log:
+            diagnostic=log.read()[-6000:].strip()
+        result['outcome']='SOLVER_ERROR'
+        result['error']='Solver produced no ODB. '+(diagnostic or 'See '+name+'_queue_solver.log')
     return result
 
 
@@ -283,7 +288,7 @@ def run(args):
             raise ValueError('Automatic plots require field_frequency=1: '+name)
         if info.get('stage') != 5 or float(info.get('reference_force_N_per_end',0))<=0:
             raise ValueError('Invalid STEP5 metadata: '+name)
-    policy=resources.resolve_policy(resources.detect_resources(),args.cpus,args.gpus)
+    policy=resources.resolve_solver_policy(resources.detect_resources(),args.cpus,args.gpus)
     print('RESOURCE REQUEST: cpus=%d gpus=%d memory=100%%; reserves=0' % (policy.cpus,policy.gpus))
     if args.repair_only:
         path=os.path.join(args.run_dir,'run_step5_queue_70_pct.bat')
@@ -310,6 +315,8 @@ def run(args):
             try:
                 if not args.extract_only:
                     result.update(run_job(name,args,policy))
+                    if result.get('error'):
+                        raise RuntimeError(result['error'])
                 path=os.path.join(args.run_dir,name+'.odb')
                 # Wait briefly for file handles to be released; never delete a lock.
                 for _ in range(30):

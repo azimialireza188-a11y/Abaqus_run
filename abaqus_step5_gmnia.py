@@ -89,7 +89,7 @@ def parse_arguments(argv=None):
     p.add_argument('--max-increments', type=int, default=5000)
     p.add_argument('--max-end-displacement-mm', type=float)
     p.add_argument('--field-frequency', type=int, default=1)
-    p.add_argument('--cpus', type=int, default=None, help='Default: all available CPUs')
+    p.add_argument('--cpus', type=int, default=None, help='Default: all physical cores available to the solver')
     p.add_argument('--gpus', default='auto')
     p.add_argument('--stop-method', choices=['monitor', 'urdfil'], default='monitor')
     p.add_argument('--postpeak-stop-ratio', type=float, default=.70,
@@ -97,7 +97,7 @@ def parse_arguments(argv=None):
     args = p.parse_args(argv)
     import runtime_resources
     try:
-        policy = runtime_resources.resolve_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
+        policy = runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
     except ValueError as error:
         p.error(str(error))
     args.cpus, args.gpus = policy.cpus, policy.gpus

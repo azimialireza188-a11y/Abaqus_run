@@ -8,6 +8,33 @@ from types import SimpleNamespace
 
 
 class QueueTests(unittest.TestCase):
+    def test_solver_auto_uses_all_physical_cores_without_limiting_python_workers(self):
+        import runtime_resources as r
+        inventory=r.ResourceInventory(24,12,64*1024**3,60*1024**3,[])
+        self.assertTrue(hasattr(r,'resolve_solver_policy'))
+        self.assertEqual(r.resolve_solver_policy(inventory).cpus,12)
+        self.assertEqual(r.resolve_policy(inventory).cpus,24)
+        self.assertEqual(r.resolve_solver_policy(inventory,cpu_override=8).cpus,8)
+        self.assertEqual(r.resolve_solver_policy(inventory).memory_reserve_bytes,0)
+
+    def test_zero_launcher_exit_without_odb_reports_solver_log(self):
+        q=self.queue()
+        with tempfile.TemporaryDirectory() as d:
+            process=mock.Mock(returncode=0)
+            process.poll.return_value=0
+            def launch(cmd, **kwargs):
+                kwargs['stdout'].write('Abaqus Error: The number of cpus (24) exceeds the number of cpus available (12).\n')
+                return process
+            previous=os.getcwd()
+            try:
+                os.chdir(d)
+                with mock.patch.object(q,'launch',side_effect=launch):
+                    result=q.run_job('STEP5_D_FY240',SimpleNamespace(run_dir=d,stop_method='monitor',ratio=.7,poll_seconds=1),SimpleNamespace(cpus=24,gpus=0))
+            finally:
+                os.chdir(previous)
+            self.assertIn('cpus available (12)',result.get('error',''))
+            self.assertEqual(result.get('outcome'),'SOLVER_ERROR')
+
     def test_nogui_driver_calls_main_even_in_nonmain_namespace(self):
         from pathlib import Path
         q=self.queue()
