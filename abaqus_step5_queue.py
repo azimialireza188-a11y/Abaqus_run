@@ -190,13 +190,71 @@ def metadata(cae, names):
         db.close()
 
 
-def read_live_lpf(path):
-    from odbAccess import openOdb
-    odb = openOdb(path=path, readOnly=True)
+def _printed_half_unit(token):
+    """Half of the last printed unit, used to avoid early stop from STA rounding."""
+    text = str(token).strip().upper()
+    if 'E' in text:
+        mantissa, exponent = text.split('E', 1)
+    else:
+        mantissa, exponent = text, '0'
+    decimals = len(mantissa.split('.', 1)[1]) if '.' in mantissa else 0
+    return 0.5 * (10.0 ** (int(exponent) - decimals))
+
+
+def read_sta_lpf(path):
+    """Read converged Static-Riks LPF values from the append-only .sta file."""
+    records = []
     try:
-        return [y for _,y in fd.lpf_history(odb.steps['GMNIA'])]
-    finally:
-        odb.close()
+        with open(path, 'r', errors='replace') as stream:
+            for raw in stream:
+                parts = raw.split()
+                if len(parts) < 9 or str(parts[-1]).upper() != 'R':
+                    continue
+                try:
+                    step = int(parts[0]); increment = int(parts[1])
+                except (TypeError, ValueError):
+                    continue
+                attempt = str(parts[2]).upper()
+                if not attempt.isdigit():
+                    continue
+                token = parts[6]
+                try:
+                    value = float(token)
+                    half_unit = _printed_half_unit(token)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(value) and math.isfinite(half_unit) and half_unit >= 0:
+                    records.append(dict(lpf=value, half_unit=half_unit, step=step,
+                                        increment=increment, attempt=int(attempt)))
+    except OSError:
+        return []
+    return records
+
+
+def crossing_sta(records, ratio):
+    """Conservative post-peak crossing using rounded .sta LPF values."""
+    if not 0 < ratio < 1:
+        raise ValueError('Require 0 < ratio < 1')
+    peak_lower = 0.0
+    peak_value = 0.0
+    peak_index = -1
+    for i, record in enumerate(records):
+        value = float(record['lpf'])
+        half = float(record.get('half_unit', 0.0))
+        if not math.isfinite(value) or not math.isfinite(half):
+            raise ValueError('Nonfinite STA LPF')
+        lower = value - half
+        upper = value + half
+        if lower > peak_lower:
+            peak_lower = lower
+            peak_value = value
+            peak_index = i
+        elif peak_lower > 0 and i > peak_index and upper <= ratio * peak_lower:
+            return dict(index=i, lpf=value, peak_lpf=peak_value,
+                        peak_index=peak_index, ratio=value/peak_value,
+                        conservative_ratio=upper/peak_lower,
+                        monitor_source='STA_RIKS_TOTAL_LPF')
+    return None
 
 
 def backup_failed_artifacts(directory, name):
@@ -271,13 +329,15 @@ def run_job(name, args, policy):
         last_warning = ''
         try:
             while process.poll() is None:
-                if args.stop_method == 'monitor' and not requested and os.path.isfile(path):
+                if args.stop_method == 'monitor' and not requested:
                     try:
-                        values = read_live_lpf(path)
-                        hit = crossing(values, args.ratio)
+                        sta_path = os.path.join(args.run_dir, name+'.sta')
+                        sta_records = read_sta_lpf(sta_path)
+                        values = [record['lpf'] for record in sta_records]
+                        hit = crossing_sta(sta_records, args.ratio)
                         if hit:
-                            report('STOP REQUEST', '%s | post-peak ratio %.3f <= %.3f; requesting Abaqus termination' %
-                                   (name, hit['ratio'], args.ratio))
+                            report('STOP REQUEST', '%s | STA post-peak ratio %.3f (conservative %.3f) <= %.3f; requesting Abaqus termination' %
+                                   (name, hit['ratio'], hit['conservative_ratio'], args.ratio))
                             # Native job control; do not kill the launcher or edit solver files.
                             control = launch(['abaqus','terminate','job='+name],cwd=args.run_dir)
                             code = control.wait(timeout=30)
@@ -285,11 +345,11 @@ def run_job(name, args, policy):
                             if code == 0:
                                 requested = True
                                 result['observed_crossing'] = hit
+                                result['monitor_source'] = 'STA_RIKS_TOTAL_LPF'
                                 report('STOP ACCEPTED', name+'; waiting for solver shutdown')
                             else:
                                 raise RuntimeError('Abaqus terminate command failed: %d' % code)
                     except Exception as error:
-                        # ODB can be unavailable/not yet flushed while Standard is writing it.
                         message = str(error)
                         if message != last_warning:
                             report('MONITOR', name+': '+message);last_warning=message
