@@ -181,6 +181,29 @@ class QueueTests(unittest.TestCase):
             self.assertIn('AsFy', s)
             self.assertTrue(os.path.getsize(os.path.join(d,'STEP5_all_force_displacement_combined.png')) > 1000)
 
+    def test_sta_riks_parser_skips_unconverged_attempts(self):
+        q=self.queue()
+        with tempfile.TemporaryDirectory() as d:
+            path=os.path.join(d,'job.sta')
+            with open(path,'w') as f:
+                f.write('   1    23   1U    0     6     6             0.941      0.03711               R\n')
+                f.write('   1    23   2     0     3     3             0.953      0.01244               R\n')
+                f.write('   1    24   1     0     5     5             0.971      0.01795               R\n')
+            records=q.read_sta_lpf(path)
+            self.assertEqual([r['lpf'] for r in records],[.953,.971])
+            self.assertEqual(records[0]['increment'],23)
+            self.assertAlmostEqual(records[0]['half_unit'],.0005)
+
+    def test_sta_crossing_is_conservative_against_print_rounding(self):
+        q=self.queue()
+        records=[dict(lpf=1.000,half_unit=.0005),
+                 dict(lpf=.700,half_unit=.0005)]
+        self.assertIsNone(q.crossing_sta(records,.70))
+        records.append(dict(lpf=.699,half_unit=.0005))
+        hit=q.crossing_sta(records,.70)
+        self.assertIsNotNone(hit)
+        self.assertLessEqual(hit['conservative_ratio'],.70)
+
     def test_monitor_stops_with_native_command_and_records_expected_nonzero_exit(self):
         q = self.queue()
         with tempfile.TemporaryDirectory() as d:
@@ -201,7 +224,8 @@ class QueueTests(unittest.TestCase):
             previous = os.getcwd()
             try:
                 os.chdir(d)
-                with mock.patch.object(q,'launch',side_effect=launch), mock.patch.object(q,'read_live_lpf',return_value=[0,1,.65]), mock.patch.object(q.time,'sleep'):
+                records=[dict(lpf=0.0,half_unit=0.0005),dict(lpf=1.0,half_unit=0.0005),dict(lpf=.65,half_unit=0.0005)]
+                with mock.patch.object(q,'launch',side_effect=launch), mock.patch.object(q,'read_sta_lpf',return_value=records), mock.patch.object(q.time,'sleep'):
                     result=q.run_job(name,args,SimpleNamespace(cpus=24,gpus=0))
             finally:
                 os.chdir(previous)
@@ -226,7 +250,8 @@ class QueueTests(unittest.TestCase):
             previous=os.getcwd()
             try:
                 os.chdir(d)
-                with mock.patch.object(q,'launch',side_effect=launch), mock.patch.object(q,'read_live_lpf',side_effect=[OSError('not flushed'),[0,1,.6]]), mock.patch.object(q.time,'sleep'):
+                records=[dict(lpf=0.0,half_unit=0.0005),dict(lpf=1.0,half_unit=0.0005),dict(lpf=.6,half_unit=0.0005)]
+                with mock.patch.object(q,'launch',side_effect=launch), mock.patch.object(q,'read_sta_lpf',side_effect=[[],records]), mock.patch.object(q.time,'sleep'):
                     result=q.run_job(name,SimpleNamespace(run_dir=d,stop_method='monitor',ratio=.7,poll_seconds=1),SimpleNamespace(cpus=24,gpus=0))
             finally:
                 os.chdir(previous)
