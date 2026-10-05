@@ -185,12 +185,14 @@ user="step5_postpeak_stop.for"
 
 and the next job is attempted even if the preceding job exits with an error.
 
-The 70% rule is the primary desired post-peak completion criterion, but it is
-not a guarantee that every job will reach it. A job can still terminate earlier
-because of nonconvergence, the maximum increment count, the existing displacement
-safety limit, licensing, or another solver error. Such a case must be reported as
-not reaching the common post-peak criterion and should not be treated as a
-complete publication run.
+The 70% rule is the primary desired post-peak completion criterion. To keep it
+from competing with an unrelated finishing condition, the Step-5 builder no
+longer activates a default displacement stop. A displacement limit is used only
+when `--max-end-displacement-mm` is supplied explicitly. The default maximum
+increment count is increased to 5000 as a high safety cap. A job can still
+terminate earlier because of genuine nonconvergence, licensing, or another solver
+error; such a case must be reported as not reaching the common post-peak
+criterion and should not be treated as a complete publication run.
 
 Abaqus/Standard user-subroutine compilation must be configured on the machine
 for the URDFIL-controlled jobs. The CAE jobs store the generated Fortran file as

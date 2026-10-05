@@ -32,9 +32,11 @@ LPF and LSTOP=1. Because P=LPF*P_ref with no preload, the force ratio is exactly
 the LPF ratio. A minimal NODE FILE request at every increment triggers URDFIL.
 The generated queue passes the supplied Fortran routine to every job.
 
-The existing positive-U3 monitor (default 0.01*L), maximum increment count and
-Riks arc settings remain safety limits; a run can still stop or fail before the
-70% criterion is reached. No equilibrium tolerances are loosened.
+The positive-U3 monitor is disabled by default so it cannot compete with the
+common 70% criterion; it is enabled only when --max-end-displacement-mm is
+supplied explicitly. Max increments defaults to 5000 as a high safety cap.
+A run can still fail before the 70% criterion through genuine nonconvergence or
+another solver/runtime error. No equilibrium tolerances are loosened.
 
 Only CAE/INP deliverables are placed in --output-dir (must be new or empty).
 Jobs are created for later manual use; this script NEVER submits them. Abaqus
@@ -80,7 +82,7 @@ def parse_arguments(argv=None):
     p.add_argument('--initial-arc', type=float, default=.01)
     p.add_argument('--min-arc', type=float, default=1e-8)
     p.add_argument('--max-arc', type=float, default=.05)
-    p.add_argument('--max-increments', type=int, default=1000)
+    p.add_argument('--max-increments', type=int, default=5000)
     p.add_argument('--max-end-displacement-mm', type=float)
     p.add_argument('--field-frequency', type=int, default=1)
     p.add_argument('--cpus', type=int, default=8)
@@ -407,11 +409,18 @@ def prepare_model(model, args):
         assembly.SetFromNodeLabels(name='STEP5_'+suffix, nodeLabels=tuple(end_labels[side]))
     bottom_name, bottom_labels = end_labels[0][0]
     assembly.SetFromNodeLabels(name='STEP5_STOP', nodeLabels=((bottom_name, (bottom_labels[0],)),))
-    stop = args.max_end_displacement_mm or length*.01
-    model.StaticRiksStep(name='GMNIA', previous='Initial', nlgeom=ON,
-        maxNumInc=args.max_increments, initialArcInc=args.initial_arc,
-        minArcInc=args.min_arc, maxArcInc=args.max_arc, totalArcLength=1.,
-        nodeOn=ON, region=assembly.sets['STEP5_STOP'], dof=3, maximumDisplacement=stop)
+    stop = args.max_end_displacement_mm
+    if stop is None:
+        model.StaticRiksStep(name='GMNIA', previous='Initial', nlgeom=ON,
+            maxNumInc=args.max_increments, initialArcInc=args.initial_arc,
+            minArcInc=args.min_arc, maxArcInc=args.max_arc, totalArcLength=1.,
+            nodeOn=OFF)
+    else:
+        model.StaticRiksStep(name='GMNIA', previous='Initial', nlgeom=ON,
+            maxNumInc=args.max_increments, initialArcInc=args.initial_arc,
+            minArcInc=args.min_arc, maxArcInc=args.max_arc, totalArcLength=1.,
+            nodeOn=ON, region=assembly.sets['STEP5_STOP'], dof=3,
+            maximumDisplacement=stop)
     for name, surface, magnitude, sign in loads:
         model.ShellEdgeLoad(name=name, createStepName='GMNIA', region=assembly.surfaces[surface],
             magnitude=magnitude, distributionType=UNIFORM, traction=GENERAL,

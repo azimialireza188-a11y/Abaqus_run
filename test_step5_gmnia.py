@@ -19,6 +19,8 @@ class Step5Tests(unittest.TestCase):
         base = ['--source-cae', 'source.cae', '--output-dir', 'out', '--fy', '240']
         args = step5.parse_arguments(base)
         self.assertAlmostEqual(args.postpeak_stop_ratio, 0.70)
+        self.assertEqual(args.max_increments, 5000)
+        self.assertIsNone(args.max_end_displacement_mm)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             step5.parse_arguments(base+['--postpeak-stop-ratio', '1.0'])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
