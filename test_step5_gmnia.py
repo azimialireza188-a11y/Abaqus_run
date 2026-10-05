@@ -15,6 +15,48 @@ class Step5Tests(unittest.TestCase):
         args = step5.parse_arguments(base+['--fy', '350'])
         self.assertEqual(args.reference_stress, 350.)
 
+    def test_default_postpeak_stop_ratio_is_70_percent(self):
+        base = ['--source-cae', 'source.cae', '--output-dir', 'out', '--fy', '240']
+        args = step5.parse_arguments(base)
+        self.assertAlmostEqual(args.postpeak_stop_ratio, 0.70)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            step5.parse_arguments(base+['--postpeak-stop-ratio', '1.0'])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            step5.parse_arguments(base+['--postpeak-stop-ratio', '0'])
+
+    def test_urdfil_tracks_peak_and_stops_at_ratio(self):
+        source = step5.render_postpeak_urdfil(0.70)
+        self.assertIn('SUBROUTINE URDFIL', source)
+        self.assertIn('CURRLPF=TIME(1)', source)
+        self.assertIn('PEAKLPF=CURRLPF', source)
+        self.assertIn('CURRLPF.LE.RATIO*PEAKLPF', source)
+        self.assertIn('LSTOP=1', source)
+        self.assertIn('RATIO=0.7D0', source)
+
+    def test_perfect_reference_is_a_default_step5_case(self):
+        with open(step5.__file__, encoding='utf-8') as stream:
+            source = stream.read()
+        self.assertIn("PERFECT_TOKEN = 'PERFECT'", source)
+        self.assertIn("name = 'STEP5_PERFECT_FY'+tag", source)
+        self.assertIn('perfect_reference=True', source)
+        self.assertIn('[PERFECT_TOKEN] + imperfect', source)
+
+    def test_inp_trigger_is_injected_before_end_step(self):
+        import os
+        import tempfile
+        handle, path = tempfile.mkstemp(suffix='.inp')
+        os.close(handle)
+        try:
+            with open(path, 'w') as stream:
+                stream.write('*HEADING\n*STEP\n*STATIC, RIKS\n0.1, 1.0\n*END STEP\n')
+            step5.inject_urdfil_trigger(path)
+            with open(path) as stream:
+                text = stream.read()
+            self.assertIn('*NODE FILE, NSET=STEP5_STOP, FREQUENCY=1', text)
+            self.assertLess(text.index('*NODE FILE'), text.index('*END STEP'))
+        finally:
+            os.remove(path)
+
     def test_step5_requires_pipeline_compatible_step4_provenance(self):
         with open(step5.__file__, encoding='utf-8') as stream:
             source = stream.read()

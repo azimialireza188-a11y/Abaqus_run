@@ -8,8 +8,10 @@ Abaqus 2024:
 fy is REQUIRED (MPa). Elastic properties, thickness, mesh, imperfections, initial
 BCs and general contact are inherited. Plasticity is elastic-perfectly-plastic,
 with no damage, rate dependence, residual stress or bolt failure added.
-All STEP4_* models are selected unless --models explicitly lists a subset.
-The compatible source is the Z-axis four-piece model from the preceding scripts.
+All STEP4_* imperfect models plus the untouched perfect reference model are selected
+unless --models explicitly lists a subset. Use the token PERFECT in --models to
+select the no-imperfection reference. The compatible source is the Z-axis
+four-piece model from the preceding scripts.
 
 Rigid BEAM MPC bolts are replaced by BEAM assembled connectors at identical
 nodes. These are force-output-capable rigid connectors, NOT MPC-type sections,
@@ -24,11 +26,15 @@ End-area weights in each Model description define work-conjugate shortening:
 delta = weighted_mean(U3 at zmin) - weighted_mean(U3 at zmax).
 The midspan axial anchor reaction is NOT the column load.
 
-Default stop: positive U3 at one bottom-end node reaches 0.01*L. This is a
-single-node displacement limit, NOT total shortening. Max increments=1000;
-initial/min/max arc increments=0.01/1e-8/0.05, total arc scale=1. These are pilot
-settings, not a convergence guarantee. No equilibrium tolerances are loosened.
-Confirm a peak and a sufficient descending branch after the eventual solve.
+Primary post-peak stop: at the first converged increment after the peak for which
+P <= postpeak_stop_ratio*Pu (default 0.70), implemented by URDFIL using the Riks
+LPF and LSTOP=1. Because P=LPF*P_ref with no preload, the force ratio is exactly
+the LPF ratio. A minimal NODE FILE request at every increment triggers URDFIL.
+The generated queue passes the supplied Fortran routine to every job.
+
+The existing positive-U3 monitor (default 0.01*L), maximum increment count and
+Riks arc settings remain safety limits; a run can still stop or fail before the
+70% criterion is reached. No equilibrium tolerances are loosened.
 
 Only CAE/INP deliverables are placed in --output-dir (must be new or empty).
 Jobs are created for later manual use; this script NEVER submits them. Abaqus
@@ -78,6 +84,8 @@ def parse_arguments(argv=None):
     p.add_argument('--max-end-displacement-mm', type=float)
     p.add_argument('--field-frequency', type=int, default=1)
     p.add_argument('--cpus', type=int, default=8)
+    p.add_argument('--postpeak-stop-ratio', type=float, default=.70,
+                   help='Stop at first converged post-peak increment with P <= ratio*Pu (default 0.70)')
     args = p.parse_args(argv)
     if args.reference_stress is None:
         args.reference_stress = args.fy
@@ -89,9 +97,141 @@ def parse_arguments(argv=None):
         p.error('Require min-arc <= initial-arc <= max-arc')
     if min(args.cpus, args.max_increments, args.field_frequency) < 1:
         p.error('cpus, max-increments and field-frequency must be positive')
+    if (not math.isfinite(args.postpeak_stop_ratio)
+            or not 0. < args.postpeak_stop_ratio < 1.):
+        p.error('--postpeak-stop-ratio must satisfy 0 < ratio < 1')
     args.source_cae = os.path.abspath(os.path.expanduser(args.source_cae))
     args.output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     return args
+
+
+PERFECT_TOKEN = 'PERFECT'
+STEP4_MANIFEST_MARKER = 'STEP4_MANIFEST='
+STOP_SUBROUTINE_NAME = 'step5_postpeak_stop.for'
+
+
+def reference_step4_manifest(model):
+    """Recover the exact Step-4 manifest stored on the untouched reference model."""
+    text = str(model.description or '')
+    index = text.rfind(STEP4_MANIFEST_MARKER)
+    if index < 0:
+        raise ValueError('Reference model lacks STEP4_MANIFEST provenance')
+    raw = text[index+len(STEP4_MANIFEST_MARKER):].strip()
+    try:
+        manifest = json.loads(raw)
+    except Exception as exc:
+        raise ValueError('Reference STEP4_MANIFEST is not valid JSON: %s' % exc)
+    payload = dict(specification=manifest, current_case={})
+    pipeline_contract.validate_step4_payload(payload)
+    return manifest
+
+
+def perfect_step4_payload(reference_model):
+    """Create Step-4-compatible zero-imperfection provenance without moving any node."""
+    manifest = reference_step4_manifest(reference_model)
+    case = dict(
+        label='PERFECT',
+        local_component_mm=0.0,
+        distortional_component_mm=0.0,
+        global_component_mm=0.0,
+        actual_max_transverse_offset_mm=0.0,
+        actual_max_normal_offset_mm=0.0,
+        perfect_reference=True)
+    return dict(specification=manifest, current_case=case)
+
+
+def render_postpeak_urdfil(ratio):
+    """Fortran URDFIL: stop at first converged post-peak LPF <= ratio*peak LPF."""
+    literal = ('%.16g' % float(ratio)) + 'D0'
+    return """      SUBROUTINE URDFIL(LSTOP,LOVRWRT,KSTEP,KINC,DTIME,TIME)
+C
+C     STEP5 GMNIA POST-PEAK STOP
+C     In a Static Riks step TIME(1) is the load proportionality factor.
+C     With no preload, P/Pu = LPF/LPF_peak. Stop at the first converged
+C     post-peak increment satisfying LPF <= RATIO*LPF_peak.
+C
+      INCLUDE 'ABA_PARAM.INC'
+      DIMENSION ARRAY(513),JRRAY(NPRECD,513),TIME(2)
+      EQUIVALENCE (ARRAY(1),JRRAY(1,1))
+      DOUBLE PRECISION PEAKLPF,CURRLPF,RATIO
+      INTEGER PEAKINC
+      LOGICAL PEAKSET
+      SAVE PEAKLPF,PEAKINC,PEAKSET
+      DATA PEAKLPF /-1.D99/
+      DATA PEAKINC /-1/
+      DATA PEAKSET /.FALSE./
+C
+      RATIO=%s
+      LSTOP=0
+      LOVRWRT=0
+      CURRLPF=TIME(1)
+C
+      IF (.NOT.PEAKSET .OR. CURRLPF.GT.PEAKLPF) THEN
+         PEAKLPF=CURRLPF
+         PEAKINC=KINC
+         PEAKSET=.TRUE.
+      ELSE IF (PEAKLPF.GT.0.D0 .AND. KINC.GT.PEAKINC) THEN
+         IF (CURRLPF.LE.RATIO*PEAKLPF) THEN
+            LSTOP=1
+            WRITE(7,9000) KINC,CURRLPF,PEAKLPF,RATIO
+ 9000       FORMAT(' STEP5 POSTPEAK STOP: INC=',I8,
+     1             ' LPF=',1PE16.8,' PEAK=',1PE16.8,
+     2             ' RATIO=',1PE12.4)
+         END IF
+      END IF
+C
+      RETURN
+      END
+""" % literal
+
+
+def inject_urdfil_trigger(path):
+    """Request minimal .fil output every increment so Abaqus calls URDFIL."""
+    with open(path, 'r') as stream:
+        text = stream.read()
+    upper = text.upper()
+    if '*NODE FILE' in upper:
+        raise RuntimeError('Unexpected pre-existing NODE FILE request in STEP5 INP')
+    marker = '*END STEP'
+    index = upper.rfind(marker)
+    if index < 0:
+        raise RuntimeError('Cannot inject URDFIL trigger: *END STEP not found')
+    trigger = ('** STEP5 URDFIL trigger: one-node displacement to .fil every increment\n'
+               '*NODE FILE, NSET=STEP5_STOP, FREQUENCY=1\n'
+               'U\n')
+    text = text[:index] + trigger + text[index:]
+    with open(path, 'w') as stream:
+        stream.write(text)
+
+
+def write_queue_batch(path, job_names, cpus, subroutine_name=STOP_SUBROUTINE_NAME):
+    """Sequential unattended queue; every next job starts even if the previous fails."""
+    lines = [
+        '@echo off',
+        'setlocal',
+        'cd /d "%~dp0"',
+        'echo ============================================================',
+        'echo STEP5 GMNIA SEQUENTIAL QUEUE - 70%% POST-PEAK RULE',
+        'echo ============================================================',
+    ]
+    for index, name in enumerate(job_names, 1):
+        lines.extend([
+            'echo.',
+            'echo [%d/%d] %s' % (index, len(job_names), name),
+            'call abaqus job=%s input=%s.inp user="%s" cpus=%d interactive' %
+                (name, name, subroutine_name, cpus),
+            'echo Finished %s with exit code %%ERRORLEVEL%%' % name,
+        ])
+    lines.extend([
+        'echo.',
+        'echo ============================================================',
+        'echo ALL QUEUED JOBS HAVE BEEN ATTEMPTED',
+        'echo ============================================================',
+        'endlocal',
+        '',
+    ])
+    with open(path, 'w') as stream:
+        stream.write('\r\n'.join(lines))
 
 
 def end_weights(coordinates, connectivity, thickness, zmin, zmax):
@@ -307,6 +447,12 @@ def prepare_model(model, args):
         end_area_mm2=end_area[0], end_area_weights=weights,
         force_formula='P=LPF*reference_force_N_per_end (no preload)',
         shortening_formula='area_weighted_mean(U3_bottom)-area_weighted_mean(U3_top)',
+        postpeak_stop=dict(
+            ratio=args.postpeak_stop_ratio,
+            criterion='first converged post-peak increment with P <= ratio*Pu',
+            equivalent_lpf_criterion='LPF <= ratio*max_previous_LPF because P=LPF*P_ref and P0=0',
+            implementation='URDFIL LSTOP=1 triggered by NODE FILE frequency=1',
+            user_subroutine=STOP_SUBROUTINE_NAME),
         stop_node=[bottom_name, bottom_labels[0]], stop_positive_U3_mm=stop,
         material='Elastic-perfectly-plastic; source E/nu preserved; no damage',
         bolts=bolts,
@@ -336,6 +482,8 @@ def verify_input(path, bolts):
             raise RuntimeError('Required INP content missing: '+pattern)
     if re.search(r'^\*(BUCKLE|MPC)\b', text, re.M):
         raise RuntimeError('Unexpected Buckle/MPC remains in STEP5 input')
+    if not re.search(r'^\*NODE FILE[^\n]*NSET=STEP5_STOP[^\n]*FREQUENCY=1', text, re.M):
+        raise RuntimeError('URDFIL trigger NODE FILE request is missing from STEP5 input')
     if len(re.findall(r'^\*CONNECTOR SECTION\b', text, re.M)) < 1 or bolts < 1:
         raise RuntimeError('Missing connector sections')
 
@@ -349,29 +497,55 @@ def build(args):
     if os.path.exists(args.output_dir) and (not os.path.isdir(args.output_dir) or os.listdir(args.output_dir)):
         raise ValueError('Output directory must be new or empty: '+args.output_dir)
     database = openMdb(pathName=args.source_cae)
-    selected = args.models or sorted(n for n in database.models.keys() if n.startswith('STEP4_'))
+    imperfect = sorted(n for n in database.models.keys() if n.startswith('STEP4_'))
+    reference_candidates = [n for n in database.models.keys()
+        if not n.startswith('STEP4_') and STEP4_MANIFEST_MARKER in str(database.models[n].description or '')]
+    if len(reference_candidates) != 1:
+        raise ValueError('Expected exactly one untouched Step-4 reference model; found %d' %
+                         len(reference_candidates))
+    perfect_source = reference_candidates[0]
+    # Validate the untouched reference provenance before using it as PERFECT.
+    reference_step4_manifest(database.models[perfect_source])
+
+    selected = list(args.models) if args.models else [PERFECT_TOKEN] + imperfect
     if not selected or len(set(selected)) != len(selected):
-        raise ValueError('Select distinct STEP4_* models')
+        raise ValueError('Select distinct STEP4_* models and/or the PERFECT token')
     for name in selected:
+        if name == PERFECT_TOKEN:
+            continue
         if not name.startswith('STEP4_') or name not in database.models:
             raise ValueError('STEP4 source model not found: '+name)
     for name in list(database.jobs.keys()):
         del database.jobs[name]
+    keep = set(n for n in selected if n != PERFECT_TOKEN)
+    if PERFECT_TOKEN in selected:
+        keep.add(perfect_source)
     for name in list(database.models.keys()):
-        if name not in selected:
+        if name not in keep:
             del database.models[name]
     scratch = tempfile.mkdtemp(prefix='cfs_step5_')
     previous = os.getcwd()
     outputs = []
+    job_names = []
     tag = ('%g' % args.fy).replace('.', 'p').replace('+', '')
+    final_user_subroutine = os.path.join(args.output_dir, STOP_SUBROUTINE_NAME)
     try:
         os.chdir(scratch)
+        with open(STOP_SUBROUTINE_NAME, 'w') as stream:
+            stream.write(render_postpeak_urdfil(args.postpeak_stop_ratio))
+        outputs.append(STOP_SUBROUTINE_NAME)
+
         for i, source_name in enumerate(selected, 1):
-            name = 'STEP5_'+source_name[len('STEP4_'):]+'_FY'+tag
+            if source_name == PERFECT_TOKEN:
+                name = 'STEP5_PERFECT_FY'+tag
+                source_model = database.models[perfect_source]
+                model = database.Model(name=name, objectToCopy=source_model)
+                model.setValues(description=STEP4_PREFIX+json.dumps(
+                    perfect_step4_payload(source_model), ensure_ascii=True))
+            else:
+                name = 'STEP5_'+source_name[len('STEP4_'):]+'_FY'+tag
+                model = database.Model(name=name, objectToCopy=database.models[source_name])
             print('[%d/%d] BUILD %s' % (i, len(selected), name)); sys.stdout.flush()
-            # changeKey can leave native-instance owner references stale in CAE.
-            model = database.Model(name=name, objectToCopy=database.models[source_name])
-            del database.models[source_name]
             info = prepare_model(model, args)
             nodal_precision = str(info['reference_pipeline'].get('nodal_precision', 'full')).lower()
             if nodal_precision not in ('full', 'single'):
@@ -380,12 +554,27 @@ def build(args):
                 name=name, model=name, numCpus=args.cpus, numDomains=args.cpus,
                 memory=24000, memoryUnits=MEGA_BYTES,
                 nodalOutputPrecision=FULL if nodal_precision == 'full' else SINGLE,
+                userSubroutine=final_user_subroutine,
                 description='Build only; reference-compatible STEP5; '+info['force_formula'])
             job.writeInput(consistencyChecking=ON)
+            inject_urdfil_trigger(name+'.inp')
             verify_input(name+'.inp', len(info['bolts']))
             outputs.append(name+'.inp')
-            print('INP verified: %d bolts; P_ref=%g N per end' %
-                  (len(info['bolts']), info['reference_force_N_per_end'])); sys.stdout.flush()
+            job_names.append(name)
+            print('INP verified: %d bolts; P_ref=%g N per end; postpeak stop=%g%% Pu' %
+                  (len(info['bolts']), info['reference_force_N_per_end'],
+                   100.*args.postpeak_stop_ratio)); sys.stdout.flush()
+
+        # Keep only final STEP5 models in the delivered CAE.
+        for source_name in list(database.models.keys()):
+            if not source_name.startswith('STEP5_'):
+                del database.models[source_name]
+
+        ratio_tag = ('%g' % (100.*args.postpeak_stop_ratio)).replace('.', 'p')
+        queue_name = 'run_step5_queue_'+ratio_tag+'_pct.bat'
+        write_queue_batch(queue_name, job_names, args.cpus)
+        outputs.append(queue_name)
+
         cae_name = 'Step5_GMNIA_FY'+tag+'.cae'
         database.saveAs(pathName=os.path.join(scratch, cae_name))
         database.close()
@@ -396,7 +585,7 @@ def build(args):
             if os.path.exists(destination):
                 raise ValueError('Refusing to overwrite '+destination)
             shutil.move(os.path.join(scratch, name), destination)
-        print('SAVED: %s; one CAE + %d INP files. NO ANALYSIS SUBMITTED.' %
+        print('SAVED: %s; one CAE + %d INP files + URDFIL + sequential queue. NO ANALYSIS SUBMITTED.' %
               (args.output_dir, len(selected)))
     except Exception:
         print('BUILD FAILED. Diagnostic intermediate files: '+scratch)

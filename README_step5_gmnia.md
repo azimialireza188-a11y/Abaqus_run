@@ -129,3 +129,70 @@ The default output directory is the ODB directory. Expected files are:
 
 The SVG is publication-friendly vector output. The CSV can be imported directly
 into Excel, Origin, MATLAB or Python for final figure styling.
+
+
+## Perfect reference and 70% post-peak stop
+
+The Step-5 builder now includes the untouched no-imperfection reference model by
+default, in addition to all `STEP4_*` imperfection cases. For `fy=240` the
+perfect model is named:
+
+```text
+STEP5_PERFECT_FY240
+```
+
+The perfect model is copied from the untouched reference model stored in the
+Step-4 CAE. No nodal imperfection is added; the same mesh, S4R formulation,
+contact, boundary conditions and original BEAM_MPC bolt endpoints are preserved
+before the normal Step-5 conversion to assembled BEAM connectors.
+
+All Step-5 jobs also use one common post-peak stopping rule. The default is:
+
+```text
+P <= 0.70 Pu
+```
+
+at the first converged increment after the peak. Since the Step-5 loading has no
+preload and uses `P = LPF * P_ref`, this is exactly equivalent to:
+
+```text
+LPF <= 0.70 * LPF_peak
+```
+
+The builder writes `step5_postpeak_stop.for`, an Abaqus/Standard `URDFIL`
+routine. A minimal `*NODE FILE, NSET=STEP5_STOP, FREQUENCY=1` request is
+injected into every INP so URDFIL is called after every converged increment.
+URDFIL tracks the largest LPF reached and sets `LSTOP=1` at the first
+post-peak increment satisfying the 70% rule.
+
+The ratio is configurable, but the publication default is 0.70:
+
+```bat
+--postpeak-stop-ratio 0.70
+```
+
+The builder also writes a sequential batch file such as:
+
+```text
+run_step5_queue_70_pct.bat
+```
+
+Each Abaqus command in that queue explicitly includes:
+
+```text
+user="step5_postpeak_stop.for"
+```
+
+and the next job is attempted even if the preceding job exits with an error.
+
+The 70% rule is the primary desired post-peak completion criterion, but it is
+not a guarantee that every job will reach it. A job can still terminate earlier
+because of nonconvergence, the maximum increment count, the existing displacement
+safety limit, licensing, or another solver error. Such a case must be reported as
+not reaching the common post-peak criterion and should not be treated as a
+complete publication run.
+
+Abaqus/Standard user-subroutine compilation must be configured on the machine
+for the URDFIL-controlled jobs. The CAE jobs store the generated Fortran file as
+their user subroutine, and the generated queue passes it explicitly on the
+command line.
