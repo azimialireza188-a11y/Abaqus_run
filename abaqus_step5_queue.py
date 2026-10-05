@@ -30,6 +30,7 @@ if SCRIPT_DIR not in sys.path:
 import abaqus_step5_force_displacement_core as fd
 import abaqus_pipeline_contract as contract
 import runtime_resources as resources
+from abaqus_step5_progress import report, elapsed_text
 
 
 def crossing(values, ratio):
@@ -215,6 +216,42 @@ def backup_failed_artifacts(directory, name):
     return result
 
 
+def latest_line(path):
+    """Read only a bounded tail; solver-owned files may be absent or busy."""
+    try:
+        with open(path, 'rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - 16384))
+            lines = stream.read().decode('utf-8', errors='replace').splitlines()
+        if size > 16384:
+            lines = lines[1:]
+        return next((line.strip()[:300] for line in reversed(lines) if line.strip()), '')
+    except OSError:
+        return ''
+
+
+def solver_progress(directory, name, elapsed, values, requested):
+    parts = [name, 'elapsed='+elapsed_text(elapsed)]
+    if requested:
+        parts.append('Stop requested; waiting for solver exit')
+    elif not os.path.isfile(os.path.join(directory, name+'.odb')):
+        parts.append('Waiting for ODB (startup/preprocessing/solver)')
+    if values:
+        peak = max(values)
+        parts.append('LPF=%g; peak LPF=%g' % (values[-1], peak))
+        if peak > 0:
+            parts.append('P/Pmax=%.3f (latest available ODB sample)' % (values[-1]/peak))
+    status = latest_line(os.path.join(directory, name+'.sta'))
+    if status:
+        parts.append('STA latest: '+status)
+    else:
+        status = latest_line(os.path.join(directory, name+'_queue_solver.log'))
+        if status:
+            parts.append('Solver log: '+status)
+    return ' | '.join(parts)
+
+
 def run_job(name, args, policy):
     path = os.path.join(args.run_dir,name+'.odb')
     if os.path.exists(path):
@@ -222,8 +259,13 @@ def run_job(name, args, policy):
     result = dict(model=name,criterion_reached=False,stop_method=args.stop_method,
                   previous_artifacts=backup_failed_artifacts(args.run_dir,name))
     cmd = job_command(name,policy.cpus,policy.gpus,args.stop_method)
-    print('RUN: '+subprocess.list2cmdline(cmd));sys.stdout.flush()
-    with open(name+'_queue_solver.log','w') as log:
+    report('SUBMIT', subprocess.list2cmdline(cmd))
+    log_path = os.path.join(args.run_dir, name+'_queue_solver.log')
+    report('SOLVER LOG', log_path)
+    started = time.monotonic()
+    next_progress = started
+    values = []
+    with open(log_path,'w') as log:
         process = launch(cmd,cwd=args.run_dir,stdout=log,stderr=subprocess.STDOUT)
         requested = False
         last_warning = ''
@@ -231,8 +273,11 @@ def run_job(name, args, policy):
             while process.poll() is None:
                 if args.stop_method == 'monitor' and not requested and os.path.isfile(path):
                     try:
-                        hit = crossing(read_live_lpf(path), args.ratio)
+                        values = read_live_lpf(path)
+                        hit = crossing(values, args.ratio)
                         if hit:
+                            report('STOP REQUEST', '%s | post-peak ratio %.3f <= %.3f; requesting Abaqus termination' %
+                                   (name, hit['ratio'], args.ratio))
                             # Native job control; do not kill the launcher or edit solver files.
                             control = launch(['abaqus','terminate','job='+name],cwd=args.run_dir)
                             code = control.wait(timeout=30)
@@ -240,14 +285,18 @@ def run_job(name, args, policy):
                             if code == 0:
                                 requested = True
                                 result['observed_crossing'] = hit
-                                print('70% crossing observed: '+name);sys.stdout.flush()
+                                report('STOP ACCEPTED', name+'; waiting for solver shutdown')
                             else:
                                 raise RuntimeError('Abaqus terminate command failed: %d' % code)
                     except Exception as error:
                         # ODB can be unavailable/not yet flushed while Standard is writing it.
                         message = str(error)
                         if message != last_warning:
-                            print('MONITOR: '+name+': '+message);sys.stdout.flush();last_warning=message
+                            report('MONITOR', name+': '+message);last_warning=message
+                now = time.monotonic()
+                if now >= next_progress:
+                    report('SOLVING', solver_progress(args.run_dir, name, now-started, values, requested))
+                    next_progress = now + getattr(args, 'progress_seconds', 15.0)
                 time.sleep(args.poll_seconds)
         except BaseException:
             control = launch(['abaqus','terminate','job='+name],cwd=args.run_dir)
@@ -256,8 +305,10 @@ def run_job(name, args, policy):
             raise
         result['solver_exit_code'] = process.returncode
         result['termination_requested'] = requested
+    report('SOLVER EXIT', '%s | code=%s | elapsed=%s' %
+           (name, process.returncode, elapsed_text(time.monotonic()-started)))
     if not os.path.isfile(path):
-        with open(name+'_queue_solver.log',errors='replace') as log:
+        with open(log_path,errors='replace') as log:
             diagnostic=log.read()[-6000:].strip()
         result['outcome']='SOLVER_ERROR'
         result['error']='Solver produced no ODB. '+(diagnostic or 'See '+name+'_queue_solver.log')
@@ -266,6 +317,7 @@ def run_job(name, args, policy):
 
 def run(args):
     from abaqus_step5_gmnia import write_queue_batch
+    report('VALIDATE', 'Checking queue inputs in '+args.run_dir)
     names = args.jobs or [os.path.splitext(os.path.basename(p))[0]
                          for p in sorted(glob.glob(os.path.join(args.run_dir,'STEP5_*.inp')))]
     names = sorted(names, key=lambda name: (not name.startswith('STEP5_PERFECT_'), name))
@@ -281,6 +333,7 @@ def run(args):
     cae = args.cae or (caes[0] if len(caes)==1 else None)
     if not cae:
         raise ValueError('Specify --cae: expected exactly one Step5_GMNIA_FY*.cae')
+    report('METADATA', 'Reading CAE metadata: '+cae)
     infos = metadata(cae,names)
     # Metadata is validated before any submission; all plots use P=LPF*P_ref.
     for name,info in infos.items():
@@ -288,8 +341,12 @@ def run(args):
             raise ValueError('Automatic plots require field_frequency=1: '+name)
         if info.get('stage') != 5 or float(info.get('reference_force_N_per_end',0))<=0:
             raise ValueError('Invalid STEP5 metadata: '+name)
+    report('RESOURCES', 'Detecting available CPUs and GPUs')
     policy=resources.resolve_solver_policy(resources.detect_resources(),args.cpus,args.gpus)
-    print('RESOURCE REQUEST: cpus=%d gpus=%d memory=100%%; reserves=0' % (policy.cpus,policy.gpus))
+    report('RESOURCES', 'cpus=%d gpus=%d memory=100%%; reserves=0' % (policy.cpus,policy.gpus))
+    report('QUEUE', '%d jobs | mode=%s | post-peak stop=%.1f%% | progress every %g s' %
+           (len(names), 'extract-only' if args.extract_only else args.stop_method,
+            args.ratio*100, getattr(args, 'progress_seconds', 15.0)))
     if args.repair_only:
         path=os.path.join(args.run_dir,'run_step5_queue_70_pct.bat')
         if os.path.exists(path):
@@ -310,7 +367,7 @@ def run(args):
     curves, summaries, yield_lines=[],[],[]
     try:
         for index,name in enumerate(names,1):
-            print('[%d/%d] %s' % (index,len(names),name));sys.stdout.flush()
+            report('JOB %d/%d' % (index,len(names)), name)
             result=dict(model=name,criterion_reached=False)
             try:
                 if not args.extract_only:
@@ -319,12 +376,14 @@ def run(args):
                         raise RuntimeError(result['error'])
                 path=os.path.join(args.run_dir,name+'.odb')
                 # Wait briefly for file handles to be released; never delete a lock.
+                report('WAIT FOR ODB', name+' | checking solver file locks')
                 for _ in range(30):
                     if not os.path.exists(os.path.splitext(path)[0]+'.lck'):
                         break
                     time.sleep(1)
                 if os.path.exists(os.path.splitext(path)[0]+'.lck'):
                     raise ValueError('ODB remains locked: '+path)
+                report('EXTRACT', name+' | reading force-displacement results and writing CSV/SVG')
                 summary=fd.extract(SimpleNamespace(cae=cae,odb=path,model=name,step='GMNIA',
                                     output_dir=args.run_dir,allow_partial=True,skip_png=True))
                 with open(summary['csv'],encoding='utf-8-sig') as f:
@@ -342,24 +401,28 @@ def run(args):
                 if not any(math.isclose(y,old,rel_tol=1e-10) for old in yield_lines):
                     yield_lines.append(y)
                 stem=os.path.splitext(summary['csv'])[0]
+                report('PLOT', name+' | writing force-displacement PNG')
                 plot_png(stem+'.png',[(label,points)],[y],name+' - Riks force-shortening')
                 summary.update(queue_status=result,png=stem+'.png')
                 with open(os.path.splitext(summary['csv'])[0]+'.json','w',encoding='utf-8') as f:
                     json.dump(summary,f,indent=2,allow_nan=False)
             except Exception as error:
                 result['error']=str(error)
-                print('FAILED: '+name+': '+str(error));sys.stdout.flush()
+                report('FAILED', name+': '+str(error))
             summaries.append(result)
             with open(os.path.join(args.run_dir,'STEP5_queue_status.json'),'w') as f:
                 json.dump(summaries,f,indent=2,allow_nan=False)
             try:
+                report('COMPARISON', 'Updating combined plots and peak summary (%d/%d jobs processed)' % (index,len(names)))
                 write_comparison(args.run_dir,curves,yield_lines,summaries)
             except Exception as error:
-                print('COMPARISON PLOT FAILED: '+str(error));sys.stdout.flush()
+                report('COMPARISON FAILED', str(error))
                 summaries[-1]['comparison_error']=str(error)
             with open(os.path.join(args.run_dir,'STEP5_queue_status.json'),'w') as f:
                 json.dump(summaries,f,indent=2,allow_nan=False)
-        print('QUEUE FINISHED. Check STEP5_queue_status.json and STEP5_peak_summary.csv.')
+            report('JOB %d/%d FINISHED' % (index,len(names)), name+' | '+
+                   ('FAILED' if result.get('error') else result.get('outcome','UNKNOWN')))
+        report('QUEUE FINISHED', 'Check STEP5_queue_status.json and STEP5_peak_summary.csv.')
         if any(r.get('error') or r.get('comparison_error') or r.get('outcome')=='SOLVER_ERROR' or not r.get('criterion_reached') for r in summaries):
             raise RuntimeError('Some runs/plots failed or did not reach the post-peak criterion; see queue status')
     finally:
@@ -389,12 +452,16 @@ def main():
     p.add_argument('--gpus',default='auto')
     p.add_argument('--ratio',type=float,default=.70)
     p.add_argument('--poll-seconds',type=float,default=1.0)
+    p.add_argument('--progress-seconds',type=float,default=15.0,
+                   help='Console heartbeat interval; independent of ODB stop polling (default: 15)')
     p.add_argument('--stop-method',choices=['monitor','urdfil'],default='monitor')
     p.add_argument('--repair-only',action='store_true')
     p.add_argument('--extract-only',action='store_true')
     args=p.parse_args(argv)
     if not 0 < args.ratio < 1 or not math.isfinite(args.poll_seconds) or args.poll_seconds<=0:
         p.error('Invalid ratio/poll interval')
+    if not math.isfinite(args.progress_seconds) or args.progress_seconds <= 0:
+        p.error('Progress interval must be finite and positive')
     args.run_dir=os.path.abspath(args.run_dir)
     if args.cae:
         args.cae=os.path.abspath(args.cae)

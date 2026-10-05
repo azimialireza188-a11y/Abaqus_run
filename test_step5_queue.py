@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import io
 import abaqus_step5_gmnia as build
 import importlib.util
 from unittest import mock
@@ -8,6 +9,38 @@ from types import SimpleNamespace
 
 
 class QueueTests(unittest.TestCase):
+    def test_running_solver_reports_progress_even_before_odb_exists(self):
+        q = self.queue()
+        with tempfile.TemporaryDirectory() as d:
+            process = mock.Mock(returncode=0)
+            process.poll.side_effect = [None, None, None, 0]
+            output = io.StringIO()
+            args = SimpleNamespace(run_dir=d, stop_method='monitor', ratio=.7,
+                                   poll_seconds=1, progress_seconds=15)
+            with mock.patch.object(q, 'launch', return_value=process), \
+                    mock.patch.object(q.time, 'sleep'), \
+                    mock.patch.object(q.time, 'monotonic', side_effect=[0, 0, 1, 15, 16]), \
+                    mock.patch.object(q.sys, 'stdout', output):
+                q.run_job('STEP5_D_FY240', args, SimpleNamespace(cpus=12, gpus=0))
+            text = output.getvalue()
+            self.assertEqual(text.count('[SOLVING]'), 2)
+            self.assertIn('Waiting for ODB', text)
+            self.assertIn('elapsed=00:00:15', text)
+            self.assertIn('[SOLVER EXIT]', text)
+
+    def test_solver_progress_reads_latest_status_without_requiring_complete_file(self):
+        q = self.queue()
+        with tempfile.TemporaryDirectory() as d:
+            name = 'STEP5_D_FY240'
+            with open(os.path.join(d, name+'.sta'), 'w') as stream:
+                stream.write('HEADER\n  1  27  1  0  3  3  0.45\n\n')
+            self.assertTrue(hasattr(q, 'solver_progress'), 'live status reporting is missing')
+            message = q.solver_progress(d, name, 65, [0, 1, .8], False)
+            self.assertIn('elapsed=00:01:05', message)
+            self.assertIn('LPF=0.8', message)
+            self.assertIn('P/Pmax=0.800', message)
+            self.assertIn('1  27  1', message)
+
     def test_solver_auto_uses_all_physical_cores_without_limiting_python_workers(self):
         import runtime_resources as r
         inventory=r.ResourceInventory(24,12,64*1024**3,60*1024**3,[])

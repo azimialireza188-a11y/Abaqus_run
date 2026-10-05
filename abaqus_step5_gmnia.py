@@ -55,6 +55,7 @@ import struct
 import sys
 import tempfile
 import abaqus_pipeline_contract as pipeline_contract
+from abaqus_step5_progress import report
 
 # Abaqus/CAE noGUI can execute the script without a __file__ global.
 # Resolve before build changes cwd to its temporary workspace.
@@ -247,9 +248,14 @@ def write_queue_batch(path, job_names, cpus='auto', subroutine_name=STOP_SUBROUT
     if cae:
         command += ' --cae "%s"' % cae
     lines = ['@echo off', 'setlocal', 'cd /d "%~dp0"',
+             'set "PYTHONUNBUFFERED=1"',
              'echo STEP5 GMNIA QUEUE - POST-PEAK MONITOR AND AUTOMATIC PLOTS',
+             'echo [STARTUP] Starting Abaqus/CAE queue driver; waiting for Python initialization...',
+             'echo [PROGRESS] Job, stage and elapsed time will be printed; solver heartbeat every 15 seconds.',
              command, 'set "QUEUE_EXIT=%ERRORLEVEL%"',
-             'echo Queue exit code: %QUEUE_EXIT%', 'endlocal & exit /b %QUEUE_EXIT%', '']
+             'echo [QUEUE EXIT] Code: %QUEUE_EXIT%',
+             'if not "%QUEUE_EXIT%"=="0" echo [ATTENTION] Queue failed or a stop criterion was not reached. Check messages and STEP5_queue_status.json.',
+             'endlocal & exit /b %QUEUE_EXIT%', '']
     with open(path, 'w', newline='') as stream:
         stream.write('\r\n'.join(lines))
 
@@ -517,6 +523,7 @@ def verify_input(path, bolts):
 
 
 def build(args):
+    report('BUILD START', 'Loading Abaqus modules')
     import caeModules
     from abaqus import openMdb
     from abaqusConstants import ON, PERCENTAGE, FULL, SINGLE
@@ -524,7 +531,9 @@ def build(args):
         raise ValueError('Source CAE not found: '+args.source_cae)
     if os.path.exists(args.output_dir) and (not os.path.isdir(args.output_dir) or os.listdir(args.output_dir)):
         raise ValueError('Output directory must be new or empty: '+args.output_dir)
+    report('OPEN CAE', args.source_cae)
     database = openMdb(pathName=args.source_cae)
+    report('VALIDATE', 'Checking Step4 models and reference provenance')
     imperfect = sorted(n for n in database.models.keys() if n.startswith('STEP4_'))
     reference_candidates = [n for n in database.models.keys()
         if not n.startswith('STEP4_') and STEP4_MANIFEST_MARKER in str(database.models[n].description or '')]
@@ -567,6 +576,7 @@ def build(args):
         outputs.append('abaqus_v6.env')
 
         for i, source_name in enumerate(selected, 1):
+            report('BUILD %d/%d' % (i, len(selected)), 'Copying source model '+source_name)
             if source_name == PERFECT_TOKEN:
                 name = 'STEP5_PERFECT_FY'+tag
                 source_model = database.models[perfect_source]
@@ -576,7 +586,7 @@ def build(args):
             else:
                 name = 'STEP5_'+source_name[len('STEP4_'):]+'_FY'+tag
                 model = database.Model(name=name, objectToCopy=database.models[source_name])
-            print('[%d/%d] BUILD %s' % (i, len(selected), name)); sys.stdout.flush()
+            report('PREPARE', name+' | materials, connectors, Riks step and outputs')
             info = prepare_model(model, args)
             nodal_precision = str(info['reference_pipeline'].get('nodal_precision', 'full')).lower()
             if nodal_precision not in ('full', 'single'):
@@ -587,7 +597,9 @@ def build(args):
                 nodalOutputPrecision=FULL if nodal_precision == 'full' else SINGLE,
                 userSubroutine=final_user_subroutine if args.stop_method == 'urdfil' else '',
                 description='Build only; reference-compatible STEP5; '+info['force_formula'])
+            report('WRITE INP', name)
             job.writeInput(consistencyChecking=ON)
+            report('VERIFY INP', name)
             inject_urdfil_trigger(name+'.inp')
             verify_input(name+'.inp', len(info['bolts']))
             outputs.append(name+'.inp')
@@ -603,14 +615,17 @@ def build(args):
 
         ratio_tag = ('%g' % (100.*args.postpeak_stop_ratio)).replace('.', 'p')
         queue_name = 'run_step5_queue_'+ratio_tag+'_pct.bat'
+        report('WRITE BAT', queue_name)
         write_queue_batch(queue_name, job_names, 'auto', ratio=args.postpeak_stop_ratio, stop_method=args.stop_method)
         outputs.append(queue_name)
 
         cae_name = 'Step5_GMNIA_FY'+tag+'.cae'
+        report('SAVE CAE', cae_name)
         database.saveAs(pathName=os.path.join(scratch, cae_name))
         database.close()
         outputs.append(cae_name)
         os.makedirs(args.output_dir, exist_ok=True)
+        report('COPY OUTPUTS', args.output_dir)
         for name in outputs:
             destination = os.path.join(args.output_dir, name)
             if os.path.exists(destination):

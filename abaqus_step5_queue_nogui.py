@@ -16,5 +16,10 @@ if SCRIPT_DIR not in sys.path:
 print('STEP5 NOGUI DRIVER STARTED')
 sys.stdout.flush()
 from abaqus_step5_queue import main
+from abaqus_step5_progress import report
 
-main()
+try:
+    main()
+except Exception as error:
+    report('QUEUE FAILED', str(error))
+    raise
