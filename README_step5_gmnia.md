@@ -198,14 +198,21 @@ preload and uses `P = LPF * P_ref`, this is exactly equivalent to:
 LPF <= 0.70 * LPF_peak
 ```
 
-The default queue now uses **compiler-free ODB monitoring**. It reads converged
-LPF history every second and invokes native `abaqus terminate job=...` after the
-first observed post-peak crossing. No `user=` is passed, so `ifort` is not needed.
-This is external monitoring, not an increment callback: ODB flush/poll/command
-latency can let extra increments run. The status JSON records the observed
-crossing, termination request, launcher exit code, and crossing verified from the
-final synchronized curve. Do not claim exact first-increment termination for
-monitor mode. Native termination cannot be resumed as a suspended job.
+The default queue now uses **compiler-free Riks `.sta` monitoring**. Abaqus
+writes the converged total LPF to the append-only status file while Standard is
+running, so the queue does not need to open a solver-owned live ODB. Unsuccessful
+attempt lines such as `1U` are ignored. Because the printed `.sta` LPF is rounded,
+the live stop uses a conservative rounding bound: termination is requested only
+when the upper bound of the current printed LPF is at or below 70% of a lower
+bound on the previously observed peak. Thus text rounding cannot terminate the
+analysis before the true 70% crossing. The final ODB extraction still uses the
+automatic full-precision Riks LPF history and independently verifies the crossing.
+
+The queue invokes native `abaqus terminate job=...` after that observed crossing.
+No `user=` is passed, so `ifort` is not needed. This is external monitoring,
+not an increment callback: status-file polling and command latency can let extra
+increments run. Do not claim exact first-increment termination for monitor mode.
+Native termination cannot be resumed as a suspended job.
 
 `--stop-method urdfil` retains the exact increment callback option and requires
 a compatible Intel Fortran + Visual Studio Abaqus user-subroutine environment.
