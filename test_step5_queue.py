@@ -9,6 +9,17 @@ from types import SimpleNamespace
 
 
 class QueueTests(unittest.TestCase):
+    def test_progress_is_mirrored_to_external_log(self):
+        import abaqus_step5_progress as progress
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'progress.log')
+            with mock.patch.dict(os.environ, {'STEP5_PROGRESS_LOG': path}), \
+                    mock.patch.object(progress.sys, 'stderr', io.StringIO()):
+                progress.report('TEST', 'hello')
+            with open(path, encoding='utf-8') as stream:
+                text = stream.read()
+            self.assertIn('[TEST] hello', text)
+
     def test_running_solver_reports_progress_even_before_odb_exists(self):
         q = self.queue()
         with tempfile.TemporaryDirectory() as d:
@@ -154,6 +165,9 @@ class QueueTests(unittest.TestCase):
             with open(p) as f:
                 s = f.read()
             self.assertIn('abaqus_step5_queue_nogui.py', s)
+            self.assertIn('STEP5_PROGRESS_LOG', s)
+            self.assertIn('step5_progress_tail.ps1', s)
+            self.assertIn('start "" /b powershell.exe', s)
             self.assertNotIn('user="step5_postpeak_stop.for"', s)
 
     def test_comparison_contains_all_curves_and_yield_line(self):

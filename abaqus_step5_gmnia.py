@@ -242,6 +242,7 @@ def write_queue_batch(path, job_names, cpus='auto', subroutine_name=STOP_SUBROUT
                       cae=None, script=None, ratio=.70, stop_method='monitor'):
     """One CAE runner handles monitoring, per-job plots and final comparison."""
     script = script or os.path.join(SCRIPT_DIR, 'abaqus_step5_queue_nogui.py')
+    tail_script = os.path.join(os.path.dirname(script), 'step5_progress_tail.ps1')
     command = ('call abaqus cae noGUI="%s" -- --run-dir "%%~dp0." '
                '--cpus %s --gpus auto --ratio %g --stop-method %s --jobs %s' %
                (script, cpus, ratio, stop_method, ' '.join(job_names)))
@@ -249,12 +250,19 @@ def write_queue_batch(path, job_names, cpus='auto', subroutine_name=STOP_SUBROUT
         command += ' --cae "%s"' % cae
     lines = ['@echo off', 'setlocal', 'cd /d "%~dp0"',
              'set "PYTHONUNBUFFERED=1"',
+             'set "STEP5_PROGRESS_LOG=%~dp0STEP5_queue_progress.log"',
+             'set "STEP5_PROGRESS_DONE=%~dp0STEP5_queue_progress.done"',
+             'set "STEP5_TAIL_SCRIPT=%s"' % tail_script,
+             'del /q "%STEP5_PROGRESS_LOG%" "%STEP5_PROGRESS_DONE%" >nul 2>&1',
              'echo STEP5 GMNIA QUEUE - POST-PEAK MONITOR AND AUTOMATIC PLOTS',
              'echo [STARTUP] Starting Abaqus/CAE queue driver; waiting for Python initialization...',
-             'echo [PROGRESS] Job, stage and elapsed time will be printed; solver heartbeat every 15 seconds.',
+             'echo [PROGRESS] Live queue messages are mirrored through STEP5_queue_progress.log; solver heartbeat every 15 seconds.',
+             'start "" /b powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%STEP5_TAIL_SCRIPT%" -LogPath "%STEP5_PROGRESS_LOG%" -DonePath "%STEP5_PROGRESS_DONE%"',
              command, 'set "QUEUE_EXIT=%ERRORLEVEL%"',
+             '> "%STEP5_PROGRESS_DONE%" echo done',
+             'timeout /t 1 /nobreak >nul',
              'echo [QUEUE EXIT] Code: %QUEUE_EXIT%',
-             'if not "%QUEUE_EXIT%"=="0" echo [ATTENTION] Queue failed or a stop criterion was not reached. Check messages and STEP5_queue_status.json.',
+             'if not "%QUEUE_EXIT%"=="0" echo [ATTENTION] Queue failed or a stop criterion was not reached. Check messages, STEP5_queue_progress.log and STEP5_queue_status.json.',
              'endlocal & exit /b %QUEUE_EXIT%', '']
     with open(path, 'w', newline='') as stream:
         stream.write('\r\n'.join(lines))
