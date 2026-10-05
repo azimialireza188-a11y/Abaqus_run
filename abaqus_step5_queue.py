@@ -19,13 +19,17 @@ import time
 from html import escape
 from types import SimpleNamespace
 
+# CAE noGUI does not always add the script directory to its import path.
+# Resolve without __file__, before sibling imports and directory changes.
+SCRIPT_PATH = os.path.abspath(
+    globals().get('__file__', sys._getframe().f_code.co_filename))
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
 import abaqus_step5_force_displacement as fd
 import abaqus_pipeline_contract as contract
 import runtime_resources as resources
-
-# Capture the executing filename before entering the run directory.
-SCRIPT_PATH = os.path.abspath(
-    globals().get('__file__', sys._getframe().f_code.co_filename))
 
 
 def crossing(values, ratio):

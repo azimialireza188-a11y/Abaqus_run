@@ -8,6 +8,15 @@ from types import SimpleNamespace
 
 
 class QueueTests(unittest.TestCase):
+    def test_absolute_nogui_script_imports_siblings_from_another_directory(self):
+        import subprocess
+        import sys
+        q=self.queue()
+        code = "from pathlib import Path; p=%r; ns={'__name__':'nogui_test'}; exec(compile(Path(p).read_text(),p,'exec'),ns); assert ns['SCRIPT_PATH']==p" % os.path.abspath(q.__file__)
+        with tempfile.TemporaryDirectory() as d:
+            result=subprocess.run([sys.executable,'-I','-c',code],cwd=d,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+
     def test_nogui_without_file_resolves_runner_path(self):
         q=self.queue()
         with open(q.__file__, encoding='utf-8') as f:
