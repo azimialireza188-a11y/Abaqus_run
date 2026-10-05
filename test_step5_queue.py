@@ -20,7 +20,7 @@ class QueueTests(unittest.TestCase):
             with mock.patch.object(q, 'launch', return_value=process), \
                     mock.patch.object(q.time, 'sleep'), \
                     mock.patch.object(q.time, 'monotonic', side_effect=[0, 0, 1, 15, 16]), \
-                    mock.patch.object(q.sys, 'stdout', output):
+                    mock.patch.object(q.sys, 'stderr', output):
                 q.run_job('STEP5_D_FY240', args, SimpleNamespace(cpus=12, gpus=0))
             text = output.getvalue()
             self.assertEqual(text.count('[SOLVING]'), 2)
@@ -88,7 +88,7 @@ class QueueTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             result=subprocess.run([sys.executable,'-I','-c',code],cwd=d,capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertIn('STEP5 NOGUI DRIVER STARTED',result.stdout)
+        self.assertIn('STEP5 NOGUI DRIVER STARTED',result.stderr + result.stdout)
         self.assertIn('--run-dir',result.stdout)
 
     def test_main_accepts_cae_launcher_flags_without_separator(self):

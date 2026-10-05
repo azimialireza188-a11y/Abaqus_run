@@ -13,10 +13,9 @@ SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-print('STEP5 NOGUI DRIVER STARTED')
-sys.stdout.flush()
-from abaqus_step5_queue import main
 from abaqus_step5_progress import report
+report('DRIVER', 'STEP5 NOGUI DRIVER STARTED')
+from abaqus_step5_queue import main
 
 try:
     main()
