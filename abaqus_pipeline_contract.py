@@ -19,7 +19,8 @@ REFERENCE_CONTACT = 'GENERAL_STANDARD_HARD_FRICTIONLESS'
 REFERENCE_STRESS_MPA = 1.0
 REFERENCE_INSTANCES = ('P1', 'P2', 'P3', 'P4')
 REFERENCE_BOUNDARY_CONDITIONS = 9
-REFERENCE_LOADS = 8
+REFERENCE_LOADS = 8          # compression: one uniform edge load per piece end
+LOAD_CASES = ('compression', 'bending')
 
 
 def file_sha256(path):
@@ -40,6 +41,45 @@ def _require_number(mapping, name):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
         raise ValueError('Invalid/missing numeric pipeline field: ' + name)
     return float(value)
+
+
+def reference_load_case(build):
+    """Load case recorded by the builder; builds without the record are compression."""
+    load_case = build.get('load_case') if isinstance(build, dict) else None
+    if load_case is None:
+        return dict(type='compression')
+    if not isinstance(load_case, dict) or load_case.get('type') not in LOAD_CASES:
+        raise ValueError('Unknown reference load case: %r' % (load_case,))
+    return load_case
+
+
+def _validate_load_case(build):
+    load_case = reference_load_case(build)
+    if load_case['type'] == 'compression':
+        if int(build.get('loads', -1)) != REFERENCE_LOADS:
+            raise ValueError('Reference load count differs from the production model')
+        return load_case
+    n_loads = int(load_case.get('n_loads', -1))
+    if n_loads <= 0 or int(build.get('loads', -2)) != n_loads:
+        raise ValueError('Bending reference: nodal-force count differs from the recorded load case')
+    for name in ('reference_moment_mesh_Nmm_per_MPa', 'reference_moment_Nmm_per_MPa', 'c_extreme_mm',
+                 'neutral_axis_angle_deg'):
+        value = _require_number(load_case, name)
+        if name != 'neutral_axis_angle_deg' and value <= 0:
+            raise ValueError('Bending reference field must be positive: ' + name)
+    for name in ('compression_normal', 'neutral_axis_direction', 'centroid_mm'):
+        vector = load_case.get(name)
+        if not isinstance(vector, list) or len(vector) != 2:
+            raise ValueError('Bending reference vector missing: ' + name)
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in vector):
+            raise ValueError('Bending reference vector must be finite: ' + name)
+    theta = math.radians(load_case['neutral_axis_angle_deg'])
+    for name, expected in (('neutral_axis_direction', (math.cos(theta), math.sin(theta))),
+                           ('compression_normal', (-math.sin(theta), math.cos(theta)))):
+        if any(not math.isclose(a, b, rel_tol=0., abs_tol=1e-8)
+               for a, b in zip(load_case[name], expected)):
+            raise ValueError('Bending reference vector disagrees with neutral-axis angle: ' + name)
+    return load_case
 
 
 def validate_reference_state(state):
@@ -71,8 +111,7 @@ def validate_reference_state(state):
         raise ValueError('Reference rigid-link count differs from source_inputs')
     if int(build.get('boundary_conditions', -1)) != REFERENCE_BOUNDARY_CONDITIONS:
         raise ValueError('Reference boundary-condition count differs from the production model')
-    if int(build.get('loads', -1)) != REFERENCE_LOADS:
-        raise ValueError('Reference load count differs from the production model')
+    _validate_load_case(build)
     sigma_ref = _require_number(build, 'reference_stress_MPa')
     if not math.isclose(sigma_ref, REFERENCE_STRESS_MPA, rel_tol=0., abs_tol=1e-12):
         raise ValueError('Reference eigenvalue model must use 1 MPa reference stress')
@@ -172,6 +211,7 @@ def reference_snapshot(contract, include_hashes=True):
         expected_links=int(source['expected_links']),
         thickness_mm=float(source['thickness_mm']),
         source_directory=source.get('source_directory'),
+        load_case=load_case_snapshot(build),
     )
     if include_hashes:
         snapshot['pipeline_status_sha256'] = file_sha256(contract['paths']['pipeline_status'])
@@ -180,6 +220,27 @@ def reference_snapshot(contract, include_hashes=True):
         if os.path.isfile(contract['paths']['inp']):
             snapshot['source_inp_sha256'] = file_sha256(contract['paths']['inp'])
     return snapshot
+
+
+LOAD_CASE_SNAPSHOT_KEYS = (
+    'type', 'tag', 'reference_stress_MPa', 'area_mm2', 'neutral_axis_angle_deg', 'neutral_axis_direction',
+    'compression_normal', 'centroid_mm', 'c_extreme_mm', 'I_nn_mm4', 'reference_moment_Nmm_per_MPa',
+    'reference_moment_mesh_Nmm_per_MPa', 'section_modulus_mm3', 'section_modulus_outer_fibre_mm3',
+    'plastic_modulus_mm3', 'n_loads', 'symmetry_class_axis_deg', 'stress_definition', 'eigenvalue_meaning')
+
+
+def load_case_snapshot(build):
+    """Compact load-case record carried by Step 4/5 provenance (compression when absent)."""
+    load_case = reference_load_case(build)
+    return dict((key, load_case[key]) for key in LOAD_CASE_SNAPSHOT_KEYS if key in load_case)
+
+
+def snapshot_load_case(reference):
+    """Load case of a reference snapshot embedded in a Step-4/5 payload (old payloads: compression)."""
+    load_case = (reference or {}).get('load_case') or dict(type='compression')
+    if load_case.get('type') not in LOAD_CASES:
+        raise ValueError('Unknown load case in provenance: %r' % (load_case.get('type'),))
+    return load_case
 
 
 def parse_prefixed_json(description, prefix):

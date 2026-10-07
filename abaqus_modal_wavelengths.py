@@ -235,9 +235,10 @@ def read_displacements(frame, lookup, count, tables=None):
                 if block.instance is None or block.instance.name not in tables:
                     continue
                 table = tables[block.instance.name]
-                system = getattr(block, 'localCoordSystem', None)
-                if system is not None and np.size(system):
-                    raise ValueError('Bulk U is not in global coordinates; inspect individual values')
+                for accessor in ('localCoordSystemDouble', 'localCoordSystem'):
+                    system = getattr(block, accessor, None)
+                    if system is not None and np.size(system):
+                        raise ValueError('Bulk U is not in global coordinates; inspect individual values')
                 labels = np.asarray(block.nodeLabels,dtype=int).ravel()
                 values = None
                 for attr in ('dataDouble','data'):
@@ -253,7 +254,10 @@ def read_displacements(frame, lookup, count, tables=None):
                 keep = (labels >= 0) & (labels < len(table))
                 index = table[labels[keep]]
                 valid = index >= 0
-                data[index[valid]] = values[keep][valid,:3]
+                rows = index[valid]
+                if len(np.unique(rows)) != len(rows) or np.any(np.isfinite(data[rows, 0])):
+                    raise ValueError('Duplicate bulk nodal U values')
+                data[rows] = values[keep][valid,:3]
             if np.all(np.isfinite(data)):
                 return data
         except Exception:
@@ -264,6 +268,8 @@ def read_displacements(frame, lookup, count, tables=None):
             continue
         index = lookup.get((value.instance.name,value.nodeLabel))
         if index is not None:
+            if np.isfinite(data[index, 0]):
+                raise ValueError('Duplicate nodal U value')
             system = getattr(value, 'localCoordSystemDouble' if str(value.precision)=='DOUBLE_PRECISION'
                              else 'localCoordSystem', None)
             if system is not None and np.size(system):

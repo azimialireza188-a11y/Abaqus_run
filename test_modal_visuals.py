@@ -6,6 +6,27 @@ import abaqus_modal_report as report
 
 
 class DirectShapeTests(unittest.TestCase):
+    def test_double_local_bulk_coordinates_do_not_bypass_global_vector_check(self):
+        import abaqus_modal_wavelengths as base
+        value = NS(instance=NS(name='P1'), nodeLabel=1, precision='DOUBLE_PRECISION',
+                   localCoordSystemDouble=np.eye(3), dataDouble=(1., 0., 0.))
+        block = NS(instance=value.instance, nodeLabels=(1,), localCoordSystem=None,
+                   localCoordSystemDouble=np.eye(3), dataDouble=((1., 0., 0.),))
+        frame = NS(fieldOutputs={'U': NS(bulkDataBlocks=[block], values=[value])})
+        with self.assertRaisesRegex(ValueError, 'global nodal'):
+            base.read_displacements(frame, {('P1', 1): 0}, 1, {'P1': np.array([-1, 0])})
+
+    def test_duplicate_displacement_rows_are_rejected_in_both_read_paths(self):
+        import abaqus_modal_wavelengths as base
+        value = NS(instance=NS(name='P1'), nodeLabel=1, precision='SINGLE_PRECISION',
+                   localCoordSystem=None, data=(1., 0., 0.))
+        block = NS(instance=value.instance, nodeLabels=(1, 1), localCoordSystem=None,
+                   data=((1., 0., 0.), (2., 0., 0.)))
+        frame = NS(fieldOutputs={'U': NS(bulkDataBlocks=[block], values=[value, value])})
+        for tables in (None, {'P1': np.array([-1, 0])}):
+            with self.subTest(bulk=bool(tables)), self.assertRaisesRegex(ValueError, 'Duplicate.*nodal'):
+                base.read_displacements(frame, {('P1', 1): 0}, 1, tables)
+
     def test_local_coordinate_displacements_are_rejected_not_misclassified(self):
         import abaqus_modal_wavelengths as base
         value = NS(instance=NS(name='P1'), nodeLabel=1, precision='SINGLE_PRECISION',

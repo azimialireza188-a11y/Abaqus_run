@@ -61,9 +61,13 @@ def job_command(name, cpus, gpus, mode):
 
 
 def outcome(result, reached):
-    code = result.get('solver_exit_code', 0)
-    if code != 0 and not (result.get('termination_requested') and reached):
+    code = result.get('solver_exit_code')
+    if code is not None and code != 0 and not (result.get('termination_requested') and reached):
         return 'SOLVER_ERROR'
+    if result.get('partial'):
+        return 'PARTIAL_RESULT'
+    if code is None and not result.get('analysis_completed'):
+        return 'SOLVER_STATUS_UNKNOWN'
     if not reached:
         return 'CRITERION_NOT_REACHED'
     return 'CONTROLLED_TERMINATION' if result.get('termination_requested') else 'CRITERION_REACHED'
@@ -75,7 +79,8 @@ def launch(cmd, **kwargs):
                             shell=os.name == 'nt', **kwargs)
 
 
-def plot_png(path, curves, yield_lines, title):
+def plot_png(path, curves, yield_lines, title, axes=None):
+    axes = axes or fd.RESPONSE_AXES['compression']
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -96,8 +101,8 @@ def plot_png(path, curves, yield_lines, title):
             if name in session.xyDataObjects:
                 del session.xyDataObjects[name]
             xy = session.XYData(name=name, data=tuple(points),
-                                xValuesLabel='Axial shortening (mm)',
-                                yValuesLabel='Axial compressive load (kN)', legendLabel=label)
+                                xValuesLabel=axes['queue_x_label'],
+                                yValuesLabel=axes['queue_y_short'], legendLabel=label)
             abq_curves.append(session.Curve(xyData=xy)); names.append(name)
         xs = [x for _, points in curves for x, _ in points]
         for i, value in enumerate(yield_lines):
@@ -105,8 +110,8 @@ def plot_png(path, curves, yield_lines, title):
             if name in session.xyDataObjects:
                 del session.xyDataObjects[name]
             xy = session.XYData(name=name, data=((min(xs),value),(max(xs),value)),
-                                legendLabel='AsFy = %.3f kN' % value,
-                                xValuesLabel='Axial shortening (mm)', yValuesLabel='Axial compressive load (kN)')
+                                legendLabel=axes['capacity_label'] % value,
+                                xValuesLabel=axes['queue_x_label'], yValuesLabel=axes['queue_y_short'])
             abq_curves.append(session.Curve(xyData=xy)); names.append(name)
         chart.setValues(curvesToPlot=tuple(abq_curves))
         chart.autoColor(lines=True, symbols=True)
@@ -122,13 +127,14 @@ def plot_png(path, curves, yield_lines, title):
     for label, points in curves:
         ax.plot([p[0] for p in points], [p[1] for p in points], label=label, lw=1.6)
     for y in yield_lines:
-        ax.axhline(y, ls='--', label='AsFy = %.3f kN' % y)
-    ax.set(xlabel='Axial shortening, delta (mm)', ylabel='Axial compressive load, P (kN)', title=title)
+        ax.axhline(y, ls='--', label=axes['capacity_label'] % y)
+    ax.set(xlabel=axes['x_label'], ylabel=axes['queue_y_label'], title=title)
     ax.grid(alpha=.25); ax.legend(loc='best', fontsize=9)
     fig.tight_layout(); fig.savefig(path, dpi=300); plt.close(fig)
 
 
-def plot_svg(path, curves, yield_lines, title):
+def plot_svg(path, curves, yield_lines, title, axes=None):
+    axes = axes or fd.RESPONSE_AXES['compression']
     xs = [x for _, points in curves for x, _ in points]
     ys = [y for _, points in curves for _, y in points]+list(yield_lines)+[0.0]
     xmin, xmax = min(xs), max(xs); ymin, ymax = min(ys), max(ys)
@@ -158,25 +164,60 @@ def plot_svg(path, curves, yield_lines, title):
         lines.append('<text x="%d" y="%d" fill="%s">%s</text>' % (115+(i%3)*420,775+(i//3)*22,color,escape(label)))
     for value in yield_lines:
         lines.append('<path d="M 110 %.2f H 1160" stroke="#1676c3" stroke-dasharray="8 5"/>' % sy(value))
-        lines.append('<text x="1170" y="%.2f">AsFy %.3f kN</text>' % (sy(value),value))
+        lines.append('<text x="1170" y="%.2f">%s</text>' % (sy(value),escape(axes['capacity_label'].replace(' = ', ' ') % value)))
     lines += ['<path d="M 110 90 V 670 H 1160" fill="none" stroke="black"/>',
-              '<text x="630" y="740" text-anchor="middle">Axial shortening, delta (mm)</text>',
-              '<text transform="translate(30,380) rotate(-90)" text-anchor="middle">Axial compressive load, P (kN)</text>',
+              '<text x="630" y="740" text-anchor="middle">%s</text>' % escape(axes['x_label']),
+              '<text transform="translate(30,380) rotate(-90)" text-anchor="middle">%s</text>' % escape(axes['queue_y_label']),
               '</g></svg>']
     with open(path,'w',encoding='utf-8') as f:
         f.write('\n'.join(lines))
 
 
-def write_comparison(directory, curves, yield_lines, summaries):
-    fields = ['model','force_kN','shortening_mm','criterion_reached','outcome','solver_exit_code','error']
+PM_FIELDS = ['model','load_case','bending_axis_deg','P_kN','M_kNm','Py_kN','My_kNm','Mp_kNm',
+             'a_L_mm','a_D_mm','a_G_mm','criterion_reached','outcome']
+
+
+def write_comparison(directory, curves, yield_lines, summaries, axes=None):
+    axes = axes or fd.RESPONSE_AXES['compression']
+    if axes['kind'] == 'bending':
+        fields = ['model','a_L_mm','a_D_mm','a_G_mm','moment_kNm','My_kNm','Mu_over_My','Mp_kNm','Mu_over_Mp',
+                  'rotation_mrad','bending_axis_deg','criterion_reached','outcome','solver_exit_code','error']
+    else:
+        fields = ['model','a_L_mm','a_D_mm','a_G_mm','force_kN','Py_kN','Pu_over_Py','shortening_mm',
+                  'criterion_reached','outcome','solver_exit_code','error']
     with open(os.path.join(directory,'STEP5_peak_summary.csv'),'w',newline='',encoding='utf-8-sig') as f:
         writer=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');writer.writeheader()
         writer.writerows(summaries)
+    # One P-M point per model (P = peak axial load for compression, M = peak moment for
+    # bending): the files of all compression and bending folders combine into P-M diagrams.
+    with open(os.path.join(directory,'STEP5_PM_points.csv'),'w',newline='',encoding='utf-8-sig') as f:
+        writer=csv.DictWriter(f,fieldnames=PM_FIELDS,extrasaction='ignore');writer.writeheader()
+        for row in summaries:
+            if row.get('pm_point'):
+                writer.writerow(dict(row['pm_point'], model=row.get('model'),
+                                     criterion_reached=row.get('criterion_reached'), outcome=row.get('outcome'),
+                                     a_L_mm=row.get('a_L_mm'), a_D_mm=row.get('a_D_mm'), a_G_mm=row.get('a_G_mm')))
     if not curves:
         return
-    stem = os.path.join(directory, 'STEP5_all_force_displacement_combined')
-    plot_svg(stem+'.svg',curves,yield_lines,'STEP5 GMNIA - Combined force-shortening curves')
-    plot_png(stem+'.png',curves,yield_lines,'STEP5 GMNIA - Combined force-shortening curves')
+    stem = os.path.join(directory, axes['combined'])
+    plot_svg(stem+'.svg',curves,yield_lines,axes['combined_title'],axes)
+    plot_png(stem+'.png',curves,yield_lines,axes['combined_title'],axes)
+
+
+def pm_point(info, peak):
+    """Capacity point for P-M: (P, M) at the peak of this model with its section references."""
+    section = info.get('section_for_PM') or {}
+    fy = float((info.get('settings') or {}).get('fy', 0) or 0)
+    area = float(section.get('area_mm2') or info.get('end_area_mm2') or 0)
+    point = dict(load_case=fd.response_kind(info), Py_kN=area*fy/1000 if area and fy else None,
+                 bending_axis_deg=info.get('bending_axis_deg'))
+    if point['load_case'] == 'bending':
+        point.update(P_kN=0.0, M_kNm=peak.get('moment_kNm'),
+                     My_kNm=(section.get('first_yield_moment_Nmm') or 0)/1e6 or None,
+                     Mp_kNm=(section.get('plastic_moment_Nmm') or 0)/1e6 or None)
+    else:
+        point.update(P_kN=peak.get('force_kN'), M_kNm=0.0)
+    return point
 
 
 def metadata(cae, names):
@@ -399,8 +440,13 @@ def run(args):
     for name,info in infos.items():
         if int(info.get('settings',{}).get('field_frequency',1)) != 1:
             raise ValueError('Automatic plots require field_frequency=1: '+name)
-        if info.get('stage') != 5 or float(info.get('reference_force_N_per_end',0))<=0:
+        reference_key = 'reference_moment_Nmm' if fd.response_kind(info) == 'bending' else 'reference_force_N_per_end'
+        if info.get('stage') != 5 or float(info.get(reference_key) or 0)<=0:
             raise ValueError('Invalid STEP5 metadata: '+name)
+    kinds = set(fd.response_kind(info) for info in infos.values())
+    if len(kinds) != 1:
+        raise ValueError('One queue folder must hold one load case; found '+', '.join(sorted(kinds)))
+    axes = fd.RESPONSE_AXES[kinds.pop()]
     report('RESOURCES', 'Detecting available CPUs and GPUs')
     policy=resources.resolve_solver_policy(resources.detect_resources(),args.cpus,args.gpus)
     report('RESOURCES', 'cpus=%d gpus=%d memory=100%%; reserves=0' % (policy.cpus,policy.gpus))
@@ -423,12 +469,32 @@ def run(args):
         for name in names:
             if os.path.exists(os.path.join(args.run_dir,name+'.odb')):
                 raise ValueError('Existing ODB: '+name+'; use --extract-only or a new run folder')
+    prior_results = {}
+    status_path = os.path.join(args.run_dir, 'STEP5_queue_status.json')
+    if args.extract_only and os.path.isfile(status_path):
+        with open(status_path, encoding='utf-8') as stream:
+            prior_results = {row['model']: row for row in json.load(stream)}
     previous=os.getcwd();os.chdir(args.run_dir)
     curves, summaries, yield_lines=[],[],[]
     try:
         for index,name in enumerate(names,1):
             report('JOB %d/%d' % (index,len(names)), name)
             result=dict(model=name,criterion_reached=False)
+            if args.extract_only:
+                # Replotting cannot turn a previous solver failure into success.
+                prior = prior_results.get(name, {})
+                for key in ('solver_exit_code', 'termination_requested', 'termination_command_exit_code',
+                            'observed_crossing', 'monitor_source', 'stop_method'):
+                    if key in prior:
+                        result[key] = prior[key]
+                sta_path = os.path.join(args.run_dir, name+'.sta')
+                if os.path.isfile(sta_path):
+                    with open(sta_path, errors='replace') as stream:
+                        result['analysis_completed'] = 'THE ANALYSIS HAS COMPLETED SUCCESSFULLY' in stream.read().upper()
+            # Step-4 imperfection amplitudes of this model (u0 = aL*phiL + aD*phiD + aG*phiG).
+            case=((infos.get(name) or {}).get('source_step4') or {}).get('case') or {}
+            result.update(a_L_mm=case.get('local_component_mm'),a_D_mm=case.get('distortional_component_mm'),
+                          a_G_mm=case.get('global_component_mm'))
             try:
                 if not args.extract_only:
                     result.update(run_job(name,args,policy))
@@ -443,26 +509,43 @@ def run(args):
                     time.sleep(1)
                 if os.path.exists(os.path.splitext(path)[0]+'.lck'):
                     raise ValueError('ODB remains locked: '+path)
-                report('EXTRACT', name+' | reading force-displacement results and writing CSV/SVG')
+                report('EXTRACT', name+' | reading %s results and writing CSV/SVG' % axes['response'])
                 summary=fd.extract(SimpleNamespace(cae=cae,odb=path,model=name,step='GMNIA',
                                     output_dir=args.run_dir,allow_partial=True,skip_png=True))
                 with open(summary['csv'],encoding='utf-8-sig') as f:
                     rows=list(csv.DictReader(f))
-                points=[(float(r['shortening_mm']),float(r['force_kN'])) for r in rows]
+                points=[(float(r[axes['x']]),float(r[axes['y']])) for r in rows]
                 hit=crossing([float(r['lpf']) for r in rows],args.ratio)
                 result['criterion_reached']=bool(hit)
                 result['first_crossing']=hit
+                result['partial']=bool(summary.get('partial'))
                 result.update(summary['peak'])
                 result['outcome']=outcome(result,bool(hit))
-                label=name.replace('STEP5_','')+(' (solver error)' if result['outcome']=='SOLVER_ERROR' else '' if hit else ' (70% not reached)')
+                valid = result['outcome'] in ('CRITERION_REACHED', 'CONTROLLED_TERMINATION')
+                label=name.replace('STEP5_','')+('' if valid else ' ('+result['outcome'].lower().replace('_', ' ')+')')
                 curves.append((label,points))
                 info=infos[name]
-                y=float(info['end_area_mm2'])*float(info['settings']['fy'])/1000
+                result['pm_point']=pm_point(info, summary['peak'])
+                if axes['kind'] == 'bending':
+                    y=float(info['first_yield_moment_Nmm'])/1e6
+                    result['My_kNm']=y
+                    result['bending_axis_deg']=info.get('bending_axis_deg')
+                    mp=result['pm_point'].get('Mp_kNm')
+                    result['Mp_kNm']=mp
+                    if result.get('moment_kNm') is not None:
+                        result['Mu_over_My']=float(result['moment_kNm'])/y
+                        if mp:
+                            result['Mu_over_Mp']=float(result['moment_kNm'])/mp
+                else:
+                    y=float(info['end_area_mm2'])*float(info['settings']['fy'])/1000
+                    result['Py_kN']=y
+                    if result.get('force_kN') is not None:
+                        result['Pu_over_Py']=float(result['force_kN'])/y
                 if not any(math.isclose(y,old,rel_tol=1e-10) for old in yield_lines):
                     yield_lines.append(y)
                 stem=os.path.splitext(summary['csv'])[0]
-                report('PLOT', name+' | writing force-displacement PNG')
-                plot_png(stem+'.png',[(label,points)],[y],name+' - Riks force-shortening')
+                report('PLOT', name+' | writing %s PNG' % axes['response'])
+                plot_png(stem+'.png',[(label,points)],[y],name+' - '+axes['title'],axes)
                 summary.update(queue_status=result,png=stem+'.png')
                 with open(os.path.splitext(summary['csv'])[0]+'.json','w',encoding='utf-8') as f:
                     json.dump(summary,f,indent=2,allow_nan=False)
@@ -474,7 +557,7 @@ def run(args):
                 json.dump(summaries,f,indent=2,allow_nan=False)
             try:
                 report('COMPARISON', 'Updating combined plots and peak summary (%d/%d jobs processed)' % (index,len(names)))
-                write_comparison(args.run_dir,curves,yield_lines,summaries)
+                write_comparison(args.run_dir,curves,yield_lines,summaries,axes)
             except Exception as error:
                 report('COMPARISON FAILED', str(error))
                 summaries[-1]['comparison_error']=str(error)
@@ -483,7 +566,8 @@ def run(args):
             report('JOB %d/%d FINISHED' % (index,len(names)), name+' | '+
                    ('FAILED' if result.get('error') else result.get('outcome','UNKNOWN')))
         report('QUEUE FINISHED', 'Check STEP5_queue_status.json and STEP5_peak_summary.csv.')
-        if any(r.get('error') or r.get('comparison_error') or r.get('outcome')=='SOLVER_ERROR' or not r.get('criterion_reached') for r in summaries):
+        if any(r.get('error') or r.get('comparison_error') or r.get('outcome') not in
+               ('CRITERION_REACHED', 'CONTROLLED_TERMINATION') for r in summaries):
             raise RuntimeError('Some runs/plots failed or did not reach the post-peak criterion; see queue status')
     finally:
         os.chdir(previous)

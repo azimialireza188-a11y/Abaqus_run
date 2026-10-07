@@ -158,6 +158,48 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(q.outcome({'solver_exit_code': 0}, False), 'CRITERION_NOT_REACHED')
         self.assertEqual(q.outcome({'solver_exit_code': 0}, True), 'CRITERION_REACHED')
 
+    def test_missing_solver_status_and_partial_data_do_not_validate_capacity(self):
+        q = self.queue()
+        self.assertEqual(q.outcome({}, True), 'SOLVER_STATUS_UNKNOWN')
+        self.assertEqual(q.outcome({'analysis_completed': True}, True), 'CRITERION_REACHED')
+        self.assertEqual(q.outcome({'solver_exit_code': 0, 'partial': True}, True), 'PARTIAL_RESULT')
+
+    def test_extract_only_preserves_a_previous_solver_failure(self):
+        import csv, json
+        q = self.queue()
+        with tempfile.TemporaryDirectory() as directory:
+            name = 'STEP5_D_FY240'
+            for suffix in ('.inp', '.odb'):
+                with open(os.path.join(directory, name+suffix), 'w') as stream:
+                    stream.write('test boundary')
+            status = os.path.join(directory, 'STEP5_queue_status.json')
+            with open(status, 'w') as stream:
+                json.dump([dict(model=name, solver_exit_code=1, termination_requested=False,
+                                outcome='SOLVER_ERROR')], stream)
+            csv_path = os.path.join(directory, name+'_force_displacement.csv')
+            with open(csv_path, 'w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(['shortening_mm', 'force_kN', 'lpf'])
+                writer.writerows([(0, 0, 0), (1, 240, 1), (2, 120, .5)])
+            summary = dict(csv=csv_path, peak=dict(force_kN=240., shortening_mm=1., lpf=1.), partial=False)
+            info = dict(stage=5, settings=dict(field_frequency=1, fy=240),
+                        reference_force_N_per_end=240000., end_area_mm2=1000.)
+            args = SimpleNamespace(run_dir=directory, jobs=[name], cae='test.cae', cpus=1, gpus=0,
+                                   extract_only=True, repair_only=False, ratio=.7, stop_method='monitor')
+            with mock.patch.object(q, 'metadata', return_value={name: info}), \
+                    mock.patch.object(q.resources, 'detect_resources'), \
+                    mock.patch.object(q.resources, 'resolve_solver_policy', return_value=SimpleNamespace(cpus=1, gpus=0)), \
+                    mock.patch.object(q.fd, 'extract', return_value=summary), \
+                    mock.patch.object(q, 'plot_png'), mock.patch.object(q, 'write_comparison'), \
+                    mock.patch.object(q, 'report'):
+                with self.assertRaises(RuntimeError):
+                    q.run(args)
+            with open(status) as stream:
+                result = json.load(stream)[0]
+            self.assertEqual(result['solver_exit_code'], 1)
+            self.assertEqual(result['outcome'], 'SOLVER_ERROR')
+            self.assertTrue(result['criterion_reached'])
+
     def test_queue_batch_invokes_runner_instead_of_fortran(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, 'q.bat')
@@ -269,3 +311,30 @@ class QueueTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(d,name+'.inp')))
             self.assertFalse(os.path.exists(os.path.join(d,name+'.log')))
             self.assertTrue(all(os.path.isfile(p) for p in paths))
+
+    def test_bending_comparison_and_pm_points(self):
+        import csv
+        q=self.queue()
+        info={'settings':{'fy':240},'load_case':{'type':'bending'},'bending_axis_deg':45.,
+              'section_for_PM':{'area_mm2':1000.,'first_yield_moment_Nmm':5e7,'plastic_moment_Nmm':7e7}}
+        point=q.pm_point(info,{'moment_kNm':55.})
+        self.assertEqual((point['load_case'],point['P_kN'],point['M_kNm']),('bending',0.0,55.))
+        self.assertAlmostEqual(point['My_kNm'],50.); self.assertAlmostEqual(point['Mp_kNm'],70.)
+        self.assertAlmostEqual(point['Py_kN'],240.)
+        cpoint=q.pm_point({'settings':{'fy':240},'end_area_mm2':1000.},{'force_kN':200.})
+        self.assertEqual((cpoint['load_case'],cpoint['P_kN'],cpoint['M_kNm']),('compression',200.,0.0))
+        axes=q.fd.RESPONSE_AXES['bending']
+        with tempfile.TemporaryDirectory() as d:
+            rows=[dict(model='STEP5_D_FY240',moment_kNm=55.,My_kNm=50.,Mu_over_My=1.1,pm_point=point,
+                       criterion_reached=True,outcome='CRITERION_REACHED')]
+            q.write_comparison(d,[('D',[(0.,0.),(1.,55.)])],[50.],rows,axes)
+            with open(os.path.join(d,'STEP5_peak_summary.csv'),encoding='utf-8-sig') as f:
+                self.assertIn('Mu_over_My',f.readline())
+            with open(os.path.join(d,'STEP5_PM_points.csv'),encoding='utf-8-sig') as f:
+                pm=list(csv.DictReader(f))
+            self.assertEqual(pm[0]['load_case'],'bending'); self.assertEqual(float(pm[0]['M_kNm']),55.)
+            with open(os.path.join(d,'STEP5_all_moment_rotation_combined.svg')) as f:
+                text=f.read()
+            self.assertIn('My 50.000 kN m',text)
+            self.assertIn('End rotation, theta (mrad)',text)
+            self.assertTrue(os.path.getsize(os.path.join(d,'STEP5_all_moment_rotation_combined.png')) > 1000)

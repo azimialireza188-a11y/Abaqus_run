@@ -36,3 +36,4 @@ Desktop.ini
 runs/
 portable_modal_export*/
 *.parquet
+STEP5_queue_progress.done

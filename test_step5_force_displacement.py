@@ -4,6 +4,21 @@ import abaqus_step5_force_displacement_core as fd
 
 
 class ForceDisplacementTests(unittest.TestCase):
+    def test_end_response_rejects_local_nonfinite_and_duplicate_displacements(self):
+        from types import SimpleNamespace as NS
+        for method in (fd.weighted_u3, fd.coefficient_u3):
+            for case in ('local', 'nonfinite', 'duplicate'):
+                with self.subTest(method=method.__name__, case=case):
+                    value = NS(instance=NS(name='P1'), nodeLabel=1,
+                               precision='DOUBLE_PRECISION', dataDouble=(0., 0., 1.))
+                    if case == 'local':
+                        value.localCoordSystemDouble = ((0., 0., 1.), (0., 1., 0.), (1., 0., 0.))
+                    elif case == 'nonfinite':
+                        value.dataDouble = (0., 0., float('nan'))
+                    field = NS(getSubset=lambda **kw: NS(values=[value]* (2 if case == 'duplicate' else 1)))
+                    with self.assertRaises(ValueError):
+                        method(field, object(), {('P1', 1): 1.})
+
     def test_live_snapshot_writes_four_outputs_without_changing_sources(self):
         import contextlib, io, json, os, tempfile
         from types import SimpleNamespace as NS
@@ -140,6 +155,18 @@ class ForceDisplacementTests(unittest.TestCase):
         self.assertEqual(values, [0.0, 0.75, 1.10])
         self.assertEqual(meta['mode'], 'synthesized_initial_zero_then_sequence')
 
+    def test_equal_counts_cannot_assign_nonzero_load_to_initial_frame(self):
+        from types import SimpleNamespace as NS
+        with self.assertRaisesRegex(ValueError, 'initial'):
+            fd.align_lpf_history([NS(frameValue=0.), NS(frameValue=.1)],
+                                 [(.05, .75), (.15, 1.10)])
+
+    def test_missing_final_history_sample_is_not_a_missing_initial_sample(self):
+        from types import SimpleNamespace as NS
+        with self.assertRaisesRegex(ValueError, 'initial'):
+            fd.align_lpf_history([NS(frameValue=0.), NS(frameValue=.1), NS(frameValue=.2)],
+                                 [(0., 0.), (.05, .75)])
+
     def test_lpf_history_alignment_rejects_ambiguous_count(self):
         from types import SimpleNamespace as NS
         frames = [NS(frameValue=0.0), NS(frameValue=0.10), NS(frameValue=0.20)]
@@ -212,6 +239,56 @@ class ForceDisplacementTests(unittest.TestCase):
         self.assertTrue(ticks)
         self.assertTrue(all(math.isfinite(x) for x in ticks))
         self.assertEqual(ticks, sorted(ticks))
+
+    def test_bending_moment_rotation_extraction(self):
+        """Bending metadata -> M = LPF*M_ref and the work-conjugate end rotation sum k_i*U3_i."""
+        import contextlib, io, json, os, tempfile
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            model='STEP5_PERFECT_FY240'
+            cae=os.path.join(d,'step5.cae'); odb_path=os.path.join(d,model+'.odb')
+            for path in (cae,odb_path):
+                with open(path,'w') as stream: stream.write('source unchanged')
+            # two loaded nodes per end at eta = +-100 mm, F = +-1 (unit), M_ref = 200 N mm per MPa
+            weights=[[['P1',1,1/200.],['P1',2,-1/200.]],[['P1',3,-1/200.],['P1',4,1/200.]]]
+            info={'settings':{'fy':240,'reference_stress':240,'field_frequency':1},
+                  'load_case':{'type':'bending','neutral_axis_angle_deg':0.},
+                  'reference_moment_Nmm':48000.,'first_yield_moment_Nmm':48000.,
+                  'end_rotation_weights':weights,'bending_axis_deg':0.,
+                  'section_for_PM':{'area_mm2':10.,'first_yield_moment_Nmm':48000.,'plastic_moment_Nmm':60000.},
+                  'end_area_mm2':10.,'end_area_weights':[[['P1',1,5]],[['P1',3,5]]]}
+            bottom=object(); top=object(); instance=NS(name='P1')
+            eta={1:100.,2:-100.,3:100.,4:-100.}
+            def field(i):
+                beta=1e-3*i
+                def subset(region):
+                    labels=(1,2) if region is bottom else (3,4)
+                    u3=lambda l: 0.5*i+(beta if l in (1,2) else -beta)*eta[l]
+                    return NS(values=[NS(instance=instance,nodeLabel=l,precision='SINGLE_PRECISION',
+                                         data=(0,0,u3(l))) for l in labels])
+                return NS(getSubset=subset)
+            frames=[NS(frameValue=i,fieldOutputs={'U':field(i)}) for i in range(3)]
+            step=NS(frames=frames,historyRegions={'Assembly':NS(historyOutputs={
+                'LPF':NS(data=[(0,0),(1,1),(2,.6)])})})
+            odb=NS(steps={'GMNIA':step},rootAssembly=NS(nodeSets={
+                'STEP5_BOTTOM':bottom,'STEP5_TOP':top}),close=mock.Mock())
+            db=NS(models={model:NS(description=fd.STEP5_PREFIX+json.dumps(info))},close=mock.Mock())
+            args=NS(cae=cae,odb=odb_path,model=None,step='GMNIA',output_dir=d,allow_partial=False,skip_png=True)
+            modules={'caeModules':NS(),'abaqus':NS(openMdb=lambda **kw:db),
+                     'odbAccess':NS(openOdb=mock.Mock(return_value=odb))}
+            with mock.patch.dict('sys.modules',modules), contextlib.redirect_stdout(io.StringIO()):
+                summary=fd.extract(args)
+            self.assertAlmostEqual(summary['peak']['moment_kNm'],0.048)
+            self.assertAlmostEqual(summary['peak']['rotation_mrad'],2.0)   # beta_b - beta_t = 2*beta
+            self.assertEqual(summary['bending_axis_deg'],0.)
+            for extension in ('csv','json','svg'):
+                self.assertGreater(os.path.getsize(os.path.join(d,model+'_moment_rotation.'+extension)),100)
+            with open(os.path.join(d,model+'_moment_rotation.svg')) as stream:
+                self.assertIn('Bending moment, M (kN m)',stream.read())
+        self.assertEqual(fd.response_kind({}), 'compression')
+        with self.assertRaises(ValueError):
+            fd.coefficient_map([['P1',1,0.0]])
 
 
 if __name__ == '__main__':

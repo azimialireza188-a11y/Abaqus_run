@@ -201,6 +201,10 @@ def flag_clusters(rows, relative_gap=2e-4):
         disagree = len({r['family'] for r in cluster}) > 1
         for row in cluster:
             row['flags'].append('near_repeated_eigenvalue')
+            # Individually matching labels do not bound all linear combinations
+            # of a near-repeated eigenspace. This fast path computes no bounds.
+            row['flags'].append('cluster_subspace_not_evaluated')
+            row['status'] = 'UNRESOLVED'
             row['cluster_modes'] = [r['mode'] for r in cluster]
             if disagree:
                 row['flags'].append('cluster_family_disagreement'); row['status']='UNRESOLVED'

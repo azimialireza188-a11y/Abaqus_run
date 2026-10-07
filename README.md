@@ -1,5 +1,86 @@
 # Abaqus_run
 
+## Technical audit — 7 October 2026
+
+The existing implementation was corrected in place, preserving prior local edits.
+No production analysis was submitted. The model builder remains intentionally
+limited to the four-piece C4 section, uniform S4R shells and the documented
+end restraints; it is not a general arbitrary-section generator.
+
+Corrections made during this audit:
+
+- Validate stable isotropic material constants, finite member metadata, C4
+  geometry, seam attachment locations, duplicate connections and connectivity
+  before entering CAE. Section-property integration is now insensitive to large
+  coordinate offsets. Symmetry checks compare complete walls rather than just
+  endpoints; bending-angle run names preserve the normalized angle precision.
+- Protect both modal exporters against unsupported double-precision bulk access;
+  fall back to precision-aware nodal values. Reject duplicate modes/nodal records,
+  missing translations and local-coordinate data that would otherwise be read
+  as global vectors. GDLC rejects stale source hashes for NPZ and Parquet.
+- Make geometric report ratios independent of eigenvector amplitude. The fast
+  suggestion path treats near-repeated eigenvalues as unresolved when it has
+  not evaluated the eigenspace, even if individual labels agree.
+- Repair GDLC's direct-sum basis for strips and pieces with a single fold: rigid
+  directions that do not move folds must not also appear in Other. Cluster
+  whitening now removes arbitrary mode scale before its rank decision and
+  clusters do not depend on archive ordering. Invalid ring edges, incomplete
+  archives, mixed shell thickness and composite layups fail explicitly.
+- Write GDLC reference coupling DOFs separately so an axial Y DOF is not
+  accidentally constrained by the range `1, 3`. Repeated node sets are additive
+  and symmetry boundary DOFs are interpreted correctly. Local-reference checks
+  require predominantly L content, not merely an absence of G/D/C. Failed
+  reference checks no longer populate legacy "pure" eigenvalue columns.
+- Use constant resultant compression loading in GMNIA, consistent with the
+  reported `P = LPF * P_ref`. Reject shifted/incomplete LPF histories that would
+  assign nonzero load to the initial frame. Preserve prior solver failure evidence
+  during extract-only processing, and require actual job completion rather than
+  a compilation-completion message. End-response extraction rejects local,
+  duplicate or nonfinite displacements. Bending provenance vectors must agree
+  with their recorded angle.
+
+Scientific interpretation and remaining validation:
+
+- The geometric report and GDLC are kinematic classifiers. Their percentages do
+  not partition strain energy or critical load. GDLC uses a discrete transverse
+  bending proxy, rigid-fold assumptions, and a project-specific relative-piece
+  family C. Its algebraic self-tests and constrained-reference checks are useful
+  consistency tests, not independent cFSM/GBT validation. See
+  [GDLC methodological scope](gdlc_classifier/README_GDLC.md).
+- The 25%-of-peak fold-extent rule is a mesh-dependent heuristic. Rotation-side
+  sensitivity does not quantify uncertainty in that extent. Inspect detected
+  corners and establish mesh/fold-threshold sensitivity for each new section
+  family. A G component at a short local wavelength is not automatically a
+  member-level global instability. A separated transverse component is not by
+  itself a new admissible FE eigenmode or an independently solved buckling load.
+- Rigid BEAM MPC/connector bolts omit bolt compliance, slip, bearing and hole
+  effects. End U1/U2/UR3 restraints enforce the chosen diaphragm/twist condition.
+  These are model assumptions to compare against the physical specimen, not
+  software errors that can be fixed without connection/support evidence.
+- Linear buckling freezes contact in the base state. Open gaps do not become
+  load-bearing merely because a plotted eigenmode closes them. Eigenvectors have
+  arbitrary amplitude; use GMNIA and imperfection sensitivity for collapse claims.
+  These interpretations follow the
+  [Abaqus eigenvalue buckling documentation](https://docs.software.vt.edu/abaqusv2025/English/SIMACAEANLRefMap/simaanl-c-eigenbuckling.htm).
+- Independent modal validation should compare equivalent section geometry,
+  restraints, loading and longitudinal wavelengths with a reference such as
+  [CUFSM](https://www.ce.jhu.edu/cufsm/about/). Self-recovery of a constructed
+  basis alone cannot establish agreement with that reference.
+
+Before production: use the existing `--check-inputs` and `--build-only` paths;
+inspect the generated mesh, loads, end restraints and bolt/contact definitions;
+perform an Abaqus datacheck; and regenerate classifications without
+`--skip-existing`. Establish mesh convergence and independent modal benchmarks
+before using family-specific critical values in DSM or research conclusions.
+
+Verification uses the repository's lightweight Python tests, numerical GDLC
+benchmarks and syntax compilation with installed Abaqus 2024 Python. These do
+not establish CAE API execution, solver convergence or physical calibration.
+Final results: 254 Python tests passed; 64 focused tests plus two additional
+data-validation regressions passed under Abaqus Python; all seven GDLC benchmarks
+passed under Abaqus Python; all 38 Python files compiled syntactically; and
+`git diff --check` passed. No CAE build, datacheck or solver analysis was launched.
+
 Step 4 now supports fast geometric G/L/D suggestions directly from the
 reference ODB through the existing `--suggest` command. See
 [fast screening and execution](README_fast_modal_suggest.md). The exact
@@ -29,6 +110,57 @@ abaqus cae noGUI=abaqus_complete_model_m20.py -- ^
   --portable-export-workers auto ^
   --modal-audit
 ```
+
+## Bending load case (P-M workflow)
+
+All five stages also run for bending; compression stays the default and is
+unchanged. Only Step 3 needs new options; every later stage reads the load case
+from `pipeline_status.json` / the Step-4 provenance.
+
+**Reference stress (CUFSM-consistent).** Compression: uniform 1 MPa, so the
+eigenvalue is the critical stress (P_cr = lambda*A). Bending: linear stress
+`sigma = 1 MPa * eta/c` on both end sections, `eta` = distance from the neutral
+axis through the centroid, compression positive on the `+n = (-sin t, cos t)`
+side, `t = --bending-axis-deg` measured from global X, `c` = largest `|eta|` of
+the CUFSM centre-line nodes. The extreme-fibre stress is exactly 1 MPa, so the
+eigenvalue is the critical extreme-fibre stress in MPa, directly comparable with
+a CUFSM signature curve for a unit extreme-fibre reference stress, and
+`M_cr = lambda * M_ref`, `M_cr/M_y = lambda/f_y` (DSM flexure). The stress is
+applied as the consistent nodal forces of the linear edge traction (exact for
+the linear S4R edges); `M_ref` actually applied by the mesh is stored as
+`load_case.reference_moment_mesh_Nmm_per_MPa` in the build json. Boundary
+conditions are those of compression (end sections fixed in their plane and
+against twist, warping free). Lanczos with eigenvalues >= 0 is used: the reversed
+moment is another load case (for this section it is identical by symmetry).
+
+**Axes needed for P-M.** `--check-inputs --load-case bending` prints the
+section symmetry and `bending_axes_for_PM`. The four-piece square sections are
+D4-symmetric (rotations by 90 deg and four mirror lines), so every bending axis
+is equivalent to one in [0, 45] deg and +M = -M. Required: `0` (neutral axis
+parallel to the faces; seams/lips at the extreme fibre) and `45` (diagonal;
+corners at the extreme fibre). `22.5` is optional (only for a biaxial surface).
+
+```bat
+cd /d "C:\Users\810200014.HAMI.000\Documents\Abaqus_run"
+abaqus cae noGUI=abaqus_complete_model_m20.py -- ^
+  --builtup-dir "C:\Users\810200014.HAMI.000\Documents\CUFSM-Single\cfs_abaqus\A3184_t2_qm1_0_0_0_R2p5_lipR20t_lipLen60_M80_L3600_gap10_nb19_end25-25_row15" ^
+  --output-root "D:\CFS-Column" ^
+  --load-case bending ^
+  --bending-axis-deg 0 ^
+  --mesh-mm 20 --n-modes 250 --n-vectors 500 --max-iterations 1250 --cpus 8 ^
+  --buckle-output detailed --nodal-precision full ^
+  --longitudinal-lines 4 --longitudinal-line-min-spacing-mm 5 ^
+  --modal-audit
+```
+
+The run folder is `<input>_BEND000` (`_BEND045` for 45 deg); `--build-only`,
+`--resume-post` etc. work as for compression. `--n-vectors/--max-iterations`
+are only used with `--eigensolver subspace`.
+GDLC, Step 4 and Step 5 use the same commands as for compression with the
+bending run folder; see `README_step4_imperfections.md` and
+`README_step5_gmnia.md` (sections "Bending") for the global-mode choice and the
+moment-rotation outputs. `STEP5_PM_points.csv` in every Step-5 folder (both load
+cases) holds one (P, M) capacity point per model for the later P-M diagram.
 
 ## Longitudinal section lines
 

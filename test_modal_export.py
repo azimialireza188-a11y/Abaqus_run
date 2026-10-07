@@ -70,6 +70,42 @@ class FakeOdb:
 
 
 class ModalExportTests(unittest.TestCase):
+    def test_documented_double_bulk_access_falls_back_without_losing_precision(self):
+        odb = FakeOdb(True, double=True)
+        class DoubleBlock:
+            instance = odb.rootAssembly.instances['P1']
+            nodeLabels = (1, 2, 3, 4)
+            localCoordSystem = None
+            @property
+            def data(self):
+                raise RuntimeError('Underlying data are double precision')
+        for frame in odb.steps['Buckle'].frames[1:]:
+            for field in frame.fieldOutputs.values():
+                field.bulkDataBlocks = [DoubleBlock()]
+            frame.fieldOutputs['U'].values[0].dataDouble = (1.000000000123, 2., 3.)
+        with tempfile.TemporaryDirectory() as root:
+            result = exporter.export_odb_object(odb, os.path.join(root, 'portable'), {},
+                                                output_format='npz')
+            with np.load(os.path.join(root, 'portable', 'modes_0001.npz')) as data:
+                self.assertEqual(data['vectors'][0, 0], 1.000000000123)
+            self.assertEqual(result['parquet_float'], 'float64')
+
+    def test_duplicate_mode_ids_are_rejected_before_serialization(self):
+        odb = FakeOdb(False)
+        odb.steps['Buckle'].frames[2].mode = 1
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(ValueError, 'Duplicate.*mode'):
+                exporter.export_odb_object(odb, os.path.join(root, 'portable'), {},
+                                           output_format='npz')
+
+    def test_duplicate_nodal_values_cannot_silently_overwrite(self):
+        odb = FakeOdb(False)
+        frame = odb.steps['Buckle'].frames[1]
+        frame.fieldOutputs['U'].values.append(frame.fieldOutputs['U'].values[0])
+        mesh = exporter._mesh(odb)
+        with self.assertRaisesRegex(ValueError, 'Duplicate.*nodal'):
+            exporter._field_array(frame, 'U', mesh['index'], 4)
+
     def exercise(self, with_ur, double=False):
         with tempfile.TemporaryDirectory() as root:
             output = os.path.join(root, 'portable')
@@ -86,6 +122,8 @@ class ModalExportTests(unittest.TestCase):
             first = np.load(os.path.join(output, 'modes_0001.npz'), allow_pickle=False)
             self.assertEqual(first['vectors'].shape, (4 * (6 if with_ur else 3), 1))
             self.assertEqual(first['modes'].tolist(), [1])
+            first.close()
+            dof_map.close()
             return report
 
     def test_external_python_environment_drops_abaqus_python_paths(self):

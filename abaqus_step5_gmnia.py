@@ -6,8 +6,14 @@ Abaqus 2024:
     --output-dir "new_step5_folder" --fy 350
 
 fy is REQUIRED (MPa). Elastic properties, thickness, mesh, imperfections, initial
-BCs and general contact are inherited. Plasticity is elastic-perfectly-plastic,
-with no damage, rate dependence, residual stress or bolt failure added.
+BCs and general contact are inherited. Plasticity is elastic-perfectly-plastic at
+fy by default; --stress-strain CSV (engineering strain, engineering stress MPa;
+first row = yield point at fy) gives an isotropic-hardening curve, converted to
+true stress vs logarithmic plastic strain as Abaqus requires with NLGEOM. No
+damage, rate dependence, residual stress or bolt failure is added.
+The Step-4 imperfection u0 = aL*phiL + aD*phiD + aG*phiG is already in the node
+coordinates (stress-free initial geometry, as *IMPERFECTION would give); this
+script only verifies that it is preserved bit-for-bit (mesh digest).
 All STEP4_* imperfect models plus the untouched perfect reference model are selected
 unless --models explicitly lists a subset. Use the token PERFECT in --models to
 select the no-imperfection reference. The compatible source is the Z-axis
@@ -25,6 +31,16 @@ P=LPF*reference_force_N_per_end; never add the two opposing end forces.
 End-area weights in each Model description define work-conjugate shortening:
 delta = weighted_mean(U3 at zmin) - weighted_mean(U3 at zmax).
 The midspan axial anchor reaction is NOT the column load.
+
+BENDING (Step-3 --load-case bending, detected from the Step-4 provenance): the
+Step-3 consistent nodal end forces of the linear stress 1 MPa*eta/c are kept and
+scaled to --reference-stress (default fy), so LPF=1 means the first-yield moment
+M_y at the extreme centre-line fibre and M = LPF*reference_moment_Nmm (no
+preload). The response is the work-conjugate end rotation
+theta = sum_ends sum_i (F_i/M_ref) U3_i  (+ = compression fibre shortens; exact
+for plane end sections; uniform U3 contributes nothing), so M*theta is the work.
+The post-peak criterion is the same LPF ratio (M <= ratio*Mu). Section
+properties (A, M_y, M_p) are stored for later P-M interaction.
 
 Primary post-peak stop: at the first converged increment after the peak for which
 P <= postpeak_stop_ratio*Pu (default 0.70), implemented by URDFIL using the Riks
@@ -95,7 +111,17 @@ def parse_arguments(argv=None):
     p.add_argument('--stop-method', choices=['monitor', 'urdfil'], default='monitor')
     p.add_argument('--postpeak-stop-ratio', type=float, default=.70,
                    help='Stop at first converged post-peak increment with P <= ratio*Pu (default 0.70)')
+    p.add_argument('--stress-strain',
+                   help='Optional CSV: engineering strain, engineering stress (MPa); first row = yield point '
+                        '(stress = --fy, strain <= fy/E). Default: elastic-perfectly-plastic at fy')
     args = p.parse_args(argv)
+    args.stress_strain_rows = None
+    if args.stress_strain:
+        args.stress_strain = os.path.abspath(os.path.expanduser(args.stress_strain))
+        try:
+            args.stress_strain_rows = read_stress_strain(args.stress_strain)
+        except (OSError, ValueError) as error:
+            p.error('--stress-strain: %s' % error)
     import runtime_resources
     try:
         policy = runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
@@ -120,6 +146,63 @@ def parse_arguments(argv=None):
     args.source_cae = os.path.abspath(os.path.expanduser(args.source_cae))
     args.output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     return args
+
+
+def read_stress_strain(path):
+    """Engineering (strain, stress MPa) rows from a CSV; a non-numeric header row is skipped."""
+    import csv
+    rows = []
+    with open(path, newline='', encoding='utf-8-sig') as stream:
+        for record in csv.reader(stream):
+            cells = [c.strip() for c in record if c.strip()]
+            if not cells:
+                continue
+            try:
+                strain, stress = float(cells[0]), float(cells[1])
+            except (ValueError, IndexError):
+                if rows:
+                    raise ValueError('non-numeric row after the data started: %r' % record)
+                continue
+            if not (math.isfinite(strain) and math.isfinite(stress)) or strain < 0 or stress <= 0:
+                raise ValueError('strains must be >= 0 and stresses > 0: %r' % record)
+            if rows and strain <= rows[-1][0]:
+                raise ValueError('engineering strains must increase strictly')
+            rows.append((strain, stress))
+    if len(rows) < 2:
+        raise ValueError('at least two rows (yield point and one hardening point) are required')
+    return rows
+
+
+def plastic_table(rows, young, fy):
+    """Engineering curve -> Abaqus *PLASTIC table (true stress, log plastic strain).
+
+    true stress = s(1+e), true strain = ln(1+e), plastic strain = true strain - true stress/E.
+    The first row is the yield point: its stress must equal fy and its strain must not
+    exceed the elastic strain at yield; its plastic strain is set to exactly zero.
+    Beyond the last row Abaqus keeps the stress constant."""
+    if rows is None:
+        return ((float(fy), 0.),)
+    table = []
+    for i, (strain, stress) in enumerate(rows):
+        true_stress = stress*(1.+strain)
+        plastic = math.log1p(strain)-true_stress/young
+        if i == 0:
+            if not math.isclose(stress, fy, rel_tol=5e-3):
+                raise ValueError('First stress-strain row must be the yield point with stress = --fy '
+                                 '(%g MPa given, fy = %g MPa)' % (stress, fy))
+            if strain > 1.1*fy/young+1e-4:
+                raise ValueError('First stress-strain row must be at the elastic strain at yield '
+                                 '(<= fy/E = %.6g), got %g' % (fy/young, strain))
+            plastic = 0.
+        else:
+            if plastic <= table[-1][1]:
+                raise ValueError('Plastic strain does not increase at row %d (strain %g, stress %g)'
+                                 % (i+1, strain, stress))
+            if true_stress < table[-1][0]:
+                raise ValueError('True stress decreases at row %d; softening needs a damage model, '
+                                 'which this builder does not add' % (i+1))
+        table.append((true_stress, plastic))
+    return tuple(table)
 
 
 PERFECT_TOKEN = 'PERFECT'
@@ -388,6 +471,9 @@ def prepare_model(model, args):
         raise ValueError('Expected a Z-axis column')
     weights, end_labels, end_area = [[], []], [[], []], [0., 0.]
     expected_loads, loads, materials, integration_counts = set(), [], set(), set()
+    load_case = pipeline_contract.snapshot_load_case(reference)
+    bending = load_case['type'] == 'bending'
+    end_meshes = []        # bending: (instance, node xyz, element topology) for the end forces
     for name in names:
         inst = assembly.instances[name]
         assignments = model.parts[inst.partName].sectionAssignments
@@ -401,13 +487,16 @@ def prepare_model(model, args):
         xyz = {n.label: n.coordinates for n in inst.nodes}
         topology = [tuple(n.label for n in e.getNodes()) for e in inst.elements]
         tributary = end_weights(xyz, topology, thickness, zmin, zmax)
+        if bending:
+            end_meshes.append((name, xyz, topology))
         for side, suffix, sign in ((0, '0', 1.), (1, 'L', -1.)):
             end = 'END_%s_%s' % (suffix, name)
-            load_name = 'COMP_'+end
-            expected_loads.add(load_name)
-            old_load = model.loads[load_name]
-            if old_load.region[0] != end+'_S':
-                raise ValueError('Unexpected load surface: '+load_name)
+            if not bending:
+                load_name = 'COMP_'+end
+                expected_loads.add(load_name)
+                old_load = model.loads[load_name]
+                if old_load.region[0] != end+'_S':
+                    raise ValueError('Unexpected load surface: '+load_name)
             geometric_area = thickness*bi.sum(e.getSize(printResults=False) for e in assembly.sets[end].edges)
             meshed_area = bi.sum(tributary[side].values())
             if min(geometric_area, meshed_area) <= 0:
@@ -417,20 +506,33 @@ def prepare_model(model, args):
             end_area[side] += meshed_area
             end_labels[side].append((name, tuple(sorted(tributary[side]))))
             weights[side].extend([name, label, area] for label, area in sorted(tributary[side].items()))
-            loads.append((load_name, end+'_S', thickness*args.reference_stress, sign))
+            if not bending:
+                loads.append((load_name, end+'_S', thickness*args.reference_stress, sign))
+    bending_info = None
+    if bending:
+        loads, expected_loads, bending_info = bending_end_loads(
+            model, end_meshes, thickness, zmin, zmax, load_case, args.reference_stress,
+            int(reference['loads']), args.fy)
     if set(model.loads.keys()) != expected_loads:
         raise ValueError('Unexpected additional/missing loads; refusing to silently remove them')
     if not math.isclose(end_area[0], end_area[1], rel_tol=1e-6):
         raise ValueError('Opposite loaded end areas differ')
     if len(integration_counts) != 1 or min(integration_counts) < 1:
         raise ValueError('Shell sections must have the same number of thickness integration points')
+    if min(integration_counts) < 5:
+        print('  WARNING: %d section points through the thickness; at least 5 are recommended to '
+              'capture through-thickness yielding in a plastic shell analysis' % min(integration_counts))
+    plastic_tables = {}
     for material_name in materials:
         material = model.materials[material_name]
         if not hasattr(material, 'elastic'):
             raise ValueError('Source elastic properties missing: '+material_name)
         if hasattr(material, 'plastic'):
             raise ValueError('Source already has plasticity; use the elastic STEP4 CAE')
-        material.Plastic(table=((args.fy, 0.),))
+        young = float(material.elastic.table[0][0])
+        table = plastic_table(getattr(args, 'stress_strain_rows', None), young, args.fy)
+        material.Plastic(table=table)
+        plastic_tables[material_name] = [list(row) for row in table]
     for repository in (model.loads, model.fieldOutputRequests, model.historyOutputRequests):
         for key in list(repository.keys()):
             del repository[key]
@@ -453,10 +555,17 @@ def prepare_model(model, args):
             minArcInc=args.min_arc, maxArcInc=args.max_arc, totalArcLength=1.,
             nodeOn=ON, region=assembly.sets['STEP5_STOP'], dof=3,
             maximumDisplacement=stop)
-    for name, surface, magnitude, sign in loads:
-        model.ShellEdgeLoad(name=name, createStepName='GMNIA', region=assembly.surfaces[surface],
-            magnitude=magnitude, distributionType=UNIFORM, traction=GENERAL,
-            directionVector=((0., 0., 0.), (0., 0., sign)), follower=OFF, resultant=OFF)
+    if bending:
+        for name, node_set, force in loads:
+            model.ConcentratedForce(name=name, createStepName='GMNIA', region=assembly.sets[node_set],
+                cf3=force, distributionType=UNIFORM, follower=OFF)
+    else:
+        for name, surface, magnitude, sign in loads:
+            # P = LPF*A0*sigma_ref requires integration over the original edge
+            # length, even when a loaded end warps during NLGEOM deformation.
+            model.ShellEdgeLoad(name=name, createStepName='GMNIA', region=assembly.surfaces[surface],
+                magnitude=magnitude, distributionType=UNIFORM, traction=GENERAL,
+                directionVector=((0., 0., 0.), (0., 0., sign)), follower=OFF, resultant=ON)
     assembly.SetFromElementLabels(name='STEP5_SHELLS', elementLabels=tuple(
         (name, tuple(e.label for e in assembly.instances[name].elements)) for name in names))
     model.FieldOutputRequest(name='ShellResponse', createStepName='GMNIA',
@@ -496,7 +605,11 @@ def prepare_model(model, args):
                             if args.stop_method == 'monitor' else 'URDFIL LSTOP=1 triggered by NODE FILE frequency=1'),
             user_subroutine=STOP_SUBROUTINE_NAME),
         stop_node=[bottom_name, bottom_labels[0]], stop_positive_U3_mm=stop,
-        material='Elastic-perfectly-plastic; source E/nu preserved; no damage',
+        material=('Elastic-perfectly-plastic at fy' if getattr(args, 'stress_strain_rows', None) is None else
+                  'Isotropic hardening from engineering curve %s (sha256 %s), converted to true stress / '
+                  'log plastic strain' % (args.stress_strain, pipeline_contract.file_sha256(args.stress_strain)))
+                 + '; source E/nu preserved; no damage',
+        plastic_tables=plastic_tables,
         bolts=bolts,
         connection_transition=dict(
             source='BEAM_MPC from abaqus_complete_model_m20.py',
@@ -511,13 +624,97 @@ def prepare_model(model, args):
             source_loads=int(reference['loads']),
             source_contact=reference['shell_contact']),
         warning='Pilot Riks settings; no solve/convergence or physical mode classification validated. Do not remesh.')
+    info['load_case'] = load_case
+    info['section_for_PM'] = dict(
+        area_mm2=end_area[0], squash_load_N=end_area[0]*args.fy,
+        definition='meshed end area (chords); squash load = A*fy')
+    if bending:
+        info.pop('reference_force_N_per_end')
+        info.pop('force_formula')
+        info.pop('shortening_formula')
+        info.update(bending_info)
+        info['section_for_PM'].update(
+            first_yield_moment_Nmm=bending_info['first_yield_moment_Nmm'],
+            plastic_moment_Nmm=bending_info['plastic_moment_Nmm'])
     model.setValues(description='STEP5_GMNIA '+json.dumps(info, ensure_ascii=True))
     return info
 
 
-def verify_input(path, bolts):
+def bending_end_loads(model, pieces, thickness, zmin, zmax, load_case, reference_stress, expected_count, fy):
+    """Bending: recompute the Step-3 consistent nodal forces of the linear end stress from the
+    (unperturbed) end nodes, check them against the inherited BEND_END_* loads (names, node sets,
+    count, moment), scale them to reference_stress and build the work-conjugate rotation weights."""
+    import abaqus_load_case
+    assembly = model.rootAssembly
+    tol = max(1e-6, (zmax-zmin)*1e-8)
+    loads, expected, weights = [], set(), [[], []]
+    moments, totals, magnitudes = [0., 0.], [0., 0.], [0., 0.]
+    nx, ny = load_case['compression_normal']
+    xc, yc = load_case['centroid_mm']
+    m_unit = float(load_case['reference_moment_mesh_Nmm_per_MPa'])
+    q_all = []
+    for name, xyz, topology in pieces:
+        for side, suffix, z, sign in ((0, '0', zmin, 1.), (1, 'L', zmax, -1.)):
+            end_nodes = set(label for label, p in xyz.items() if abs(p[2]-z) <= tol)
+            edges = set()
+            for labels in topology:
+                for a, b in zip(labels, labels[1:]+labels[:1]):
+                    if a in end_nodes and b in end_nodes:
+                        edges.add((min(a, b), max(a, b)))
+            q = abaqus_load_case.consistent_edge_forces(xyz, sorted(edges), thickness, load_case)
+            q_all.append((name, side, suffix, sign, q, xyz))
+    q_max = max(abs(v) for item in q_all for v in item[4].values())
+    for name, side, suffix, sign, q, xyz in q_all:
+        k = int(name[1:])
+        for label in sorted(q):
+            value = q[label]
+            eta = nx*(xyz[label][0]-xc)+ny*(xyz[label][1]-yc)
+            moments[side] += value*eta
+            totals[side] += value
+            magnitudes[side] += abs(value)
+            if abs(value) <= 1e-12*q_max:
+                continue
+            load_name = 'BEND_END_%s_P%d_N%d' % (suffix, k, label)
+            node_set = 'BENDN_%s_P%d_%d' % (suffix, k, label)
+            if load_name not in model.loads.keys():
+                raise ValueError('Inherited bending load missing (mesh or load case changed): '+load_name)
+            if model.loads[load_name].region[0] != node_set:
+                raise ValueError('Unexpected bending load region: '+load_name)
+            nodes = assembly.sets[node_set].nodes
+            if len(nodes) != 1 or nodes[0].label != label or nodes[0].instanceName != name:
+                raise ValueError('Bending load node set does not hold exactly its node: '+node_set)
+            expected.add(load_name)
+            loads.append((load_name, node_set, sign*value*reference_stress))
+            weights[side].append([name, label, sign*value/m_unit])
+    if len(expected) != expected_count:
+        raise ValueError('Recomputed bending loads (%d) differ from the reference count (%d)'
+                         % (len(expected), expected_count))
+    for side in (0, 1):
+        if not math.isclose(moments[side], m_unit, rel_tol=1e-7):
+            raise ValueError('Recomputed bending end moment %.9g differs from the Step-3 reference %.9g; '
+                             'the end nodes moved or the mesh changed' % (moments[side], m_unit))
+        if abs(totals[side]) > 1e-6*magnitudes[side]:
+            raise ValueError('Bending end forces carry a net axial force')
+    return loads, expected, dict(
+        reference_moment_Nmm=m_unit*reference_stress,
+        reference_moment_Nmm_per_MPa=m_unit,
+        moment_formula='M = LPF*reference_moment_Nmm (no preload); LPF=1 is the extreme-fibre stress reference_stress',
+        rotation_formula=('theta = sum_bottom k_i*U3_i + sum_top k_i*U3_i, k_i = F_i/M_ref (signed): work-conjugate '
+                          'relative end rotation, + = compression fibre shortens'),
+        end_rotation_weights=weights,
+        first_yield_moment_Nmm=fy*m_unit,
+        plastic_moment_Nmm=(fy*float(load_case['plastic_modulus_mm3'])
+                            if load_case.get('plastic_modulus_mm3') else None),
+        section_moment_definitions=('M_y = fy*M_ref(mesh): first yield at the extreme centre-line fibre (CUFSM '
+                                    'convention); M_p = fy*Z, Z = centre-line thin-walled plastic modulus'),
+        bending_axis_deg=load_case.get('neutral_axis_angle_deg'))
+
+
+def verify_input(path, bolts, bending=False):
     with open(path) as stream:
         text = stream.read().upper()
+    if bending and not re.search(r'^\*CLOAD\b', text, re.M):
+        raise RuntimeError('Bending STEP5 input has no *CLOAD end forces')
     for pattern in (r'\*STEP[^\n]*NLGEOM=YES', r'\*STATIC[^\n]*RIKS', r'\*PLASTIC',
                     r'\*ELEMENT[^\n]*TYPE=CONN3D2', r'\*CONNECTOR SECTION', r'\bPEEQ\b', r'\bCTF1\b'):
         if not re.search(pattern, text):
@@ -604,17 +801,22 @@ def build(args):
                 memory=100, memoryUnits=PERCENTAGE, getMemoryFromAnalysis=False,
                 nodalOutputPrecision=FULL if nodal_precision == 'full' else SINGLE,
                 userSubroutine=final_user_subroutine if args.stop_method == 'urdfil' else '',
-                description='Build only; reference-compatible STEP5; '+info['force_formula'])
+                description='Build only; reference-compatible STEP5; '+(info.get('force_formula') or info['moment_formula']))
             report('WRITE INP', name)
             job.writeInput(consistencyChecking=ON)
             report('VERIFY INP', name)
             inject_urdfil_trigger(name+'.inp')
-            verify_input(name+'.inp', len(info['bolts']))
+            verify_input(name+'.inp', len(info['bolts']), bending='reference_moment_Nmm' in info)
             outputs.append(name+'.inp')
             job_names.append(name)
-            print('INP verified: %d bolts; P_ref=%g N per end; postpeak stop=%g%% Pu' %
-                  (len(info['bolts']), info['reference_force_N_per_end'],
-                   100.*args.postpeak_stop_ratio)); sys.stdout.flush()
+            if 'reference_moment_Nmm' in info:
+                print('INP verified: %d bolts; bending axis %g deg; M_ref=%g N mm (LPF=1); postpeak stop=%g%% Mu' %
+                      (len(info['bolts']), info['bending_axis_deg'], info['reference_moment_Nmm'],
+                       100.*args.postpeak_stop_ratio)); sys.stdout.flush()
+            else:
+                print('INP verified: %d bolts; P_ref=%g N per end; postpeak stop=%g%% Pu' %
+                      (len(info['bolts']), info['reference_force_N_per_end'],
+                       100.*args.postpeak_stop_ratio)); sys.stdout.flush()
 
         # Keep only final STEP5 models in the delivered CAE.
         for source_name in list(database.models.keys()):

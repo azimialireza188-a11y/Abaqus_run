@@ -101,6 +101,106 @@ class PipelineContractTests(unittest.TestCase):
         self.assertEqual(snap['nodal_precision'], 'full')
         self.assertEqual(snap['expected_links'], 76)
 
+    def bending_state(self, root):
+        import abaqus_load_case as lc
+        state = valid_state(root)
+        square = {'P1': [[-100., 100., 100., 100.]], 'P2': [[100., 100., 100., -100.]],
+                  'P3': [[100., -100., -100., -100.]], 'P4': [[-100., -100., -100., 100.]]}
+        definition = lc.bending_reference(square, 2.0, 45.)
+        definition.update(n_loads=40, reference_moment_mesh_Nmm_per_MPa=definition['reference_moment_Nmm_per_MPa'])
+        state['build'].update(loads=40, load_case=definition)
+        return state
+
+    def test_compression_is_the_default_and_keeps_eight_loads(self):
+        root, state = self.make_run()
+        self.assertEqual(contract.reference_load_case(state['build']), dict(type='compression'))
+        snap = contract.reference_snapshot(contract.load_reference_run(root), include_hashes=False)
+        self.assertEqual(snap['load_case'], dict(type='compression'))
+        self.assertEqual(contract.snapshot_load_case({}), dict(type='compression'))
+        state['build']['loads'] = 40
+        with self.assertRaisesRegex(ValueError, 'load count'):
+            contract.validate_reference_state(state)
+
+    def test_bending_reference_contract(self):
+        state = self.bending_state(tempfile.mkdtemp())
+        contract.validate_reference_state(state)
+        snap = contract.load_case_snapshot(state['build'])
+        self.assertEqual(snap['type'], 'bending')
+        self.assertEqual(snap['neutral_axis_angle_deg'], 45.)
+        self.assertNotIn('section_symmetry', snap)
+        state['build']['loads'] = 41
+        with self.assertRaisesRegex(ValueError, 'nodal-force count'):
+            contract.validate_reference_state(state)
+        state = self.bending_state(tempfile.mkdtemp())
+        state['build']['load_case']['type'] = 'torsion'
+        with self.assertRaises(ValueError):
+            contract.validate_reference_state(state)
+
+    def test_bending_vectors_must_be_finite_and_match_recorded_angle(self):
+        for key, vector in (("centroid_mm", [float("nan"), 0.]),
+                            ("compression_normal", [1., 1.]),
+                            ("neutral_axis_direction", [0., 1.])):
+            with self.subTest(key=key):
+                state = self.bending_state("unused")
+                state['build']['load_case'][key] = vector
+                with self.assertRaises(ValueError):
+                    contract.validate_reference_state(state)
+
+    def test_bending_convention_and_symmetry_axes(self):
+        import math
+        import abaqus_load_case as lc
+        square = [(-100., -100., 100., -100.), (100., -100., 100., 100.),
+                  (100., 100., -100., 100.), (-100., 100., -100., -100.)]
+        ref0 = lc.bending_reference(square, 2.0, 0.)
+        inertia = 2.0*(2*200**3/12.+2*200*100**2)
+        self.assertAlmostEqual(ref0['I_nn_mm4'], inertia)
+        self.assertAlmostEqual(ref0['c_extreme_mm'], 100.)
+        self.assertAlmostEqual(ref0['reference_moment_Nmm_per_MPa'], inertia/100.)
+        self.assertAlmostEqual(ref0['plastic_modulus_mm3'], 2.0*(2*200*100+2*2*100**2/2.))
+        self.assertAlmostEqual(lc.unit_stress(ref0, 0., 100.), 1.0)      # compression at +Y for theta = 0
+        self.assertAlmostEqual(lc.unit_stress(ref0, 0., -100.), -1.0)
+        ref45 = lc.bending_reference(square, 2.0, 45.)
+        self.assertAlmostEqual(ref45['c_extreme_mm'], 100.*math.sqrt(2.))
+        self.assertAlmostEqual(lc.unit_stress(ref45, -100., 100.), 1.0)  # corner on the +n side
+        symmetry = lc.section_symmetry(square)
+        self.assertEqual(symmetry['rotations_deg'], [0, 90, 180, 270])
+        self.assertEqual(symmetry['mirror_lines_deg'], [0., 45., 90., 135.])
+        axes = lc.required_bending_axes(symmetry)
+        self.assertEqual(axes['required_axes_deg'], [0., 45.])
+        self.assertEqual(axes['fundamental_range_width_deg'], 45.)
+        for theta, canonical in ((90., 0.), (135., 45.), (180., 0.), (200., 20.), (315., 45.)):
+            self.assertAlmostEqual(lc.canonical_axis(theta, symmetry), canonical)
+        # a C4-only pinwheel has no mirror line: the range to sample is 90 degrees
+        pinwheel = [(0., 0., 100., 0.), (100., 0., 100., 30.)]
+        pin = [tuple(v for v in seg) for seg in pinwheel]
+        segs = []
+        for k in range(4):
+            a = math.radians(90*k)
+            rot = lambda x, y: (math.cos(a)*x-math.sin(a)*y, math.sin(a)*x+math.cos(a)*y)
+            segs += [rot(s[0], s[1])+rot(s[2], s[3]) for s in pin]
+        self.assertEqual(lc.section_symmetry(segs)['mirror_lines_deg'], [])
+        self.assertEqual(lc.required_bending_axes(lc.section_symmetry(segs))['fundamental_range_width_deg'], 90.)
+        self.assertEqual([lc.load_case_tag('bending', a) for a in (0, 45, 22.5, -45)],
+                         ['_BEND000', '_BEND045', '_BEND022p5', '_BEND315'])
+        self.assertEqual(lc.load_case_tag('compression'), '')
+
+    def test_consistent_edge_forces_reproduce_the_linear_stress_resultants(self):
+        import abaqus_load_case as lc
+        square = [(-100., -100., 100., -100.), (100., -100., 100., 100.),
+                  (100., 100., -100., 100.), (-100., 100., -100., -100.)]
+        ref = lc.bending_reference(square, 2.0, 30.)
+        # one wall discretized in 7 linear edges: force resultant and moment are exact
+        pts = dict((i, (-100.+200.*i/7, 100.)) for i in range(8))
+        edges = [(i, i+1) for i in range(7)]
+        q = lc.consistent_edge_forces(pts, edges, 2.0, ref)
+        nx, ny = ref['compression_normal']
+        eta = lambda p: nx*p[0]+ny*p[1]
+        exact_force = 2.0*sum((eta(pts[a])+eta(pts[b]))/2*200./7 for a, b in edges)/ref['c_extreme_mm']
+        exact_moment = 2.0*sum((eta(pts[a])**2+eta(pts[a])*eta(pts[b])+eta(pts[b])**2)/3*200./7
+                               for a, b in edges)/ref['c_extreme_mm']
+        self.assertAlmostEqual(sum(q.values()), exact_force)
+        self.assertAlmostEqual(sum(q[i]*eta(pts[i]) for i in q), exact_moment)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -95,6 +95,16 @@ class FastSuggestTests(unittest.TestCase):
         fast.flag_clusters(rows)
         self.assertTrue(all(r['status']=='UNRESOLVED' for r in rows))
 
+    def test_same_family_cluster_requires_subspace_evidence(self):
+        # Vectors L+0.1*G and L-0.1*G are individually >99% L;
+        # their difference is pure G. Agreement of labels is insufficient.
+        rows = [dict(mode=i, eigenvalue=value, family='LOCAL', status='CANDIDATE', flags=[])
+                for i, value in ((1, 100.), (2, 100.001))]
+        fast.flag_clusters(rows)
+        self.assertTrue(all(r['status'] == 'UNRESOLVED' for r in rows))
+        self.assertTrue(all('cluster_subspace_not_evaluated' in r['flags'] for r in rows))
+
+
     def test_longitudinal_weights_sum_to_length(self):
         w = fast.longitudinal_weights([0., 1., 3., 10.])
         self.assertAlmostEqual(w.sum(), 10.)

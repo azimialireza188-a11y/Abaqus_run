@@ -49,7 +49,7 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
 ## محتوای مدل
 
 - Step از نوع `Static, Riks` با `NLGEOM=ON`؛ Buckle قبلی حذف می‌شود.
-- مصالح الاستیک–کاملاً پلاستیک با fy ورودی؛ E و ضریب پواسون قبلی حفظ می‌شوند. شکست یا آسیب مصالح و پیچ‌ها تعریف نشده است.
+- مصالح به‌طور پیش‌فرض الاستیک–کاملاً پلاستیک با fy ورودی؛ با `--stress-strain` منحنی سخت‌شوندگی (پایین را ببینید). E و ضریب پواسون قبلی حفظ می‌شوند. شکست یا آسیب مصالح و پیچ‌ها تعریف نشده است.
 - فشار مرجع پیش‌فرض برابر fy است. `--reference-stress` امکان تغییر آن را می‌دهد.
 - مدل مرجع Step 3 از **BEAM_MPC** استفاده می‌کند. Step 4 این اتصالات را بدون تغییر نگه می‌دارد. در Step 5، فقط برای دسترسی به نیروی/گشتاور اتصال، هر BEAM_MPC به **Assembled BEAM Connector** روی دقیقاً همان دو گره تبدیل می‌شود. تعداد لینک‌ها و endpointها با provenance مدل مرجع کنترل می‌شوند و هیچ compliance عمدی اضافه نمی‌شود. این تبدیل در metadata به‌صورت صریح ثبت می‌شود و نباید به‌عنوان Fastener جدید یا تغییر footprint تلقی شود.
 - محور محلی ۱ هر اتصال از گره A به B، محور ۲ در راستای تصویر محور طول ستون است. `CTF1..3` نیروها و `CTM1..3` گشتاورها در این دستگاه هستند.
@@ -64,8 +64,8 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
 | `--initial-arc` | 0.01 |
 | `--min-arc` | 1e-8 |
 | `--max-arc` | 0.05 |
-| `--max-increments` | 1000 |
-| `--max-end-displacement-mm` | 0.01L؛ برای L=3600 برابر 36 mm |
+| `--max-increments` | 5000 |
+| `--max-end-displacement-mm` | غیرفعال (فقط با مقدار صریح فعال می‌شود) |
 | `--field-frequency` | 1؛ هر Increment |
 | `--cpus` | همهٔ CPUهای در دسترس |
 
@@ -299,3 +299,84 @@ Abaqus on the target Windows machine reports 12 available solver CPUs despite
 (24). No core is reserved. Queue CLI CPU settings override older generated env
 files, so existing CAE/INP/BAT files need not be rebuilt for this change. A launcher
 exit code zero with no ODB now reports the actual solver log as SOLVER_ERROR.
+
+
+## Bending (moment-rotation)
+
+A Step-4 CAE built from a bending run is detected automatically from its provenance; the command is the
+same as for compression. Differences:
+
+- Loading: the Step-3 consistent nodal end forces of the linear stress `1 MPa*eta/c` (`BEND_END_*`, CF3)
+  are recomputed from the end nodes, checked against the inherited loads (names, nodes, count, applied
+  moment, zero net axial force) and scaled to `--reference-stress` (default fy). LPF = 1 is therefore the
+  first-yield moment `M_y` at the extreme centre-line fibre, and `M = LPF*reference_moment_Nmm` (no preload).
+- Response: work-conjugate end rotation `theta = sum_bottom k_i U3_i + sum_top k_i U3_i`,
+  `k_i = F_i/M_ref` (signed, stored as `end_rotation_weights`). It equals the relative rotation of plane end
+  sections exactly, a uniform U3 does not contribute, and `M*theta` is the work of the end forces
+  (positive = compression fibre shortens).
+- Post-peak stop: the same LPF ratio, i.e. the first converged increment after the peak with `M <= 0.70 Mu`.
+- Outputs: `<job>_moment_rotation.csv/.json/.svg/.png`, `STEP5_all_moment_rotation_combined.*`, and
+  `STEP5_peak_summary.csv` with `moment_kNm`, `My_kNm`, `Mu_over_My`, `Mp_kNm`, `Mu_over_Mp`.
+  `M_p = fy*Z` with the centre-line thin-walled plastic modulus.
+- P-M: every Step-5 folder (compression and bending) writes `STEP5_PM_points.csv`
+  (`load_case, bending_axis_deg, P_kN, M_kNm, Py_kN, My_kNm, Mp_kNm`, amplitudes, outcome): one capacity
+  point per model, ready to be combined across the compression and the 0/45 deg bending folders.
+
+```bat
+set "RUN_DIR=D:\CFS-Column\<input>_BEND000"
+cd /d "C:\Users\810200014.HAMI.000\Documents\Abaqus_run"
+abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
+  --source-cae "%RUN_DIR%\imperfection\Step4_LDG.cae" ^
+  --output-dir "%RUN_DIR%\imperfection\Step5_GMNIA_FY240_LDG" ^
+  --fy 240 ^
+  --initial-arc 0.01 ^
+  --min-arc 1e-8 ^
+  --max-arc 0.05 ^
+  --max-increments 5000 ^
+  --field-frequency 1 ^
+  --postpeak-stop-ratio 0.70
+```
+
+## Strain hardening (optional `--stress-strain`)
+
+By default the material is elastic-perfectly-plastic at `--fy`. If coupon data are available, give the
+engineering stress-strain curve as a CSV file with two columns, engineering strain and engineering stress in
+MPa. A header row is allowed.
+
+```text
+strain,stress_MPa
+0.0012,240
+0.02,290
+0.10,340
+```
+
+- The first row is the yield point: its stress must equal `--fy` (within 0.5 %), and its strain must not
+  exceed the elastic strain fy/E.
+- Step 5 converts every row to true stress = s(1+e) and logarithmic plastic strain = ln(1+e) − true stress/E,
+  which is the form `*PLASTIC` requires with NLGEOM.
+- Plastic strain must increase and true stress must not decrease (softening would need a damage model).
+- Beyond the last row the stress stays constant.
+- The table and the CSV checksum are recorded in each model description (`plastic_tables`, `material`).
+
+```bat
+  --stress-strain "D:\CFS-Column\coupon_FY240.csv" ^
+```
+
+Corner strength enhancement from cold work and residual stresses are not modelled. Most modal-imperfection
+GMNIA studies of cold-formed steel follow the same convention: the residual stress effect is treated as part
+of the equivalent geometric imperfection.
+
+## Peak summary for imperfection-sensitivity studies
+
+`STEP5_peak_summary.csv` (written by the queue) now also lists, for every model:
+- `a_L_mm`, `a_D_mm`, `a_G_mm`: the Step-4 amplitudes of u0 = aL·phiL + aD·phiD + aG·phiG;
+- `Py_kN` = A·fy;
+- `Pu_over_Py`.
+
+With the `--combo` cases of Step 4, this gives the strength-versus-amplitude table directly.
+
+## How to read the PERFECT model
+
+`STEP5_PERFECT_FY…` has no imperfection. Riks then follows the symmetric fundamental path until yielding, or
+until round-off triggers a bifurcation. Its peak is an upper reference, used for normalisation and for
+checking the imperfection sensitivity; it is not a design strength.

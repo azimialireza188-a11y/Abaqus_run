@@ -1,6 +1,8 @@
 """CLI/data-flow checks; never launch the Abaqus solver."""
 import contextlib
+import csv
 import io
+import math
 import os
 import json
 import sys
@@ -9,6 +11,74 @@ import types
 import unittest
 from unittest import mock
 import abaqus_complete_model_m20 as builder
+
+
+class ModelInputTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def input_folder(self, changes=None, seam_change=None, segment_change=None):
+        member = dict(E_MPa=200000., nu=.3, L_mm=100., t_mm=.2,
+                      gap_mm=math.sqrt(10.)-.2, bolt_row_mm=1., n_bolts=2,
+                      end_start_mm=25., end_end_mm=25., pitch_mm=50.)
+        member.update(changes or {})
+        segments = [[1, 2., 1., 2., 3., .2], [2, -1., 2., -3., 2., .2],
+                    [3, -2., -1., -2., -3., .2], [4, 1., -2., 3., -2., .2]]
+        seams = [[1, 1, 2, 2., 3., -1., 2.], [2, 2, 3, -3., 2., -2., -1.],
+                 [3, 3, 4, -2., -3., 1., -2.], [4, 4, 1, 3., -2., 2., 1.]]
+        if seam_change:
+            seam_change(seams)
+        if segment_change:
+            segment_change(segments)
+        with tempfile.TemporaryDirectory() as folder:
+            for name, rows in (('builtup_segments.csv', segments),
+                               ('builtup_seams.csv', seams),
+                               ('builtup_bolts_y.csv', [[25.], [75.]])):
+                with open(os.path.join(folder, name), 'w', newline='') as stream:
+                    csv.writer(stream).writerows(rows)
+            with open(os.path.join(folder, 'builtup_member.csv'), 'w', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(member))
+                writer.writeheader()
+                writer.writerow(member)
+            yield folder
+
+    def test_valid_export_retains_exact_bolt_positions(self):
+        with self.input_folder() as folder:
+            self.assertEqual(builder.read_model_inputs(folder)[5], [25., 75.])
+
+    def test_unstable_isotropic_material_is_rejected_before_cae(self):
+        for key, value in (('E_MPa', 0.), ('E_MPa', -1.), ('nu', -.999999-1.), ('nu', .5)):
+            with self.subTest(key=key, value=value), self.input_folder({key: value}) as folder:
+                with self.assertRaises(ValueError):
+                    builder.read_model_inputs(folder)
+
+    def test_nonfinite_member_metadata_is_rejected(self):
+        for key in ('t_mm', 'gap_mm', 'end_start_mm', 'end_end_mm', 'pitch_mm', 'bolt_row_mm'):
+            with self.subTest(key=key), self.input_folder({key: 'nan'}) as folder:
+                with self.assertRaises(ValueError):
+                    builder.read_model_inputs(folder)
+
+    def test_check_inputs_rejects_non_c4_geometry(self):
+        def shift_third_piece(rows):
+            rows[2][1] += .1
+            rows[2][3] += .1
+        with self.input_folder(segment_change=shift_third_piece) as folder:
+            with self.assertRaises(ValueError):
+                builder.read_model_inputs(folder)
+
+    def test_seam_must_attach_to_its_piece(self):
+        def shift_seam(rows):
+            rows[0][3] += .1
+            rows[0][5] += .1  # preserves gap; both points leave their walls
+        with self.input_folder(seam_change=shift_seam) as folder:
+            with self.assertRaises(ValueError):
+                builder.read_model_inputs(folder)
+
+    def test_duplicate_seam_endpoints_cannot_leave_disconnected_pieces(self):
+        def duplicate_seams(rows):
+            for row in rows[1:]:
+                row[1:] = rows[0][1:]
+        with self.input_folder(seam_change=duplicate_seams) as folder:
+            with self.assertRaises(ValueError):
+                builder.read_model_inputs(folder)
 
 
 class PipelineTests(unittest.TestCase):
@@ -286,6 +356,40 @@ class PipelineTests(unittest.TestCase):
                 'previous run', modal_audit=False, portable_export='off',
                 portable_modes_per_shard=8, parquet_python=None, parquet_backend=None,
                 portable_export_workers='auto')
+
+    def test_bending_options_output_suffix_and_solver(self):
+        with tempfile.TemporaryDirectory() as root:
+            argv = ['--builtup-dir', os.path.join(root, 'input', 'Section M80'), '--output-root',
+                    os.path.join(root, 'results')]
+            args = builder.parse_arguments(argv)
+            self.assertEqual((args.load_case, args.eigensolver), ('compression', 'auto'))
+            self.assertEqual(builder.prepare_output_directory(args), os.path.join(root, 'results', 'Section M80'))
+            self.assertEqual(builder.effective_eigensolver('compression', 'auto'), 'subspace')
+            args = builder.parse_arguments(argv+['--load-case', 'bending', '--bending-axis-deg', '-315'])
+            self.assertEqual(args.bending_axis_deg, 45.)
+            self.assertEqual(builder.prepare_output_directory(args),
+                             os.path.join(root, 'results', 'Section M80_BEND045'))
+            self.assertEqual(builder.effective_eigensolver('bending', 'auto'), 'lanczos')
+            self.assertEqual(builder.effective_eigensolver('bending', 'subspace'), 'subspace')
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            builder.parse_arguments(['--bending-axis-deg', '45'])      # needs --load-case bending
+
+    def test_load_case_definition_records_convention_and_pm_axes(self):
+        square = {1: [(-100., 100., 100., 100.)], 2: [(-100., -100., -100., 100.)],
+                  3: [(100., -100., -100., -100.)], 4: [(100., 100., 100., -100.)]}
+        data = (square, 2.0, 200000.0, 0.3, [], [], {})
+        compression = builder.load_case_definition(data, 'compression', 0.)
+        self.assertEqual((compression['type'], compression['tag']), ('compression', ''))
+        self.assertAlmostEqual(compression['area_mm2'], 1600.)
+        bending = builder.load_case_definition(data, 'bending', 45.)
+        self.assertEqual(bending['tag'], '_BEND045')
+        self.assertEqual(bending['bending_axes_for_PM']['required_axes_deg'], [0., 45.])
+        self.assertAlmostEqual(bending['reference_stress_MPa'], 1.0)
+        self.assertEqual(bending['symmetry_class_axis_deg'], 45.)
+        with open(builder.__file__) as stream:
+            source = stream.read()
+        self.assertIn("eigensolver=LANCZOS, minEigen=0.0 if LOAD_CASE == 'bending' else None", source)
+        self.assertIn("expected_loads = 8 if LOAD_CASE == 'compression' else load_definition['n_loads']", source)
 
 
 if __name__ == '__main__':

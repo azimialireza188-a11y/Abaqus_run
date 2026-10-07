@@ -31,6 +31,21 @@ Portable modal export can be generated after the same solver run, or later
 from an existing ODB, without rebuilding the model. New runs retain both U
 and UR; old U-only ODBs are exported without inventing rotations.
 Set --check-inputs to validate the CSV data without starting Abaqus/CAE.
+
+Load case (default --load-case compression, unchanged): uniform 1 MPa end stress,
+so each eigenvalue is the critical stress in MPa. --load-case bending applies the
+CUFSM-consistent linear stress sigma = 1 MPa * eta/c on both end sections
+(eta = distance from the neutral axis at --bending-axis-deg from global X,
+compression on the +n = (-sin, cos) side, c = extreme centre-line fibre), as
+consistent nodal forces of the linear edge traction. The eigenvalue is then the
+critical extreme-fibre stress in MPa and M_cr = eigenvalue * M_ref (build json,
+load_case). Same BCs (simple supports, free warping, twist restrained at ends).
+Bending uses the Lanczos eigensolver with minimum eigenvalue 0 by default:
+the reversed moment is a different load case (another --bending-axis-deg),
+and for a section with 180-degree symmetry its eigenvalues are exact duplicates.
+Bending run folders/jobs get the suffix _BEND<angle>, e.g. _BEND000, _BEND045.
+--check-inputs also prints the section symmetry and the bending axes that are
+required for P-M interaction (one per symmetry class).
 """
 import csv
 import json
@@ -46,6 +61,8 @@ import time
 # CAE noGUI executes scripts without defining __file__.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(
     globals().get('__file__', sys._getframe().f_code.co_filename)))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)  # shared modules stay importable after chdir to the run folder
 
 
 BUILTUP_DIR = r'C:\Users\810200014.HAMI.000\Documents\CUFSM-Single\cfs_abaqus\A4784_t2_qm1_0_0_0_R8_lipR20t_lipLen60_M200_L3600_gap10_nb19_end25-25_row15'
@@ -59,6 +76,9 @@ N_VECTORS = 60       # vectors used per SUBSPACE iteration
 MAX_ITERATIONS = 300  # iteration limit for SUBSPACE, separate from mode count
 LONGITUDINAL_LINES = 0  # 0: original; 2..99: per curve; 100: all source lines
 LONGITUDINAL_LINE_MIN_SPACING_MM = 0.0  # 0: disabled; applies to optional lines for 2..99
+LOAD_CASE = 'compression'  # 'compression' (uniform 1 MPa) or 'bending' (linear, 1 MPa extreme fibre)
+BENDING_AXIS_DEG = 0.0     # bending: neutral-axis angle from global X; compression on the +n side
+EIGENSOLVER = 'auto'       # auto: SUBSPACE for compression, LANCZOS (eigenvalues >= 0) for bending
 # Changing settings requires rebuilding the CAE/INP with this script.
 # A finer mesh increases model size; exact bolt locations may require shorter edges.
 # ====================================================================
@@ -83,6 +103,19 @@ def validate_settings():
             raise ValueError('%s must be a positive integer' % name)
     if N_VECTORS < N_MODES:
         raise ValueError('N_VECTORS must be at least N_MODES')
+    if LOAD_CASE not in ('compression', 'bending'):
+        raise ValueError('LOAD_CASE must be compression or bending')
+    if EIGENSOLVER not in ('auto', 'subspace', 'lanczos'):
+        raise ValueError('EIGENSOLVER must be auto, subspace or lanczos')
+    if not math.isfinite(float(BENDING_AXIS_DEG)):
+        raise ValueError('BENDING_AXIS_DEG must be finite')
+
+
+def effective_eigensolver(load_case, eigensolver):
+    """auto -> subspace for compression (production default), lanczos for bending."""
+    if eigensolver == 'auto':
+        return 'lanczos' if load_case == 'bending' else 'subspace'
+    return eigensolver
 
 
 def parse_arguments(argv=None):
@@ -113,6 +146,13 @@ def parse_arguments(argv=None):
         default=LONGITUDINAL_LINE_MIN_SPACING_MM,
         help='Minimum section-path spacing for optional lines added by --longitudinal-lines 2..99; '
              '0 disables the filter. Mandatory/bolt boundaries are never removed; 100 still retains all source lines.')
+    parser.add_argument('--load-case', choices=('compression', 'bending'), default=LOAD_CASE,
+        help='compression (default, uniform 1 MPa) or bending (linear stress, 1 MPa at the extreme fibre)')
+    parser.add_argument('--bending-axis-deg', type=float, default=BENDING_AXIS_DEG,
+        help='Bending only: neutral-axis angle from global X in degrees; compression on the +n=(-sin,cos) side. '
+             'Run --check-inputs to list the axes required by the section symmetry')
+    parser.add_argument('--eigensolver', choices=('auto', 'subspace', 'lanczos'), default=EIGENSOLVER,
+        help='auto: subspace for compression (unchanged), Lanczos with eigenvalues >= 0 for bending')
     parser.add_argument('--n-modes', type=int, default=N_MODES)
     parser.add_argument('--n-vectors', type=int, default=None)
     parser.add_argument('--max-iterations', type=int, default=MAX_ITERATIONS)
@@ -167,6 +207,13 @@ def parse_arguments(argv=None):
         args.n_vectors = max(N_VECTORS, min(2*args.n_modes, args.n_modes+8))
     if args.n_vectors < args.n_modes:
         parser.error('--n-vectors must be at least --n-modes')
+    if not math.isfinite(args.bending_axis_deg):
+        parser.error('--bending-axis-deg must be finite')
+    if args.load_case != 'bending' and args.bending_axis_deg != BENDING_AXIS_DEG:
+        parser.error('--bending-axis-deg requires --load-case bending')
+    if args.load_case == 'bending':
+        import abaqus_load_case
+        args.bending_axis_deg = abaqus_load_case.normalize_angle(args.bending_axis_deg)
     args.builtup_dir = os.path.abspath(os.path.expanduser(args.builtup_dir))
     if args.output_dir:
         args.output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
@@ -181,6 +228,9 @@ def prepare_output_directory(args):
         input_name = os.path.basename(os.path.normpath(args.builtup_dir))
         if not input_name:
             raise ValueError('--builtup-dir must name a folder, not a drive root')
+        if getattr(args, 'load_case', 'compression') != 'compression':
+            import abaqus_load_case
+            input_name += abaqus_load_case.load_case_tag(args.load_case, args.bending_axis_deg)
         os.makedirs(args.output_root, exist_ok=True)
         number = 1
         while True:
@@ -623,7 +673,33 @@ def read_geometry(folder):
         raise ValueError('Expected four pieces, found %d' % len(pieces))
     with open(os.path.join(folder, 'builtup_member.csv'), 'r') as stream:
         member = next(csv.DictReader(stream))
-    return pieces, thickness, float(member['E_MPa']), float(member['nu'])
+    young, poisson = float(member['E_MPa']), float(member['nu'])
+    if not math.isfinite(young) or young <= 0 or not math.isfinite(poisson) or not -1 < poisson < .5:
+        raise ValueError('Isotropic elasticity requires finite E_MPa > 0 and -1 < nu < 0.5')
+    return pieces, thickness, young, poisson
+
+
+def validate_c4_geometry(pieces):
+    """The builder rotates one shared native part; every source piece must match it."""
+    if sorted(pieces) != [1, 2, 3, 4]:
+        raise ValueError('This builder supports the four-piece C4 section')
+    for k in sorted(pieces):
+        if len(pieces[k]) != len(pieces[1]):
+            raise ValueError('Piece %d is not a C4 copy of piece 1' % k)
+        for a, b in zip(pieces[1], pieces[k]):
+            for unused in range(k - 1):
+                a = (-a[1], a[0], -a[3], a[2])
+            if max(abs(x-y) for x, y in zip(a, b)) >= 1e-6:
+                raise ValueError('Piece %d is not a C4 copy of piece 1' % k)
+
+
+def point_on_section(point, segments, tol):
+    for x1, y1, x2, y2 in segments:
+        dx, dy = x2-x1, y2-y1
+        fraction = max(0., min(1., ((point[0]-x1)*dx+(point[1]-y1)*dy)/(dx*dx+dy*dy)))
+        if math.hypot(point[0]-x1-fraction*dx, point[1]-y1-fraction*dy) <= tol:
+            return True
+    return False
 
 
 def read_model_inputs(folder):
@@ -635,11 +711,16 @@ def read_model_inputs(folder):
         bolts = [float(row[0]) for row in csv.reader(f) if row]
     with open(os.path.join(folder, 'builtup_member.csv')) as f:
         member = next(csv.DictReader(f))
+    validate_c4_geometry(pieces)
     length = float(member['L_mm'])
     tol = 1e-3
-    values = [length, thickness, young, poisson] + bolts + [v for row in seams for v in row]
+    metadata = [float(member[key]) for key in ('t_mm', 'gap_mm', 'bolt_row_mm', 'n_bolts',
+                                                'end_start_mm', 'end_end_mm', 'pitch_mm')]
+    values = [length, thickness, young, poisson] + metadata + bolts + [v for row in seams for v in row]
     if any(math.isnan(v) or math.isinf(v) for v in values) or length <= 0:
         raise ValueError('Model inputs must be finite, and member length must be positive')
+    if float(member['gap_mm']) < 0 or float(member['bolt_row_mm']) < 0:
+        raise ValueError('Clear gap and bolt-row distance must be nonnegative')
     if abs(thickness - float(member['t_mm'])) > 1e-9:
         raise ValueError('Thickness differs between segment and member CSV files')
     if not bolts or len(bolts) != int(member['n_bolts']):
@@ -653,19 +734,38 @@ def read_model_inputs(folder):
     pitches = [b-a for a, b in zip(bolts, bolts[1:])]
     if any(abs(p-float(member['pitch_mm'])) > tol for p in pitches):
         raise ValueError('Actual bolt spacings differ from the exported pitch_mm')
-    if len(seams) != 4 or sorted(pieces) != [1, 2, 3, 4]:
+    if len(seams) != 4:
         raise ValueError('This builder supports the four-piece C4 section')
+    if any(len(row) != 7 or any(v != int(v) for v in row[:3]) for row in seams):
+        raise ValueError('Invalid seam CSV row')
     if len(set(row[0] for row in seams)) != len(seams):
         raise ValueError('Duplicate seam identifiers')
+    connections = set()
+    neighbors = dict((k, set()) for k in pieces)
     for row in seams:
-        if len(row) != 7 or any(v != int(v) for v in row[:3]):
-            raise ValueError('Invalid seam CSV row')
         sid, pa, pb, xa, ya, xb, yb = row
         if int(pa) not in pieces or int(pb) not in pieces or pa == pb:
             raise ValueError('Invalid pieces in seam %g' % sid)
+        ends = tuple(sorted(((int(pa), xa, ya), (int(pb), xb, yb))))
+        if ends in connections:
+            raise ValueError('Duplicate seam connection in seam %g' % sid)
+        connections.add(ends)
+        neighbors[int(pa)].add(int(pb))
+        neighbors[int(pb)].add(int(pa))
+        if (not point_on_section((xa, ya), pieces[int(pa)], 1e-6) or
+                not point_on_section((xb, yb), pieces[int(pb)], 1e-6)):
+            raise ValueError('Seam %g attachment point is not on its section piece' % sid)
         # For this exported section, mating lip mid-surfaces are gap + t apart.
         if abs(math.hypot(xb-xa, yb-ya) - float(member['gap_mm']) - thickness) > tol:
             raise ValueError('Seam %g does not match the exported gap and thickness' % sid)
+    reached, pending = set(), [1]
+    while pending:
+        k = pending.pop()
+        if k not in reached:
+            reached.add(k)
+            pending.extend(neighbors[k] - reached)
+    if reached != set(pieces):
+        raise ValueError('Bolt seams must connect all four pieces to the axial anchor')
     return pieces, thickness, young, poisson, seams, bolts, member
 
 
@@ -686,6 +786,27 @@ def input_summary(data):
         shell_contact='GENERAL_STANDARD_HARD_FRICTIONLESS')
 
 
+def load_case_definition(inputs, load_case=None, bending_axis_deg=None):
+    """Reference load definition (no CAE needed): what the eigenvalue means, section
+    properties for later P-M combination, section symmetry and the required bending axes."""
+    import abaqus_load_case
+    pieces, thickness = inputs[0], inputs[1]
+    load_case = LOAD_CASE if load_case is None else load_case
+    theta = BENDING_AXIS_DEG if bending_axis_deg is None else bending_axis_deg
+    if load_case == 'bending':
+        definition = abaqus_load_case.bending_reference(pieces, thickness, theta)
+    else:
+        definition = abaqus_load_case.compression_reference(pieces, thickness)
+    symmetry = abaqus_load_case.section_symmetry(pieces)
+    definition['section_properties'] = abaqus_load_case.section_properties(pieces, thickness)
+    definition['section_symmetry'] = symmetry
+    definition['bending_axes_for_PM'] = abaqus_load_case.required_bending_axes(symmetry)
+    if load_case == 'bending':
+        definition['symmetry_class_axis_deg'] = abaqus_load_case.canonical_axis(theta, symmetry)
+    definition['tag'] = abaqus_load_case.load_case_tag(load_case, theta)
+    return definition
+
+
 def add_general_contact(model):
     """Define shell contact in Initial, inherited by subsequent steps.
 
@@ -704,6 +825,74 @@ def add_general_contact(model):
         assignments=((GLOBAL, SELF, 'Hard_Frictionless'),))
 
 
+def apply_bending_end_forces(model, assembly, end_sets, thickness, definition):
+    """Consistent nodal forces of the linear edge traction t * 1 MPa * eta/c on every meshed
+    end edge (one ConcentratedForce per loaded node; +Z at z=0, -Z at z=L). Checks that the
+    forces carry no net axial force and no moment about the other axis, and records the
+    moment actually applied by the mesh (M_ref_mesh), which differs from the centre-line
+    M_ref only by the chord approximation of curved walls."""
+    import abaqus_load_case
+    from abaqusConstants import UNIFORM, OFF
+    forces_by_end, totals = [], {}
+    max_abs = 0.0
+    for k, inst, suffix, sign, set_name in end_sets:
+        end_nodes = assembly.sets[set_name].nodes
+        labels = set(n.label for n in end_nodes)
+        coords = dict((n.label, n.coordinates) for n in end_nodes)
+        edges = set()
+        for node in end_nodes:
+            for element in node.getElements():
+                connectivity = [n.label for n in element.getNodes()]
+                for a, b in zip(connectivity, connectivity[1:]+connectivity[:1]):
+                    if a in labels and b in labels:
+                        edges.add((min(a, b), max(a, b)))
+        if not edges:
+            raise RuntimeError('No meshed end edges found for '+set_name)
+        q = abaqus_load_case.consistent_edge_forces(coords, sorted(edges), thickness, definition)
+        forces_by_end.append((k, suffix, inst, sign, q, coords))
+        max_abs = max([max_abs] + [abs(v) for v in q.values()])
+    nx, ny = definition['compression_normal']
+    tx, ty = definition['neutral_axis_direction']
+    xc, yc = definition['centroid_mm']
+    count = 0
+    for k, suffix, inst, sign, q, coords in sorted(forces_by_end, key=lambda item: (item[0], item[1])):
+        side = totals.setdefault(suffix, dict(force=0., abs_force=0., moment=0., secondary=0.))
+        for label in sorted(q):
+            value = q[label]
+            x, y = coords[label][0], coords[label][1]
+            side['force'] += value
+            side['abs_force'] += abs(value)
+            side['moment'] += value*(nx*(x-xc)+ny*(y-yc))
+            side['secondary'] += value*(tx*(x-xc)+ty*(y-yc))
+            if abs(value) <= 1e-12*max_abs:
+                continue  # node on the neutral axis
+            node_set = 'BENDN_%s_P%d_%d' % (suffix, k, label)
+            assembly.Set(name=node_set, nodes=inst.nodes.sequenceFromLabels((label,)))
+            model.ConcentratedForce(name='BEND_END_%s_P%d_N%d' % (suffix, k, label),
+                createStepName='Buckle', region=assembly.sets[node_set],
+                cf3=sign*value, distributionType=UNIFORM, follower=OFF)
+            count += 1
+    for suffix, side in totals.items():
+        if abs(side['force']) > 1e-6*side['abs_force']:
+            raise RuntimeError('Bending end forces at end %s carry a net axial force (%g N): the '
+                               'neutral axis is not through the meshed centroid' % (suffix, side['force']))
+        if abs(side['secondary']) > 1e-6*abs(side['moment']):
+            raise RuntimeError('Bending end forces at end %s carry a moment about the other axis' % suffix)
+    m_mesh = totals['0']['moment']
+    if not math.isclose(m_mesh, totals['L']['moment'], rel_tol=1e-9):
+        raise RuntimeError('Bending reference moments differ between the two ends')
+    m_source = definition['reference_moment_Nmm_per_MPa']
+    print('Bending reference: M_ref(mesh) = %.6g N mm per MPa extreme-fibre stress; centre-line '
+          'M_ref = %.6g (ratio %.6f); %d nodal forces.' % (m_mesh, m_source, m_mesh/m_source, count))
+    sys.stdout.flush()
+    return dict(n_loads=count, reference_moment_mesh_Nmm_per_MPa=m_mesh,
+                mesh_to_centreline_moment_ratio=m_mesh/m_source,
+                load_application='consistent nodal forces of the linear edge traction (CF3), +Z at z=0, -Z at z=L',
+                net_axial_force_relative=max(abs(s['force'])/s['abs_force'] for s in totals.values()),
+                secondary_moment_relative=max(abs(s['secondary'])/abs(s['moment']) for s in totals.values()),
+                critical_moment_formula='M_cr = eigenvalue * reference_moment_mesh_Nmm_per_MPa (applied by the FE model)')
+
+
 def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='full', gpus='auto'):
     import runtime_resources
     policy = runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(), cpus, gpus)
@@ -713,13 +902,15 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
         inputs = read_model_inputs(BUILTUP_DIR)
     pieces, thickness, young, poisson, seams, bolts, member = inputs
     LENGTH_MM = float(member['L_mm'])
-    MODEL_NAME = ('BU_BOLT_L%g_M%g' % (LENGTH_MM, MESH_MM)).replace('.', 'p')
+    load_definition = load_case_definition(inputs)
+    MODEL_NAME = ('BU_BOLT_L%g_M%g' % (LENGTH_MM, MESH_MM)).replace('.', 'p') + load_definition['tag']
+    solver = effective_eigensolver(LOAD_CASE, EIGENSOLVER)
     print('Source inputs: '+json.dumps(input_summary(inputs), sort_keys=True))
     import caeModules  # initialize all CAE repositories for noGUI execution
     from abaqus import mdb, session
     from abaqusConstants import (THREE_D, DEFORMABLE_BODY, ON, OFF, CARTESIAN,
         MIDDLE_SURFACE, FROM_SECTION, XYPLANE, XZPLANE, YZPLANE, QUAD,
-        STRUCTURED, FIXED, S4R, STANDARD, SUBSPACE, SET, UNIFORM, GENERAL,
+        STRUCTURED, FIXED, S4R, STANDARD, SUBSPACE, LANCZOS, SET, UNIFORM, GENERAL,
         BEAM_MPC, DOF_MODE_MPC, PERCENTAGE, FULL, SINGLE)
     import mesh
     import regionToolset
@@ -727,13 +918,7 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
     import job as job_module
 
     # Verify exact C4 symmetry before sharing one native meshed part.
-    for k in sorted(pieces):
-        assert len(pieces[k]) == len(pieces[1])
-        for a, b in zip(pieces[1], pieces[k]):
-            a = list(a)
-            for unused in range(k - 1):
-                a = [-a[1], a[0], -a[3], a[2]]
-            assert max(abs(x-y) for x, y in zip(a, b)) < 1e-6
+    validate_c4_geometry(pieces)
     if MODEL_NAME in mdb.models:
         raise RuntimeError('Use a fresh CAE session: model already exists')
     model = mdb.Model(name=MODEL_NAME)
@@ -874,9 +1059,16 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
                             axisDirection=(0., 0., 1.), angle=90.0 * (k-1))
     assembly.regenerate()
     add_general_contact(model)
-    model.BuckleStep(name='Buckle', previous='Initial', numEigen=N_MODES,
-                    eigensolver=SUBSPACE, maxEigen=None, vectors=N_VECTORS,
-                    maxIterations=MAX_ITERATIONS)
+    if solver == 'subspace':
+        model.BuckleStep(name='Buckle', previous='Initial', numEigen=N_MODES,
+                        eigensolver=SUBSPACE, maxEigen=None, vectors=N_VECTORS,
+                        maxIterations=MAX_ITERATIONS)
+    else:
+        # Lanczos: bending keeps only eigenvalues >= 0 (the reversed moment is another load case).
+        model.BuckleStep(name='Buckle', previous='Initial', numEigen=N_MODES,
+                        eigensolver=LANCZOS, minEigen=0.0 if LOAD_CASE == 'bending' else None,
+                        maxEigen=None)
+    bending_loads = []
     for k, inst in sorted(instances.items()):
         for suffix, z, sign in (('0', 0., 1.), ('L', LENGTH_MM, -1.)):
             edges = inst.edges.getByBoundingBox(xMin=-1e6, yMin=-1e6, zMin=z-1e-4,
@@ -887,10 +1079,16 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
             model.DisplacementBC(name='SS_'+name, createStepName='Initial',
                 region=assembly.sets[name], u1=SET, u2=SET, ur3=SET)
             assembly.Surface(name=name+'_S', side1Edges=edges)
-            model.ShellEdgeLoad(name='COMP_'+name, createStepName='Buckle',
-                region=assembly.surfaces[name+'_S'], magnitude=thickness,
-                distributionType=UNIFORM, traction=GENERAL,
-                directionVector=((0., 0., 0.), (0., 0., sign)), follower=OFF, resultant=OFF)
+            if LOAD_CASE == 'compression':
+                model.ShellEdgeLoad(name='COMP_'+name, createStepName='Buckle',
+                    region=assembly.surfaces[name+'_S'], magnitude=thickness,
+                    distributionType=UNIFORM, traction=GENERAL,
+                    directionVector=((0., 0., 0.), (0., 0., sign)), follower=OFF, resultant=OFF)
+            else:
+                bending_loads.append((k, inst, suffix, sign, name))
+    if LOAD_CASE == 'bending':
+        load_definition.update(apply_bending_end_forces(
+            model, assembly, bending_loads, thickness, load_definition))
 
     def exact_node(inst, xyz):
         nodes = inst.nodes.getByBoundingSphere(center=xyz, radius=1e-3)
@@ -911,7 +1109,8 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
             model.MultipointConstraint(name=name, controlPoint=assembly.sets[name+'_A'],
                 surface=assembly.sets[name+'_B'], mpcType=BEAM_MPC,
                 userMode=DOF_MODE_MPC, userType=0, csys=None)
-    assert len(model.constraints) == len(seams)*len(bolts) and len(model.loads) == 8
+    expected_loads = 8 if LOAD_CASE == 'compression' else load_definition['n_loads']
+    assert len(model.constraints) == len(seams)*len(bolts) and len(model.loads) == expected_loads
     assert len(model.boundaryConditions) == 9
     for name in list(model.fieldOutputRequests.keys()):
         del model.fieldOutputRequests[name]
@@ -939,6 +1138,11 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
         bolts_per_seam=len(bolts), rigid_links=len(model.constraints),
         boundary_conditions=len(model.boundaryConditions), loads=len(model.loads),
         reference_stress_MPa=1.0, submitted=False)
+    report['load_case'] = dict(load_definition, type=LOAD_CASE, n_loads=len(model.loads))
+    report['eigensolver'] = dict(
+        requested=EIGENSOLVER, used=solver,
+        min_eigenvalue=0.0 if (solver == 'lanczos' and LOAD_CASE == 'bending') else None,
+        subspace_vectors_and_iterations_used=solver == 'subspace')
     report['contact'] = dict(type='General contact (Standard)', step='Initial',
         domain='All exterior surfaces, including self-contact', normal='HARD',
         tangential='FRICTIONLESS', allow_separation=True,
@@ -960,6 +1164,7 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
 def main(argv=None):
     global BUILTUP_DIR, MESH_MM, N_MODES, N_VECTORS, MAX_ITERATIONS
     global LONGITUDINAL_LINES, LONGITUDINAL_LINE_MIN_SPACING_MM
+    global LOAD_CASE, BENDING_AXIS_DEG, EIGENSOLVER
     args = parse_arguments(argv)
     parquet_backend = None
     if (args.portable_export in ('parquet', 'both') and
@@ -976,15 +1181,18 @@ def main(argv=None):
     LONGITUDINAL_LINES = args.longitudinal_lines
     LONGITUDINAL_LINE_MIN_SPACING_MM = args.longitudinal_line_min_spacing_mm
     N_MODES, N_VECTORS, MAX_ITERATIONS = args.n_modes, args.n_vectors, args.max_iterations
+    LOAD_CASE, BENDING_AXIS_DEG, EIGENSOLVER = args.load_case, args.bending_axis_deg, args.eigensolver
     validate_settings()
     inputs = read_model_inputs(BUILTUP_DIR)
     settings = vars(args).copy()
     settings['effective_buckle_output'] = 'classification_U_plus_portable_UR'
     settings['automatic_shell_energy'] = False
+    settings['effective_eigensolver'] = effective_eigensolver(LOAD_CASE, EIGENSOLVER)
     if parquet_backend is not None:
         settings['portable_parquet_backend'] = parquet_backend
     if args.check_inputs:
-        print(json.dumps(dict(settings=settings, source_inputs=input_summary(inputs)), indent=2))
+        print(json.dumps(dict(settings=settings, source_inputs=input_summary(inputs),
+                              load_case=load_case_definition(inputs)), indent=2))
         return
     # Resolve the local postprocessor before submitting an expensive analysis.
     processor = None
@@ -997,6 +1205,8 @@ def main(argv=None):
     os.chdir(output_dir)
     settings['output_dir'] = output_dir
     state = dict(status='BUILDING', settings=settings, source_inputs=input_summary(inputs), submitted=False)
+    if LOAD_CASE != 'compression':
+        state['load_case'] = load_case_definition(inputs)
     def save_state(status):
         state['status'] = status
         state['updated_at'] = datetime.datetime.now().isoformat()

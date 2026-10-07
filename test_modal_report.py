@@ -40,6 +40,16 @@ class ModalReportTests(unittest.TestCase):
         np.testing.assert_allclose(a, b, atol=1e-12)
         self.assertAlmostEqual(sum(a), 1., places=12)
 
+    def test_arbitrary_eigenvector_scale_does_not_underflow_or_overflow_shares(self):
+        u = np.zeros((9, 2))
+        u[:, 1] = np.sin(np.linspace(0, np.pi, 9))
+        for scale in (1e-180, -1e180):
+            with self.subTest(scale=scale):
+                diagnostics = self.fit.component_diagnostics(scale*u)
+                self.assertAlmostEqual(diagnostics['local_percent'], 100.)
+                self.assertTrue(all(np.isfinite(value) for value in diagnostics.values()))
+
+
     def test_family_is_unresolved_when_geometry_proxy_unsupported(self):
         self.assertEqual(report.family_label([.1, .1, .8], False), 'Unresolved')
         self.assertEqual(report.family_label([.9, .05, .05], False), 'Global-like')

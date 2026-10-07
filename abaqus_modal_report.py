@@ -399,7 +399,15 @@ class SectionProjector:
         return parts
 
     def component_diagnostics_weighted(self, weighted_coefficients):
-        parts=self._weighted_components(weighted_coefficients)
+        y=np.asarray(weighted_coefficients,dtype=float)
+        if not np.all(np.isfinite(y)):
+            raise ValueError('Nonfinite transverse mode field')
+        scale=float(np.max(np.abs(y),initial=0.))
+        # All reported quantities are homogeneous ratios. Normalize before
+        # squaring so arbitrary eigenvector amplitude cannot alter the shares.
+        if scale > 0:
+            y=y/scale
+        parts=self._weighted_components(y)
         norms={k:float(np.sum(v*v)) for k,v in parts.items()}
         ldg=norms['L']+norms['D']+norms['G']; all_self=ldg+norms['A']+norms['O']
         # Pure Other/Assembly motion can leave round-off in L/D/G. Do not
@@ -408,7 +416,7 @@ class SectionProjector:
             for key in ('L', 'D', 'G'):
                 norms[key]=0.
             ldg=0.
-        reconstruction=sum(parts.values()); y=np.asarray(weighted_coefficients,dtype=float)
+        reconstruction=sum(parts.values())
         x=(y.reshape(-1,len(self.sqrtw))/self.sqrtw[None,:])
         curvature=float(np.sum((x@self.curvature_matrix.T)**2)) if self.curvature_matrix.size else 0.
         return dict(

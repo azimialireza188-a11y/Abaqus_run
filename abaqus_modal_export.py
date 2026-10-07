@@ -174,6 +174,8 @@ def _field_array(frame, field_name, index, node_count):
         row = index.get(key)
         if row is None:
             continue
+        if np.isfinite(result[row, 0]):
+            raise ValueError('Duplicate %s nodal field value: %r' % (field_name, key))
         vector, precision = _vector(value)
         result[row, :] = vector
         precisions.add(precision)
@@ -229,7 +231,7 @@ def _build_bulk_plan(field, index, node_count):
         rows = np.fromiter(
             (index.get((name, int(label)), -1) for label in labels),
             dtype=np.int64, count=len(labels))
-        if np.any(rows < 0) or np.any(seen[rows]):
+        if np.any(rows < 0) or len(np.unique(rows)) != len(rows) or np.any(seen[rows]):
             return None
         # Validate shape/coordinate-system once while constructing the plan.
         data, unused_precision = _bulk_block_data(block)
@@ -421,6 +423,9 @@ def export_odb_object(odb, output_dir, source_info, output_format='parquet',
                   if int(getattr(frame, 'mode', 0)) > 0]
         if not frames:
             raise ValueError('No positive mode frames in selected buckling step')
+        mode_ids = [int(frame.mode) for frame in frames]
+        if len(set(mode_ids)) != len(mode_ids):
+            raise ValueError('Duplicate buckling mode identifiers in selected step')
         ur_flags = [('UR' in frame.fieldOutputs) for frame in frames]
         if any(ur_flags) and not all(ur_flags):
             raise ValueError('Inconsistent UR availability across buckling modes')
@@ -450,7 +455,14 @@ def export_odb_object(odb, output_dir, source_info, output_format='parquet',
             field = frame.fieldOutputs[field_name]
             plan = bulk_plans[field_name]
             if plan is None:
-                plan = _build_bulk_plan(field, mesh['index'], len(mesh['node_labels']))
+                try:
+                    plan = _build_bulk_plan(field, mesh['index'], len(mesh['node_labels']))
+                except Exception:
+                    # Abaqus Python bulk access can reject double precision.
+                    # FieldValue uses the source's precision-specific accessor
+                    # and independently checks the global-coordinate contract.
+                    plan = None
+                    bulk_fallback_fields.add(field_name)
                 plan = plan if plan is not None else False
                 bulk_plans[field_name] = plan
             if plan is not False:
