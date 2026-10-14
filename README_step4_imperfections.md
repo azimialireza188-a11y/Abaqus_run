@@ -3,7 +3,12 @@
 `abaqus_step4_imperfections.py` now consumes the exact completed run created by
 `abaqus_complete_model_m20.py`. The run identity comes from
 `pipeline_status.json`; the script no longer selects arbitrary `*.cae` or
-`*.odb` files by wildcard order.
+`*.odb` files by wildcard order. A run that was only built (`--build-only`,
+status `BUILT`, no `.odb`) is accepted as well: its CAE is the perfect model,
+but it cannot supply mode shapes, so every needed component must then name its
+own solved source (e.g. `--local-source <run>_REF_L --global-source <run>_REF_G`);
+otherwise Step 4 stops with a message. The manifest records
+`reference_run_status` and `source_odb_sha256 = null` in that case.
 
 ## 1. Update the repository
 
@@ -39,6 +44,16 @@ abaqus cae noGUI=abaqus_step4_imperfections.py -- ^
   --dist-mm 3.6 ^
   --output-cae "D:\CFS-Column\Step4_imperfections.cae"
 ```
+
+### Command-line form and `--cpus`
+
+Every option is written `--name value` with a space. The Abaqus launcher rejects `--name=value`
+("has both equality sign and prepended dash") before the script starts. A blank line inside a `^`-continued
+command also ends it.
+
+`--cpus N` (or `auto`, the default) is accepted by Step 4 for a uniform command line across the pipeline.
+Step 4 launches no Abaqus solver: the value sets the NumPy/BLAS threads of the build (when NumPy is not
+already loaded by Abaqus/CAE) and is the default worker count of `--suggest` (`--suggest-cpus` overrides it).
 
 ### Selectable source and mode for each component
 
@@ -84,6 +99,22 @@ abaqus cae noGUI=abaqus_step4_imperfections.py -- ^
 
 ### Combined L + D + G imperfections and amplitude studies (`--combo`)
 
+When running from Windows cmd, assign the selected mode numbers using
+`set "LOCAL_MODE=number"`, `set "DIST_MODE=number"` and
+`set "GLOBAL_MODES=number,number"`, then pass `--local-mode "%LOCAL_MODE%"`,
+`--dist-mode "%DIST_MODE%"` and `--global-mode "%GLOBAL_MODES%"`.
+Do not paste a block of interactive `set /p` prompts: the next command can become
+the answer to the preceding prompt. Mode numbers in examples are illustrative;
+select them from the current original/reference reports. Step 4 prints argument
+errors to stdout as `STEP4 INPUT ERROR`, including in CAE, and treats invalid
+arguments as a failed CAE script. Successful generation requires `SAVED:` and
+the new output CAE; CAE's `Exit code: 0` by itself is insufficient.
+If CAE hides stdout/stderr, its final `RuntimeError` also includes the exact bad
+option and value. Changing a source folder cannot fix a mode variable containing
+command text. Mode numbers can be passed directly, for example `--local-mode 1`
+and `--global-mode 2,3`, instead of using environment variables; choose the numbers
+from the current reports. This avoids stale `LOCAL_MODE` / `GLOBAL_MODES` values.
+
 Every case is the field
 
     u0 = aL*phiL + aD*phiD + aG*phiG
@@ -100,9 +131,11 @@ sweep for a sensitivity study, is given with `--combo NAME=aL,aD,aG` (repeat the
 | `L/…` | fraction of the member length | `L/1000`, `-L/1500` |
 | `0` | component absent | `0` |
 
-- Names: 1–20 letters, digits or `_`, starting with a letter; they become `STEP4_<NAME>` and, in Step 5, `STEP5_<NAME>_FY…`. Names are compared case-insensitively (Windows file names).
+- Any mix of families in one command, in any number and order: three non-zero amplitudes (LDG), two (LD, LG, DG) or one (L, D, G), e.g. `--combo LDG_mp=-0.34t,1.8t,L/1000 --combo LG_mp=-0.34t,0,L/1000 --combo L_mp=-0.34t,0,0`; add or remove `--combo` options freely.
+- Names: 1–20 letters, digits or `_`, starting with a letter; they become `STEP4_<NAME>` and, in Step 5, `STEP5_<NAME>_FY…`. Names are compared case-insensitively (Windows file names); they must differ from each other and from the built-in cases selected with `--cases` (with `--cases none`, `--combo LD_mp=…` is fine).
 - With `--combo` and no `--cases`, only the `--combo` cases are built; add `--cases L_low,D,…` (or `all`) to build built-in cases too.
 - Only the components with a non-zero amplitude are required, e.g. a `--combo` with aD = 0 needs no `--dist-mode`.
+- A non-zero aD needs `--dist-mode` and a solved distortional source. There is no GDLC distortional reference model: without `--dist-source` the mode is read from the `--run-dir` run, which must then be solved and recorded (`--resume-post`, status `COMPLETED`); a `--build-only` run cannot supply it.
 - A negative amplitude flips that component's normalized shape (the sign rule is recorded in the manifest).
 
 ```bat
@@ -127,14 +160,47 @@ A square or other doubly-symmetric column has two global flexural modes with equ
 pair Abaqus returns an arbitrary basis, so the bow direction of "mode 1" alone can change from one solve to the
 next. `--global-mode 1,2` takes the combination of the pair (again an exact eigenmode) whose mean transverse
 displacement points along `--global-angle-deg` (degrees from the first transverse axis, X for a Z-axis
-column), then normalizes it to unit peak. The pair must have equal eigenvalues (within 1 %). For a single
+column), then normalizes it to unit peak. The modes must form a complete span-based eigenvalue group (relative span 0.1 %, consistent with default GDLC). For a single
 mode, Step 4 prints a warning when a neighbouring mode has the same eigenvalue (within 0.1 %), and records
 the achieved bow angle and a translation ratio (about 1 for a flexural bow, about 0 for a torsional mode).
+
+A single `--global-mode` together with an explicit `--global-angle-deg` is accepted:
+- if that mode has exactly one equal-eigenvalue partner in its ODB (within 0.1 %), the pair is used and
+  aligned with the angle, and a `NOTE` says so (A3184 REF_G: `--global-mode 2` becomes the flexural pair
+  2,3; mode 1 there is torsional). Writing the pair, `--global-mode 2,3`, gives the same field;
+- with several partners the complete eigenspace is used. An explicit incomplete group is rejected;
+- the oriented shape minimizes its physical displacement norm subject to the requested mean bow, using an orthonormal SVD basis. It is invariant under nonsingular changes of the eigenvector basis, including groups larger than two;
+- without a partner the angle can only fix the sign of an already aligned bow. A direction outside the single-mode span, or an attempt to orient a torsional mode by a bow angle, is rejected. Omit the angle to use that eigenmode unchanged apart from normalization.
+
+Only an exactly repeated eigenvalue makes every combination an exact eigenmode.
+The 0.1 % grouping tolerance is a numerical convention for nearly repeated
+modes. A combined imperfection from a nearly repeated group is an oriented
+imperfection field, not a newly solved exact eigenpair; source eigenvalues are
+retained in the manifest.
 
 ### Bending runs
 
 Step 4 detects a bending reference run (Step 3 `--load-case bending`) from
 `pipeline_status.json`; nothing else changes and the provenance carries the load case to Step 5.
+Optional `--load-case bending` asserts that recorded type; it never converts a compression
+model to bending. A mismatch is an error. Compression commands without this option are unchanged.
+
+Generate and solve references from the **same bending family run** (even when it is only BUILT):
+
+```bat
+set "RUN_DIR=D:\D-CFS-Column\D-CFS-Column\family_9_BEND000"
+cd /d "D:\Abaqus_run\gdlc_classifier"
+python gdlc_mode_decomposition.py "%RUN_DIR%" --make-reference-models --reference-modes 20
+python gdlc_mode_decomposition.py "%RUN_DIR%_REF_L" "%RUN_DIR%_REF_G" --solve-reference-models --export auto --stiffness required --cpus auto
+```
+
+`--solve-reference-models` solves reference folders; passing only the original run does not
+create or solve its sibling references. The correct paths above include `_BEND000` before
+`_REF_L` / `_REF_G`. Compression's `family_9_REF_L/G` are different load cases.
+Bending Step4 checks the source build's load case/axis, geometry/material/bolt configuration,
+reference kind and original/reference INP hashes when recorded. Direct `.odb` arguments obey
+the same checks. Legacy reference metadata without hashes needs its matching copied build record.
+Only finite positive-eigenvalue modes are accepted for the applied bending direction.
 
 - Local and distortional shapes: take them from the BENDING run / its REF_L (they are concentrated in the
   compression zone and differ from the compression modes). Choose the mode numbers again from the bending
@@ -144,9 +210,53 @@ Step 4 detects a bending reference run (Step 3 `--load-case bending`) from
   (`--global-mode 1`, no `--global-angle-deg`). Bending breaks the equal-eigenvalue flexural pair, so
   `--global-mode 1,2` is refused when the two eigenvalues differ. `G1000`/`L/1000` is the peak transverse
   displacement of that mode (it includes the twist component).
+- The REF_G of a bending run keeps the twist free (`twist: free` in `gdlc_reference.json`): under a moment
+  the intended global mode is lateral-torsional, i.e. lateral translation coupled with section twist.
+  Restraining twist along the member suppresses that mechanism and defines a different, artificially
+  restrained reference. Twist coupled to the lateral bow belongs to G and is not contamination by D/L.
+- Step 4 checks the selected global vector, from a single mode or a complete degenerate group:
+  its mean transverse displacement (net lateral bow) must
+  be at least half of its mean displacement magnitude (translation ratio >= 0.5 - this rejects pure
+  torsional modes and even-half-wave lateral-torsional modes, which have no net bow) and must point
+  lie within 10 deg of the lateral direction defined by the applied moment's neutral axis.
+  A mode that fails is refused with its bow angle and ratio. The sign is set so that a positive aG
+  bows towards +lateral direction (`p` in `LG_mp`), independent of the arbitrary eigenvector sign.
+- Step 4 prints a WARNING when a REF_G / REF_L source failed its own GDLC reference-model check
+  (`reference_check.passed = false` in its `basis_report.json`).
+- For bending, selected reference vectors with current, ODB-matched classifications must meet
+  G >= 95 % for REF_G, or L >= 95 % and G+D+C <= 5 % for REF_L, otherwise Step 4 stops.
+  A different mode failing the run-wide check does not reject a pure selected vector. These
+  percentages distinguish G/D/L/C/O; G includes lateral-torsional motion and does not certify
+  zero twist. Single global modes and complete degenerate combinations both undergo the
+  same net-bow/direction checks against the moment's neutral-axis direction. An explicit
+  --global-angle-deg cannot substitute a different moment axis. The existing 10-degree
+  direction tolerance and 0.5 net-bow ratio are screening rules, not design-code limits.
+  The generic 80 % mixed-mode warning remains
+  unchanged for compression and modes deliberately taken from the original model. Missing
+  or stale classifications cannot certify purity and retain the existing diagnostic notes.
 - Analytical bow (no `--global-source`): the default direction is the lateral direction, i.e. along the
   neutral axis (`--bending-axis-deg`); `--global-angle-deg` still overrides it.
 - Amplitudes and `--combo` work unchanged (0.34t, 1.8t, L/1000 are geometric).
+
+For a single LG case, after selecting modes from the solved bending references:
+
+```bat
+cd /d "D:\Abaqus_run"
+set "LOCAL_MODE=1"
+set "GLOBAL_MODES=1"
+abaqus cae noGUI=abaqus_step4_imperfections.py -- ^
+  --run-dir "%RUN_DIR%" --load-case bending ^
+  --local-source "%RUN_DIR%_REF_L" --local-mode "%LOCAL_MODE%" ^
+  --global-source "%RUN_DIR%_REF_G" --global-mode "%GLOBAL_MODES%" ^
+  --cases none --combo LG_mp=-0.34t,0,L/1000 ^
+  --output-cae "%RUN_DIR%\imperfection\Step4_LG.cae"
+```
+
+Mode 1 is an example, not a guaranteed selection for every family. A single global eigenmode
+retains its lateral/torsional shape; do not prescribe a bow angle unless that eigenmode actually
+has that direction. Do not combine modes 1,2 unless they form a complete repeated-eigenvalue group.
+Step5 then takes this `Step4_LG.cae` with its normal `--source-cae` command and inherits bending
+automatically; its response is moment-rotation. No extra `--load-case` is needed in Step5.
 
 ```bat
 set "RUN_DIR=D:\CFS-Column\<input>_BEND000"
@@ -166,10 +276,10 @@ abaqus cae noGUI=abaqus_step4_imperfections.py -- ^
 
 When the source folder contains `mode_decomposition_GDLC\mode_participation.csv` from
 `gdlc_mode_decomposition.py`, Step 4 looks up every selected mode. The lookup is used only if the eigenvalue
-in the CSV matches the ODB frame (otherwise the classification belongs to another solve and is reported as
+in the CSV matches the ODB frame and `basis_report.json` identifies the same ODB SHA256 (otherwise the classification is stale or unverified and is reported as
 stale). Step 4 prints its G/D/L/C/O shares and warns when the local, distortional or global component is not
 dominated by L, D or G respectively, with at least 80 %. The shares are stored under
-`component_sources.<component>.gdlc`. The pure REF_L / REF_G reference models give the cleanest L and G shapes.
+`component_sources.<component>.gdlc`. Individual `*_pct` shares assess the selected vector; `rel_*_pct` group shares are retained separately and never substituted for individual purity. Old reports without ODB provenance must be reclassified before relying on their purity. REF_L / REF_G are constrained reference shapes, whose purity must still be checked from their outputs.
 
 ### Inter-piece clearance screen
 
@@ -177,7 +287,7 @@ For every case, Step 4 compares the distance between the midsurface nodes of dif
 after the imperfection. Two midsurfaces closer than one shell thickness overlap. Abaqus general contact
 removes such initial overclosures by moving nodes without strain, which would locally change the imposed
 imperfection. Step 4 then prints a warning and records the pairs under `cases.<model>.interpiece_clearance`.
-The screen compares node-to-node distances: exact for matching meshes, indicative otherwise. After a Step 5
+The screen compares node-to-node distances and is always indicative: tangential slip and face interiors can hide penetration even with matching meshes. Zero flagged pairs is not proof of clearance. After a Step 5
 solve, the `.msg` file lists any adjustment that was made.
 
 The local/distortional names here identify the selected imperfection components;

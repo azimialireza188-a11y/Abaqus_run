@@ -123,15 +123,22 @@ def validate_reference_state(state):
     return dict(build=build, source_inputs=source, job_name=job_name)
 
 
-def load_reference_run(run_dir, require_completed=True):
-    """Load one exact run of abaqus_complete_model_m20.py."""
+def load_reference_run(run_dir, require_completed=True, allow_built=False):
+    """Load one exact run of abaqus_complete_model_m20.py.
+
+    allow_built: also accept a run that was built but not solved (status BUILT, from
+    --build-only): its CAE/INP/build record are complete, only the .odb is missing
+    (paths['odb'] is still the recorded name, 'solved' is False). A caller must then take
+    every mode shape from another solved model (e.g. the GDLC REF_G / REF_L folders)."""
     run_dir = os.path.abspath(os.path.expanduser(run_dir))
     status_path = os.path.join(run_dir, STATUS_FILE)
     if not os.path.isfile(status_path):
         raise ValueError('Reference pipeline status not found: ' + status_path)
     state = _load_json(status_path)
     validated = validate_reference_state(state)
-    if require_completed and str(state.get('status', '')).upper() != 'COMPLETED':
+    status = str(state.get('status', '')).upper()
+    built_only = bool(allow_built) and status == 'BUILT'
+    if require_completed and status != 'COMPLETED' and not built_only:
         raise ValueError('Reference run is not COMPLETED: %s' % state.get('status'))
 
     job_name = validated['job_name']
@@ -145,10 +152,10 @@ def load_reference_run(run_dir, require_completed=True):
     recorded_odb = validated['build'].get('odb')
     if recorded_odb and os.path.basename(str(recorded_odb)).lower() != os.path.basename(paths['odb']).lower():
         raise ValueError('Recorded ODB basename is inconsistent with job_name')
-    for key in ('cae', 'odb'):
+    for key in ('cae',) if built_only else ('cae', 'odb'):
         if not os.path.isfile(paths[key]):
             raise ValueError('Reference %s file not found: %s' % (key.upper(), paths[key]))
-    if os.path.exists(os.path.splitext(paths['odb'])[0] + '.lck'):
+    if not built_only and os.path.exists(os.path.splitext(paths['odb'])[0] + '.lck'):
         raise ValueError('Reference ODB is locked; wait for the solver/writer to finish')
 
     return dict(
@@ -160,6 +167,7 @@ def load_reference_run(run_dir, require_completed=True):
         job_name=job_name,
         instances=list(REFERENCE_INSTANCES),
         paths=paths,
+        solved=not built_only,
     )
 
 
@@ -216,7 +224,10 @@ def reference_snapshot(contract, include_hashes=True):
     if include_hashes:
         snapshot['pipeline_status_sha256'] = file_sha256(contract['paths']['pipeline_status'])
         snapshot['source_cae_sha256'] = file_sha256(contract['paths']['cae'])
-        snapshot['source_odb_sha256'] = file_sha256(contract['paths']['odb'])
+        # a BUILT (unsolved) reference has no .odb: recorded as None, never hashed
+        snapshot['source_odb_sha256'] = (file_sha256(contract['paths']['odb'])
+                                         if contract.get('solved', True) else None)
+        snapshot['reference_solved'] = bool(contract.get('solved', True))
         if os.path.isfile(contract['paths']['inp']):
             snapshot['source_inp_sha256'] = file_sha256(contract['paths']['inp'])
     return snapshot
@@ -229,9 +240,13 @@ LOAD_CASE_SNAPSHOT_KEYS = (
     'plastic_modulus_mm3', 'n_loads', 'symmetry_class_axis_deg', 'stress_definition', 'eigenvalue_meaning')
 
 
-def load_case_snapshot(build):
+def load_case_snapshot(build, expected_type=None):
     """Compact load-case record carried by Step 4/5 provenance (compression when absent)."""
     load_case = reference_load_case(build)
+    if expected_type is not None and load_case['type'] != expected_type:
+        raise ValueError('--load-case %s differs from the recorded reference load case %s; '
+                         'Step4 preserves the source loading and cannot convert it' %
+                         (expected_type, load_case['type']))
     return dict((key, load_case[key]) for key in LOAD_CASE_SNAPSHOT_KEYS if key in load_case)
 
 

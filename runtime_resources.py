@@ -7,6 +7,37 @@ import ctypes
 import inspect
 import os
 import subprocess
+import warnings
+
+
+def logical_cpu_count():
+    """CPUs usable by this process, including affinity restrictions where available."""
+    if hasattr(os, 'sched_getaffinity'):
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    query = getattr(os, 'process_cpu_count', os.cpu_count)
+    return max(1, query() or 1)
+
+
+def process_workers(tasks, cpus=None):
+    """Windows limits one ProcessPoolExecutor to 61 children; this is not a CPU reserve.
+
+    Worker initializers may assign several BLAS threads to each child on larger hosts.
+    """
+    n = min(max(1, int(tasks)), max(1, int(cpus or logical_cpu_count())))
+    return min(n, 61) if os.name == 'nt' else n
+
+
+def initialise_worker(cpus):
+    """Coordinate child BLAS pools with outer process parallelism."""
+    configure_threads(cpus)
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(cpus)
+    except ImportError:
+        pass
 
 
 @dataclass
@@ -56,13 +87,13 @@ def available_memory():
 
 
 def detect_resources():
-    cpus = len(os.sched_getaffinity(0)) if hasattr(os,'sched_getaffinity') else (os.cpu_count() or 1)
+    cpus = logical_cpu_count()
     physical = cpus
     try:
         if os.name == 'nt':
-            physical = int(subprocess.check_output(['powershell','-NoProfile','-Command',
+            physical = min(cpus, int(subprocess.check_output(['powershell','-NoProfile','-Command',
                 '(Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum'],
-                text=True, timeout=10).strip())
+                text=True, timeout=10).strip()))
         elif os.path.exists('/proc/cpuinfo'):
             with open('/proc/cpuinfo') as f: sections=f.read().strip().split('\n\n')
             ids=set()
@@ -88,6 +119,39 @@ def detect_resources():
     return ResourceInventory(cpus,physical,total,available,devices)
 
 
+def cpu_request(value):
+    """argparse type of every --cpus option: 'auto' (all available) or a positive integer.
+
+    Written as '--cpus 4' (space): the Abaqus launcher rejects '--cpus=4' before the
+    script starts, so the value form must never contain an equality sign."""
+    text = str(value).strip().lower()
+    if text == 'auto':
+        return 'auto'
+    try:
+        number = int(text)
+    except ValueError:
+        number = 0
+    if number < 1:
+        import argparse
+        raise argparse.ArgumentTypeError("must be 'auto' or a positive integer, got %r" % (value,))
+    return number
+
+
+def gpu_request(value):
+    """argparse type of every --gpus option: 'auto' (all visible) or an integer >= 0."""
+    text = str(value).strip().lower()
+    if text == 'auto':
+        return 'auto'
+    try:
+        number = int(text)
+    except ValueError:
+        number = -1
+    if number < 0:
+        import argparse
+        raise argparse.ArgumentTypeError("must be 'auto' or an integer >= 0, got %r" % (value,))
+    return number
+
+
 def resolve_policy(inventory, cpu_override=None, gpu_override=None):
     cpus=inventory.logical_cpus if cpu_override in (None,'auto') else int(cpu_override)
     gpus=len(inventory.devices) if gpu_override in (None,'auto') else int(gpu_override)
@@ -99,10 +163,21 @@ def resolve_policy(inventory, cpu_override=None, gpu_override=None):
 def resolve_solver_policy(inventory, cpu_override=None, gpu_override=None):
     """Abaqus solver CPU availability can count cores rather than SMT threads.
 
-    Use every physical core by default; keep the logical CPU policy for Python
-    postprocessing. This imposes no reserve or fixed worker/memory ceiling.
+    Use every available physical core for local solver jobs by default; keep
+    the logical CPU policy for Python postprocessing. An explicit request above
+    local capacity uses all available cores rather than causing submission to
+    fail before an ODB is created. No cores or memory are reserved.
     """
-    solver_cpus = inventory.physical_cores if cpu_override in (None,'auto') else cpu_override
+    available = max(1, min(inventory.physical_cores, inventory.logical_cpus))
+    solver_cpus = available if cpu_override in (None,'auto') else int(cpu_override)
+    if solver_cpus > available:
+        message = ('Requested %d Abaqus CPUs; using all %d available local physical cores '
+                   '(%d logical CPUs remain available to Python postprocessing).' %
+                   (solver_cpus, available, inventory.logical_cpus))
+        # Abaqus/CAE noGUI does not always show Python warnings: print it as well.
+        print('WARNING: '+message, flush=True)
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+        solver_cpus = available
     return resolve_policy(inventory, solver_cpus, gpu_override)
 
 
@@ -117,7 +192,8 @@ def batch_capacity(available, bytes_per_item, fixed_bytes=0):
 
 def configure_threads(cpus):
     if cpus<1: raise ValueError('Thread count must be positive')
-    for name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
+    for name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS',
+                 'NUMEXPR_MAX_THREADS','VECLIB_MAXIMUM_THREADS','BLIS_NUM_THREADS'):
         os.environ[name]=str(cpus)
     os.environ['OMP_DYNAMIC']='FALSE'
     os.environ['MKL_DYNAMIC']='FALSE'

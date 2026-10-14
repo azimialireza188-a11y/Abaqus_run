@@ -9,6 +9,172 @@ from types import SimpleNamespace
 
 
 class QueueTests(unittest.TestCase):
+    def test_completion_combines_current_job_evidence_instead_of_short_circuiting_sta(self):
+        from pathlib import Path
+        q=self.queue()
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as d:
+            root=Path(d); name='STEP5_LG_mp_FY240'
+            (root/(name+'.sta')).write_text('RIKS increment table, no terminal footer yet')
+            (root/(name+'.log')).write_text('Abaqus JOB '+name+' COMPLETED\n')
+            self.assertTrue(q.analysis_finished(d,name))
+            (root/(name+'.log')).unlink()
+            (root/(name+'_queue_solver.log')).write_text('10/11/2026 15:00:00 Abaqus JOB '+name+' COMPLETED\n')
+            self.assertTrue(q.analysis_finished(d,name))
+            (root/(name+'_queue_solver.log')).write_text('Abaqus JOB STEP5_PERFECT_FY240 COMPLETED\nSent Terminate message to Abaqus job STEP5_PERFECT_FY240\n')
+            self.assertFalse(q.analysis_finished(d,name))
+            (root/(name+'.sta')).write_text('THE ANALYSIS HAS NOT BEEN COMPLETED')
+            (root/(name+'.log')).write_text('Abaqus JOB '+name+' COMPLETED\n')
+            self.assertFalse(q.analysis_finished(d,name)) # contradictory terminal evidence is not success
+            (root/(name+'.sta')).write_text('RIKS increment table')
+            (root/(name+'.msg')).write_text('***ERROR: Too many attempts made for this increment.\n')
+            self.assertEqual(q.completion_details(d,name)['analysis_state'],'FAILED')
+            self.assertIn('TOO MANY ATTEMPTS',q.completion_details(d,name)['completion_diagnostics'][0])
+            (root/(name+'.msg')).write_text('***ERROR: Process terminated by external request (SIGTERM or SIGINT received).\n')
+            (root/(name+'.log')).write_text('Abaqus/Analysis exited with errors\n')
+            details=q.completion_details(d,name)
+            self.assertEqual(details['analysis_state'],'TERMINATED')
+            self.assertEqual(q.outcome(dict(details,solver_exit_code=1,termination_requested=True),True),'CONTROLLED_TERMINATION')
+
+    def test_completion_failure_is_not_validated_by_exit_zero_or_a_postpeak_crossing(self):
+        q=self.queue()
+        result=dict(solver_exit_code=0,analysis_completed=False,analysis_state='FAILED',partial=False)
+        self.assertEqual(q.outcome(result,True),'SOLVER_ERROR')
+        self.assertEqual(q.outcome(dict(result,analysis_state='TERMINATED'),False),'INCOMPLETE_ANALYSIS')
+        self.assertEqual(q.outcome(dict(result,analysis_state='UNKNOWN'),False),'SOLVER_STATUS_UNKNOWN')
+        self.assertEqual(q.outcome(dict(result,analysis_state='TERMINATED',termination_requested=True),True),'CONTROLLED_TERMINATION')
+
+    def test_finished_solve_without_postpeak_is_reusable_but_not_capacity(self):
+        import csv, json
+        q = self.queue()
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as d:
+            name = 'STEP5_TEST'
+            info = dict(reference_force_N_per_end=1000.)
+            result = dict(model=name, outcome='INCOMPLETE_ANALYSIS', analysis_completed=False, criterion_reached=False,
+                          solver_exit_code=0, partial=False, force_kN=1., Pu_over_Py=.9,
+                          pm_point=dict(P_kN=1.))
+            stem = os.path.join(d, name+'_force_displacement')
+            with open(os.path.join(d, name+'.odb'), 'w') as f: f.write('synthetic ODB')
+            with open(os.path.join(d, name+'.sta'), 'w') as f:
+                f.write('THE ANALYSIS HAS COMPLETED SUCCESSFULLY')
+            with open(stem+'.csv', 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['frame', 'lpf', 'shortening_mm', 'force_kN'])
+                writer.writerows([(0,0,0,0), (1,1,1,1), (2,.92,4,.92)])
+            with open(stem+'.json', 'w') as f:
+                json.dump(dict(model=name, step='GMNIA', frames=3, partial=False), f)
+            with open(os.path.join(d, 'STEP5_queue_status.json'), 'w') as f:
+                json.dump([result], f)
+            reused, points = q.completed_curve(d, name, info)
+            self.assertTrue(q.finished_result(reused))
+            self.assertEqual(reused['outcome'],'CRITERION_NOT_REACHED')
+            self.assertEqual(reused['previous_outcome'],'INCOMPLETE_ANALYSIS')
+            self.assertFalse(reused['capacity_verified'])
+            self.assertFalse(reused['criterion_reached'])
+            self.assertNotIn('Pu_over_Py', reused)
+            self.assertIsNone(reused.get('pm_point'))
+            self.assertEqual(points[-1], (4., .92))
+            # A successful launcher exit is insufficient when the analysis did not finish.
+            with open(os.path.join(d, name+'.sta'), 'w') as f: f.write('ANALYSIS NOT COMPLETED')
+            self.assertIsNone(q.completed_curve(d, name, info))
+            with open(stem+'.json','w') as f:
+                stat=os.stat(os.path.join(d,name+'.odb'))
+                json.dump(dict(model=name,step='GMNIA',frames=3,partial=False,
+                    odb_job_status='JOB_STATUS_COMPLETED_SUCCESSFULLY',source_odb_size=stat.st_size,
+                    source_odb_mtime_ns=stat.st_mtime_ns),f)
+            with open(os.path.join(d,name+'.sta'),'w') as f: f.write('RIKS increment table')
+            self.assertIsNotNone(q.completed_curve(d,name,info)) # bound ODB diagnostic is sufficient
+            with open(os.path.join(d,name+'.sta'),'w') as f: f.write('THE ANALYSIS HAS NOT BEEN COMPLETED')
+            self.assertIsNone(q.completed_curve(d,name,info)) # explicit negative evidence still wins
+            self.assertFalse(q.finished_result(dict(result, analysis_completed=True, partial=True)))
+            self.assertFalse(q.finished_result(dict(result, analysis_completed=True, solver_exit_code=1)))
+
+    def test_queue_finished_without_crossing_warns_and_incomplete_analysis_still_fails(self):
+        import csv, json
+        q = self.queue()
+        for finished in (True, False):
+            with self.subTest(finished=finished), tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as d:
+                name = 'STEP5_TEST'
+                for suffix in ('.inp','.odb'):
+                    with open(os.path.join(d,name+suffix),'w') as f: f.write('synthetic')
+                with open(os.path.join(d,name+'.sta'),'w') as f:
+                    f.write('RIKS increment table' if finished else 'ANALYSIS ABORTED')
+                path = os.path.join(d,name+'_force_displacement.csv')
+                with open(path,'w',newline='') as f:
+                    writer=csv.writer(f);writer.writerow(['shortening_mm','force_kN','lpf'])
+                    writer.writerows([(0,0,0),(1,1,1),(4,.92,.92)])
+                summary=dict(csv=path,peak=dict(force_kN=1.,shortening_mm=1.,lpf=1.),partial=False)
+                info=dict(stage=5,settings=dict(field_frequency=1,fy=240),
+                          reference_force_N_per_end=1000.,end_area_mm2=1000./240.)
+                args=SimpleNamespace(run_dir=d,jobs=[name],cae='synthetic.cae',cpus=1,gpus=0,
+                    extract_only=True,repair_only=False,ratio=.7,stop_method='monitor')
+                def extracted(unused):
+                    if finished:
+                        with open(os.path.join(d,name+'.log'),'w') as f:
+                            f.write('Abaqus JOB '+name+' COMPLETED\n')
+                    return summary
+                with mock.patch.object(q,'metadata',return_value={name:info}), \
+                        mock.patch.object(q.resources,'detect_resources'), \
+                        mock.patch.object(q.resources,'resolve_solver_policy',return_value=SimpleNamespace(cpus=1,gpus=0)), \
+                        mock.patch.object(q.fd,'extract',side_effect=extracted), \
+                        mock.patch.object(q,'plot_png'), mock.patch.object(q,'write_comparison'), \
+                        mock.patch.object(q,'report') as report:
+                    if finished:
+                        q.run(args)
+                        self.assertTrue(any(c.args[0]=='POSTPEAK NOT VERIFIED' for c in report.call_args_list))
+                    else:
+                        with self.assertRaisesRegex(RuntimeError,'incomplete'): q.run(args)
+                with open(os.path.join(d,'STEP5_queue_status.json')) as f: result=json.load(f)[0]
+                self.assertFalse(result['capacity_verified'])
+                self.assertNotIn('Pu_over_Py',result)
+                self.assertEqual(result['force_kN'],1.)
+
+    def test_completed_curve_is_reused_without_opening_odb_and_rejects_stale_csv(self):
+        import json,csv
+        q=self.queue()
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as d:
+            name='STEP5_TEST'
+            info=dict(reference_force_N_per_end=1000.)
+            result=dict(model=name,outcome='CRITERION_REACHED',criterion_reached=True,
+                        solver_exit_code=0,partial=False,force_kN=1.)
+            stem=os.path.join(d,name+'_force_displacement')
+            with open(os.path.join(d,name+'.odb'),'w') as f:f.write('not a real ODB')
+            with open(stem+'.csv','w',newline='') as f:
+                writer=csv.DictWriter(f,fieldnames=['frame','lpf','shortening_mm','force_kN'])
+                writer.writeheader()
+                writer.writerows([dict(frame=i,lpf=y,shortening_mm=x,force_kN=y)
+                                  for i,(x,y) in enumerate([(0.,0.),(1.,1.),(.9,.6)])])
+            with open(stem+'.json','w') as f:
+                json.dump(dict(model=name,step='GMNIA',frames=3,partial=False),f)
+            with open(os.path.join(d,'STEP5_queue_status.json'),'w') as f:json.dump([result],f)
+            reused,points=q.completed_curve(d,name,info,.7)
+            self.assertEqual(reused['outcome'],'CRITERION_REACHED')
+            self.assertEqual(points,[(0.,0.),(1.,1.),(.9,.6)]) # preserve Riks path, not sorted by x
+            os.utime(os.path.join(d,name+'.odb'),(2000000000,2000000000))
+            with self.assertRaisesRegex(ValueError,'(?i)stale'):
+                q.completed_curve(d,name,info,.7)
+
+    def test_family_styles_are_paired_and_svg_legend_is_not_clipped(self):
+        q=self.queue()
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as d:
+            path=os.path.join(d,'families.svg')
+            curves=[('family_%d %s'%(i,k),[(0.,0.),(1.,2.)])
+                    for i in range(1,11) for k in ('PERFECT','LG_mp')]
+            styles=[dict(color='#%06x'%(i+1),dash='8 5' if j else '')
+                    for i in range(10) for j in range(2)]
+            q.plot_svg(path,curves,[],'Families',styles=styles)
+            import xml.etree.ElementTree as ET
+            root=ET.parse(path).getroot()
+            polys=root.findall('.//{http://www.w3.org/2000/svg}polyline')
+            self.assertEqual(len(polys),20)
+            for i in range(0,20,2):
+                self.assertEqual(polys[i].get('stroke'),polys[i+1].get('stroke'))
+                self.assertFalse(polys[i].get('stroke-dasharray'))
+                self.assertEqual(polys[i+1].get('stroke-dasharray'),'8 5')
+            self.assertGreater(float(root.get('height')),900)
+
+    def test_zero_gpu_override_replaces_stale_environment(self):
+        self.assertIn('gpus=0', self.queue().job_command('STEP5_TEST', 8, 0, 'monitor'))
+
     def test_progress_is_mirrored_to_external_log(self):
         import abaqus_step5_progress as progress
         with tempfile.TemporaryDirectory() as d:
@@ -61,6 +227,15 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(r.resolve_solver_policy(inventory,cpu_override=8).cpus,8)
         self.assertEqual(r.resolve_solver_policy(inventory).memory_reserve_bytes,0)
 
+    def test_solver_oversized_request_uses_all_available_cores(self):
+        import runtime_resources as r
+        inventory=r.ResourceInventory(8,4,16*1024**3,10*1024**3,[])
+        with self.assertWarnsRegex(RuntimeWarning, '8.*4'):
+            policy=r.resolve_solver_policy(inventory,cpu_override=8)
+        self.assertEqual(policy.cpus,4)
+        self.assertEqual(r.resolve_policy(inventory).cpus,8)
+        self.assertEqual((policy.memory_reserve_bytes,policy.gpu_reserve_bytes),(0,0))
+
     def test_zero_launcher_exit_without_odb_reports_solver_log(self):
         q=self.queue()
         with tempfile.TemporaryDirectory() as d:
@@ -105,10 +280,12 @@ class QueueTests(unittest.TestCase):
     def test_main_accepts_cae_launcher_flags_without_separator(self):
         import sys
         q=self.queue()
-        with mock.patch.object(sys,'argv',['abaqus','-cae','-noGUI',q.__file__,'--run-dir','folder','--repair-only']), mock.patch.object(q,'run') as run:
+        with mock.patch.object(sys,'argv',['abaqus','-cae','-noGUI',q.__file__,'--run-dir','folder','--repair-only',
+                '--abaqus-cmd','C:/Solver tools/abq2024.bat']), mock.patch.object(q,'run') as run:
             q.main()
         self.assertTrue(run.call_args.args[0].repair_only)
         self.assertEqual(run.call_args.args[0].run_dir,os.path.abspath('folder'))
+        self.assertEqual(run.call_args.args[0].abaqus_cmd,'C:/Solver tools/abq2024.bat')
 
     def test_absolute_nogui_script_imports_siblings_from_another_directory(self):
         import subprocess
@@ -160,9 +337,14 @@ class QueueTests(unittest.TestCase):
 
     def test_missing_solver_status_and_partial_data_do_not_validate_capacity(self):
         q = self.queue()
-        self.assertEqual(q.outcome({}, True), 'SOLVER_STATUS_UNKNOWN')
+        # a crossing inside the synchronized data is a complete result even when the exit
+        # status of an earlier session is unknown or trailing frames were dropped
+        self.assertEqual(q.outcome({}, True), 'CRITERION_REACHED')
+        self.assertEqual(q.outcome({}, False), 'SOLVER_STATUS_UNKNOWN')
         self.assertEqual(q.outcome({'analysis_completed': True}, True), 'CRITERION_REACHED')
-        self.assertEqual(q.outcome({'solver_exit_code': 0, 'partial': True}, True), 'PARTIAL_RESULT')
+        self.assertEqual(q.outcome({'solver_exit_code': 0, 'partial': True}, True), 'CRITERION_REACHED')
+        self.assertEqual(q.outcome({'solver_exit_code': 0, 'partial': True}, False), 'PARTIAL_RESULT')
+        self.assertEqual(q.outcome({'solver_exit_code': 3}, True), 'SOLVER_ERROR')
 
     def test_extract_only_preserves_a_previous_solver_failure(self):
         import csv, json
@@ -199,6 +381,20 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(result['solver_exit_code'], 1)
             self.assertEqual(result['outcome'], 'SOLVER_ERROR')
             self.assertTrue(result['criterion_reached'])
+
+    def test_queue_cpus_option_and_repair_keep_the_requested_value(self):
+        import contextlib
+        q = self.queue()
+        argv = ['abaqus', '--', '--run-dir', '.', '--cpus', '4', '--jobs', 'STEP5_D_FY240']
+        seen = {}
+        with mock.patch('sys.argv', argv), mock.patch.object(q, 'run', side_effect=lambda a: seen.update(vars(a))):
+            q.main()
+        self.assertEqual((seen['cpus'], seen['gpus']), (4, 'auto'))
+        for bad in ('0', 'x'):
+            with mock.patch('sys.argv', argv[:5]+[bad]), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                q.main()
+        self.assertEqual(q.job_command('STEP5_D_FY240', 4, 0, 'monitor')[3], 'cpus=4')
 
     def test_queue_batch_invokes_runner_instead_of_fortran(self):
         with tempfile.TemporaryDirectory() as d:
@@ -276,6 +472,25 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(commands[1],(['abaqus','terminate','job='+name], d))
             self.assertEqual(q.outcome(result,True),'CONTROLLED_TERMINATION')
 
+    def test_custom_launcher_is_used_for_submission_and_monitor_termination(self):
+        q = self.queue()
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as d:
+            name = 'STEP5_D_FY240'
+            process = mock.Mock(returncode=1)
+            process.poll.side_effect = [None, 1]
+            control = mock.Mock()
+            control.wait.return_value = 0
+            args = SimpleNamespace(run_dir=d, stop_method='monitor', ratio=.7, poll_seconds=1,
+                                   abaqus_cmd='C:/Solver tools/custom abaqus.bat')
+            records = [dict(lpf=x,half_unit=.0005) for x in (0.,1.,.65)]
+            with mock.patch.object(q,'launch',side_effect=[process,control]) as launch, \
+                    mock.patch.object(q,'read_sta_lpf',return_value=records), \
+                    mock.patch.object(q.time,'sleep'):
+                result = q.run_job(name,args,SimpleNamespace(cpus=4,gpus=0))
+            self.assertEqual(launch.call_args_list[0].args[0][0],args.abaqus_cmd)
+            self.assertEqual(launch.call_args_list[1].args[0], [args.abaqus_cmd,'terminate','job='+name])
+            self.assertTrue(result['termination_requested'])
+
     def test_monitor_retries_unflushed_odb_then_detects_crossing(self):
         q=self.queue()
         with tempfile.TemporaryDirectory() as d:
@@ -299,18 +514,57 @@ class QueueTests(unittest.TestCase):
                 os.chdir(previous)
             self.assertTrue(result['termination_requested'])
 
-    def test_failed_compile_artifacts_are_backed_up_without_moving_input(self):
+    def test_existing_solver_artifacts_are_refused_without_moving_anything(self):
         q=self.queue()
         with tempfile.TemporaryDirectory() as d:
             name='STEP5_D_FY240'
             for ext in ('.inp','.log','.dat','.msg'):
                 with open(os.path.join(d,name+ext),'w') as f:
                     f.write(ext)
-            paths=q.backup_failed_artifacts(d,name)
-            self.assertEqual(len(paths),3)
+            with self.assertRaises(ValueError):
+                q.backup_failed_artifacts(d,name)
             self.assertTrue(os.path.isfile(os.path.join(d,name+'.inp')))
-            self.assertFalse(os.path.exists(os.path.join(d,name+'.log')))
-            self.assertTrue(all(os.path.isfile(p) for p in paths))
+            self.assertTrue(os.path.exists(os.path.join(d,name+'.log')))
+            self.assertEqual(len(os.listdir(d)), 4)
+
+    def test_occupied_resume_reports_actual_failure_and_saved_status_without_writes(self):
+        import json
+        from pathlib import Path
+        q=self.queue()
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as d:
+            root=Path(d); name='STEP5_LG_mp_FY240'
+            (root/(name+'.msg')).write_text('***ERROR: Too many attempts made for this increment.\n')
+            (root/'STEP5_queue_status.json').write_text(json.dumps([
+                dict(model=name,outcome='INCOMPLETE_ANALYSIS',solver_exit_code=0,
+                     criterion_reached=False,termination_requested=False)]))
+            before={p.name:p.read_bytes() for p in root.iterdir()}
+            with self.assertRaises(ValueError) as error:
+                q.backup_failed_artifacts(d,name)
+            message=str(error.exception)
+            self.assertIn('analysis_state=FAILED',message)
+            self.assertIn('TOO MANY ATTEMPTS',message)
+            self.assertIn('saved_outcome=INCOMPLETE_ANALYSIS',message)
+            self.assertIn('solver_exit_code=0',message)
+            self.assertEqual(before,{p.name:p.read_bytes() for p in root.iterdir()})
+            (root/(name+'.msg')).write_text('Increment table only')
+            (root/'STEP5_queue_status.json').unlink()
+            with self.assertRaisesRegex(ValueError,'saved_status=missing'):
+                q.backup_failed_artifacts(d,name)
+
+    def test_submission_contract_checks_input_and_stop_ratio(self):
+        q = self.queue()
+        with tempfile.TemporaryDirectory() as d:
+            name = 'STEP5_TEST'
+            path = os.path.join(d, name+'.inp')
+            with open(path, 'w') as stream: stream.write('original input')
+            info = dict(job_name=name, input_sha256=q.contract.file_sha256(path),
+                        settings=dict(postpeak_stop_ratio=.7))
+            self.assertTrue(q.validate_submission(d, name, info, 'urdfil', .7))
+            with self.assertRaises(ValueError): q.validate_submission(d, name, info, 'urdfil', .8)
+            q.validate_submission(d, name, info, 'monitor', .8)
+            with open(path, 'w') as stream: stream.write('changed input')
+            with self.assertRaises(ValueError): q.validate_submission(d, name, info, 'monitor', .7)
+            with self.assertRaises(ValueError): q.validate_submission(d, name, {}, 'monitor', .7)
 
     def test_bending_comparison_and_pm_points(self):
         import csv

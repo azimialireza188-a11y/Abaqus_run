@@ -187,17 +187,18 @@ def _field_array(frame, field_name, index, node_count):
 
 def _bulk_block_data(block):
     precision = str(getattr(block, 'precision', 'UNKNOWN'))
-    local = getattr(block, 'localCoordSystemDouble', None)
-    if local is None:
-        local = getattr(block, 'localCoordSystem', None)
-    if local is not None:
+    # Read only the accessor matching the block precision: Abaqus raises an OdbError (not an
+    # AttributeError, so getattr's default does not apply) for the other precision.
+    accessors = {'DOUBLE_PRECISION': ('localCoordSystemDouble',),
+                 'SINGLE_PRECISION': ('localCoordSystem',)}.get(
+                     precision, ('localCoordSystemDouble', 'localCoordSystem'))
+    for accessor in accessors:
         try:
-            if np.asarray(local).size:
-                raise ValueError('Local-coordinate bulk nodal output is unsupported')
-        except (TypeError, ValueError):
-            raise
+            local = getattr(block, accessor, None)
         except Exception:
-            pass
+            local = None
+        if local is not None and np.asarray(local).size:
+            raise ValueError('Local-coordinate bulk nodal output is unsupported')
     if precision == 'DOUBLE_PRECISION' and hasattr(block, 'dataDouble'):
         data = np.asarray(block.dataDouble, dtype=np.float64)
     else:

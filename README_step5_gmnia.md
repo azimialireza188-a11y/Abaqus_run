@@ -11,6 +11,16 @@
 حل جاری (`SOLVING`)، خروج حلگر (`SOLVER EXIT`)، استخراج (`EXTRACT`)، رسم نمودار
 (`PLOT`) و مقایسه (`COMPARISON`) مشخص می‌شوند.
 
+ساخت Step5 خروجی را کیس‌به‌کیس تحویل می‌دهد: فایل‌های تنظیمات مشترک در ابتدا،
+سپس INP بررسی‌شده و فایل `<job>_step5.json` هر کیس بلافاصله پس از تکمیل آن
+در `--output-dir` قرار می‌گیرند. پیام `CASE READY i/n` تحویل هر کیس را اعلام می‌کند.
+CAE مشترک فقط یک‌بار در پایان ذخیره و تحویل می‌شود؛ سپس BAT صف ساخته و تحویل
+می‌شود. ساخت مدل، ذخیرهٔ CAE یا تحویل فایل‌ها هیچ تحلیلی را اجرا نمی‌کند.
+اگر ساخت کیس بعدی شکست بخورد، فایل‌های تکمیل‌شدهٔ قبلی در خروجی باقی می‌مانند
+و مسیر پوشهٔ موقت برای عیب‌یابی چاپ می‌شود. این تغییر قابلیت ادامهٔ خودکار ساخت
+در پوشهٔ نیمه‌کامل اضافه نمی‌کند؛ اجرای مجدد همچنان پوشهٔ جدید یا خالی می‌خواهد.
+فایل‌های نتایج و خروجی‌های قبلی بازنویسی نمی‌شوند.
+
 هنگام حل، هر ۱۵ ثانیه زمان سپری‌شده، آخرین خط فایل `.sta` (در صورت وجود)،
 و در حالت monitor آخرین LPF و نسبت بار به بیشترین بار ثبت‌شده نمایش داده می‌شود.
 این نسبت درصد پیشرفت تحلیل نیست. تا پیش از ایجاد ODB پیام `Waiting for ODB`
@@ -67,7 +77,13 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
 | `--max-increments` | 5000 |
 | `--max-end-displacement-mm` | غیرفعال (فقط با مقدار صریح فعال می‌شود) |
 | `--field-frequency` | 1؛ هر Increment |
-| `--cpus` | همهٔ CPUهای در دسترس |
+| `--cpus` | `auto` = همهٔ هسته‌های فیزیکی؛ یا یک عدد مثبت، مثلاً `--cpus 4` |
+
+`--cpus` در Jobها، در `abaqus_v6.env` و در `run_step5_queue_*.bat` تولیدشده نوشته می‌شود؛ صف آن را روی
+همان رایانه‌ای که حل را اجرا می‌کند دوباره تعیین می‌کند (درخواست بیش از تعداد هسته‌های فیزیکی، همهٔ آن‌ها را
+به‌کار می‌گیرد و هشدار می‌دهد). برای اجرای صف با تعداد دیگری، `--cpus N` را در خط `call abaqus ...` همان BAT
+عوض کنید. همهٔ گزینه‌ها به شکل `--name value` (با فاصله) نوشته می‌شوند؛ لانچر Abaqus شکل `--name=value` را
+پیش از شروع اسکریپت رد می‌کند. در یک دستور چندخطی با `^` خط خالی نگذارید.
 
 شرط جابه‌جایی مربوط به **U3 مثبت یک گره در انتهای پایین** است؛ کوتاه‌شدگی کل ستون نیست. گره پایش در Set به نام `STEP5_STOP` مشخص است. اندازهٔ مش از مرحلهٔ چهار می‌آید و اینجا تغییر نمی‌کند. طول‌قوس، زمان فیزیکی تحلیل نیست. معیارهای تعادل پیش‌فرض Abaqus ضعیف نشده‌اند و پایدارسازی مصنوعی اضافه نشده است.
 
@@ -87,7 +103,10 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
 
 وزن‌ها در `end_area_weights` توضیح Model ذخیره می‌شوند. History خروجی جابه‌جایی دو انتها و نیرو/گشتاور تمام پیچ‌ها در هر Increment موجود است؛ بنابراین نیروی پیچ‌ها در Increment بار اوج قابل بازیابی خواهد بود. کد حاضر فقط مدل می‌سازد و نمودار یا ODB تولید نمی‌کند.
 
-فایل CAE همهٔ مدل‌ها و Jobهای آماده را دارد؛ هر INP به یک Job تعلق دارد. پوشهٔ خروجی فقط CAE و INP دریافت می‌کند. فایل‌های شروع خود Abaqus مانند `abaqus.rpy` ممکن است در پوشهٔ اجرای دستور ایجاد شوند.
+فایل CAE نهایی همهٔ مدل‌ها و Jobهای آماده را دارد؛ هر INP به یک Job تعلق دارد.
+پوشهٔ خروجی INP و metadata هر کیس را به‌تدریج و CAE و BAT را در پایان دریافت می‌کند؛
+تنظیمات مشترک و فایل URDFIL نیز در آن قرار دارند. فایل‌های شروع خود Abaqus مانند
+`abaqus.rpy` ممکن است در پوشهٔ اجرای دستور ایجاد شوند.
 
 
 ## قرارداد سازگاری با pipeline مرجع
@@ -170,6 +189,69 @@ the extractor explicitly even in Abaqus execution namespaces other than
 PNG uses Matplotlib when available, with native CAE plotting as fallback.
 
 
+## Riks robustness and Dynamic Explicit
+
+Completion is checked independently of the launcher exit code and post-peak
+criterion. The queue combines this job's `.sta`, `.msg`, `.log`, captured solver
+stdout and available ODB diagnostic status. A `.sta` without a terminal footer
+does not prevent checking the other sources. Status is refreshed after locks are
+released and extraction closes the ODB. Explicit failure or incomplete-ending
+evidence overrides success; a recorded native termination with a verified crossing
+is handled separately. A terminate message for PERFECT never establishes the
+status of another imperfection job. `analysis_state`, `completion_sources` and
+`completion_diagnostics` identify the evidence in queue JSON.
+
+Resume re-evaluates legacy `INCOMPLETE_ANALYSIS`/`SOLVER_STATUS_UNKNOWN` labels
+against current terminal evidence and the saved numerical curve. Cached ODB job
+status is used only when its recorded ODB size/timestamp still match. Missing
+completion proof stays UNKNOWN; zero exit code, synchronized frames or a plausible
+curve alone do not establish successful execution. Reassessment does not fabricate
+a verified capacity, overwrite solver artifacts or submit completed jobs again.
+
+Static Riks remains the default and preserves the existing force-controlled end
+loading, imperfections, warping freedom, contacts, materials and LPF postprocessing.
+For an optional change to the nonlinear initial predictor, append to the Step5
+builder command (or the family pipeline command):
+
+```bat
+  --riks-extrapolation none ^
+```
+
+The default `linear` leaves Abaqus's original predictor unchanged. `none` suppresses
+extrapolation; it can help when the previous incremental direction is a poor guess
+after a sudden stiffness/contact change, but is not a guaranteed convergence fix.
+It adds no inertia, damping or compliance and does not relax equilibrium tolerances.
+The choice is recorded in Step5 metadata. Pipeline resume accepts legacy metadata
+as `linear` and refuses a different requested predictor for an existing build;
+changing it requires a new output directory, not altering completed analyses.
+
+`totalArcLength=1` is the Riks arc-length **scale factor**, not a stopping condition.
+Normal termination can use an LPF/displacement limit or the maximum increment count;
+the queue's observed post-peak crossing is a separate termination request. An unmet
+post-peak criterion alone therefore does not identify a convergence failure or its
+cause. Read the failed job's `.msg`/`.sta` diagnostics before changing the solver.
+
+A drop-in Dynamic Explicit switch is intentionally not implemented. This builder
+has no dynamic density/time definition, inherits Standard general contact, and
+uses dead end loads with LPF-based force/moment extraction and stop monitoring.
+Replacing only the step would not provide a valid quasi-static capacity workflow.
+In particular, a monotonically prescribed force/moment amplitude does not measure
+the descending resistance curve. Prescribing rigid end-section kinematics instead
+would alter the current warping freedom and cannot be substituted silently.
+
+A defensible Explicit alternative would require a compatible contact/connector
+formulation, consistent physical density, smooth displacement/generalized-rotation
+control that preserves the intended end freedoms, reaction-based resistance and
+stopping, and energy/rate verification. Inspect kinetic/internal, artificial and
+dissipative energies near the peak as well as force equilibrium; a low global
+kinetic/internal-energy ratio alone does not establish capacity independence from
+loading rate or mass scaling. No automatic mass scaling or damping is introduced.
+Such a conversion and its rate-sensitivity checks exceed this minimal solver-control
+change; no Explicit ultimate-capacity result is claimed.
+
+References: [Abaqus Riks settings](https://docs.software.vt.edu/abaqusv2023/English/SIMACAECAERefMap/simacae-t-simconfigureriks.htm)
+and [Abaqus buckling with general contact](https://docs.software.vt.edu/abaqusv2025/English/SIMACAEBMKRefMap/simabmk-c-sscxsec.htm).
+
 ## Perfect reference and 70% post-peak stop
 
 The Step-5 builder now includes the untouched no-imperfection reference model by
@@ -224,22 +306,30 @@ The default maximum is 5000 increments, with no displacement stop unless
 `--max-end-displacement-mm` is explicitly given. Nonconvergence and other solver
 failures remain failures; they are not converted into successful completion.
 
-## Repair an existing queue after the ifort error
+## Repair a verified queue before any solver artifacts exist
 
-Pull the latest repository. In the directory containing your existing eight
-`STEP5_*.inp` files and `Step5_GMNIA_FY240.cae`, run:
+New sidecars bind each job name to the SHA256 of the verified final INP. A
+modified input or an old sidecar without this binding cannot be submitted by
+the queue: rebuild in a new directory. Legacy `--extract-only` remains available
+for reading prior outputs. URDFIL additionally requires the builder's stop ratio
+and, when recorded, its exact subroutine hash; monitor mode may use another
+ratio. Batch commands retain full floating-point precision. Existing solver
+artifacts block a new solve and are preserved without backups. Duplicate initial
+zero LPF samples are normalized before a live common-prefix extraction. Near-zero
+P/M endpoint resultants are clamped only within section-scaled roundoff tolerance.
+
+In a newly generated directory containing verified `STEP5_*.inp` sidecars, run:
 
 ```bat
-abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue_nogui.py" -- --run-dir . --repair-only
+abaqus cae noGUI="D:\Abaqus_run\abaqus_step5_queue_nogui.py" -- --run-dir . --repair-only --cpus 4
 run_step5_queue_70_pct.bat
 ```
 
-Repair backs up the previous BAT, validates the CAE metadata and rewrites the
-queue; it does not rebuild/modify CAE or INP and does not submit jobs. The new BAT
+Repair validates the verified job metadata and rewrites the
+queue (same file name as the builder, from `--ratio`; `--cpus`/`--gpus` are written into it); it does not rebuild/modify CAE or INP and does not submit jobs. The new BAT
 references the repository runner by absolute path. Keep that repository path
 available. Existing ODBs and live locks are never overwritten/deleted by this
-runner. Residual solver files from failed compilation are moved into a unique
-per-job backup directory before submission, preserving their diagnostics. For completed/failed existing ODBs, preserve results and replot using:
+runner. Existing solver artifacts are preserved in place and submission is refused when a destination is occupied; use a new run directory/job name. No backup copies are created. For completed/failed existing ODBs, preserve results and replot using:
 
 ```bat
 abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue_nogui.py" -- --run-dir . --extract-only
@@ -280,8 +370,9 @@ with getMemoryFromAnalysis disabled, and all detected NVIDIA GPUs requested
 through documented Abaqus CLI/environment settings (not an unsupported Job
 constructor keyword). Step5 requests standard_parallel=all. Buckling retains
 standard_parallel=solver because that procedure does not support parallel
-Standard element operations. Explicit --cpus/--gpus overrides remain available
-for deliberate use; omit old --cpus 8 commands to use the automatic default.
+Standard element operations. Explicit --cpus/--gpus overrides (e.g. --cpus 4) are
+accepted by Step 5, the queue runner, the P-M modes and the Step-1..3 builder, and
+are carried into every generated BAT; --cpus auto uses all physical cores.
 No fixed RAM reserve or worker cap is imposed. The solver only uses hardware
 supported by its procedure and installed drivers; 100% utilization of every
 resource throughout a solve is not guaranteed.
@@ -336,6 +427,20 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
   --field-frequency 1 ^
   --postpeak-stop-ratio 0.70
 ```
+
+## Metadata sidecars
+
+Step 5 inherits the loading from the Step-4 provenance. Optional `--load-case bending`
+(or `compression`) asserts that recorded case and stops on a mismatch; it never converts
+one load case into the other. Bending uses opposite consistent nodal end-force distributions,
+checks the primary moment, zero net axial force and absence of a moment about the other axis,
+then scales those forces to `--reference-stress` (default `--fy`). The two residual ratios
+are recorded as `net_axial_force_relative` and `secondary_moment_relative` in the sidecar.
+
+Every Step-5 job now also gets `<job>_step5.json` next to its INP: the same JSON that is stored in the
+model description of the CAE. The queue and `abaqus_step5_force_displacement.py` read the sidecar first,
+so `--cae` is only needed for older folders without sidecars. P-M interaction jobs
+(`abaqus_pm_interaction.py --mode gmnia`, see README.md) use the same queue and have sidecars only.
 
 ## Strain hardening (optional `--stress-strain`)
 

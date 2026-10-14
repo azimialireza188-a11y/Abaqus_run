@@ -4,6 +4,21 @@ import abaqus_step5_force_displacement_core as fd
 
 
 class ForceDisplacementTests(unittest.TestCase):
+    def test_duplicate_initial_zero_is_removed_before_partial_prefix(self):
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        frames = [NS(frameValue=i, fieldOutputs={'U':object()}) for i in (0, 1, 2)]
+        odb = NS(steps={'GMNIA':NS(frames=frames)}, rootAssembly=NS(nodeSets={
+            'STEP5_BOTTOM':object(), 'STEP5_TOP':object()}))
+        info = dict(reference_force_N_per_end=1000, settings=dict(reference_stress=240),
+                    end_area_weights=[[['P1',1,1]],[['P1',2,1]]])
+        with mock.patch.object(fd, 'lpf_history', return_value=[(0,0),(0,0),(1,.4),(2,.8),(3,.9)]), \
+                mock.patch.object(fd, 'weighted_u3', return_value=0):
+            rows, meta = fd.curve_rows(odb, 'GMNIA', info, allow_partial=True)
+        self.assertEqual([r['lpf'] for r in rows], [0,.4,.8])
+        self.assertEqual(meta['duplicate_initial_zero_samples'], 1)
+        self.assertEqual(meta['dropped_history_samples'], 1)
+
     def test_end_response_rejects_local_nonfinite_and_duplicate_displacements(self):
         from types import SimpleNamespace as NS
         for method in (fd.weighted_u3, fd.coefficient_u3):
@@ -44,6 +59,7 @@ class ForceDisplacementTests(unittest.TestCase):
                 'LPF':NS(data=[(0,0),(1,1),(2,.6)])})})
             odb=NS(steps={'GMNIA':step},rootAssembly=NS(nodeSets={
                 'STEP5_BOTTOM':bottom,'STEP5_TOP':top}),close=mock.Mock())
+            odb.diagnosticData=NS(jobStatus='JOB_STATUS_COMPLETED_SUCCESSFULLY')
             db=NS(models={model:NS(description=fd.STEP5_PREFIX+json.dumps(info))},close=mock.Mock())
             opener=mock.Mock(return_value=odb)
             args=NS(cae=cae,odb=odb_path,model=None,step='GMNIA',output_dir=d,allow_partial=True)
@@ -53,6 +69,8 @@ class ForceDisplacementTests(unittest.TestCase):
                 summary=fd.extract(args)
             opener.assert_called_once_with(path=odb_path,readOnly=True)
             self.assertTrue(summary['partial'])
+            self.assertEqual(summary['odb_job_status'],'JOB_STATUS_COMPLETED_SUCCESSFULLY')
+            self.assertEqual(summary['source_odb_size'],os.stat(odb_path).st_size)
             self.assertEqual(summary['peak']['force_kN'],1)
             self.assertEqual(summary['peak']['shortening_mm'],1)
             for extension in ('csv','json','svg','png'):

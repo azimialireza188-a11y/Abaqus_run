@@ -235,8 +235,17 @@ def read_displacements(frame, lookup, count, tables=None):
                 if block.instance is None or block.instance.name not in tables:
                     continue
                 table = tables[block.instance.name]
-                for accessor in ('localCoordSystemDouble', 'localCoordSystem'):
-                    system = getattr(block, accessor, None)
+                # Only the accessor of the block's own precision is valid: Abaqus raises
+                # (not AttributeError) for the other one, which would abandon the bulk path.
+                precision = str(getattr(block, 'precision', ''))
+                accessors = {'DOUBLE_PRECISION': ('localCoordSystemDouble',),
+                             'SINGLE_PRECISION': ('localCoordSystem',)}.get(
+                                 precision, ('localCoordSystemDouble', 'localCoordSystem'))
+                for accessor in accessors:
+                    try:
+                        system = getattr(block, accessor, None)
+                    except Exception:
+                        system = None
                     if system is not None and np.size(system):
                         raise ValueError('Bulk U is not in global coordinates; inspect individual values')
                 labels = np.asarray(block.nodeLabels,dtype=int).ravel()

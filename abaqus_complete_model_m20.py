@@ -63,6 +63,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(
     globals().get('__file__', sys._getframe().f_code.co_filename)))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)  # shared modules stay importable after chdir to the run folder
+import runtime_resources  # stdlib-only: CPU/GPU policy and the --cpus/--gpus value types
 
 
 BUILTUP_DIR = r'C:\Users\810200014.HAMI.000\Documents\CUFSM-Single\cfs_abaqus\A4784_t2_qm1_0_0_0_R8_lipR20t_lipLen60_M200_L3600_gap10_nb19_end25-25_row15'
@@ -156,8 +157,9 @@ def parse_arguments(argv=None):
     parser.add_argument('--n-modes', type=int, default=N_MODES)
     parser.add_argument('--n-vectors', type=int, default=None)
     parser.add_argument('--max-iterations', type=int, default=MAX_ITERATIONS)
-    parser.add_argument('--cpus', type=int, default=None, help='Default: all physical cores available to the solver')
-    parser.add_argument('--gpus', default='auto')
+    parser.add_argument('--cpus', type=runtime_resources.cpu_request, default='auto',
+                        help="Abaqus CPUs: 'auto' (all physical cores, default) or a positive integer, written '--cpus 4'")
+    parser.add_argument('--gpus', type=runtime_resources.gpu_request, default='auto')
     parser.add_argument('--buckle-output', choices=('standard', 'detailed'), default='standard',
                         help='Legacy compatibility option. Automatic buckling now always stores classification-only nodal mode shapes; detailed no longer adds S/E/SF/SE.')
     parser.add_argument('--nodal-precision', choices=('full', 'single'), default='full',
@@ -182,7 +184,6 @@ def parse_arguments(argv=None):
     parser.add_argument('--resume-post', metavar='RUN_DIR',
                         help='Verify completed run and postprocess its ODB; never build or submit')
     args = parser.parse_args(argv)
-    import runtime_resources
     try:
         policy = runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
     except ValueError as error:
@@ -257,21 +258,48 @@ def postprocess_arguments(report):
             '--sigma-ref', str(report['reference_stress_MPa'])]
 
 
+def analysis_failure_details(odb_path):
+    """Small read-only diagnostic from the job's own files, including prelaunch errors."""
+    if not odb_path:
+        return ''
+    base = os.path.splitext(os.path.abspath(odb_path))[0]
+    details = []
+    for suffix in ('.msg', '.log', '.dat', '.sta'):
+        try:
+            with open(base+suffix, 'rb') as stream:
+                stream.seek(max(0, os.path.getsize(base+suffix)-32768))
+                lines = stream.read().decode('utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines):
+            if any(word in line.upper() for word in ('ERROR', 'ABORTED', 'TERMINATED', 'EXCEEDS')):
+                message = ' '.join(lines[i:i+2]).strip()[:600]
+                details.append(suffix+': '+message)
+                if len(details) >= 4:
+                    break
+        if len(details) >= 4:
+            break
+    return '\nSolver diagnostics: '+' | '.join(details) if details else ''
+
+
 def require_completed(job, odb_path=None):
     """Use file evidence only when the CAE job status is unavailable.
 
     Some noGUI sessions return None after waitForCompletion. Never override an
     explicit running/aborted status, or accept a locked/incomplete output.
     """
+    def fail(message):
+        raise RuntimeError(message+analysis_failure_details(odb_path))
+
     status = str(getattr(job, 'status', None)).upper()
-    if status == 'COMPLETED':
+    if status == 'COMPLETED' and not odb_path:
         return 'CAE job.status=COMPLETED'
-    if status not in ('NONE', 'UNKNOWN', '') or not odb_path:
-        raise RuntimeError('Analysis status: %s; postprocessing cancelled. Check .msg/.dat/.sta.' % status)
+    if status not in ('COMPLETED', 'NONE', 'UNKNOWN', '') or not odb_path:
+        fail('Analysis status: %s; postprocessing cancelled. Check .msg/.dat/.sta.' % status)
     base = os.path.splitext(os.path.abspath(odb_path))[0]
     if (not os.path.isfile(odb_path) or os.path.getsize(odb_path) == 0 or
             os.path.exists(base+'.lck')):
-        raise RuntimeError('Analysis status: %s; ODB missing, empty or locked: %s' % (status, odb_path))
+        fail('Analysis status: %s; ODB missing, empty or locked: %s' % (status, odb_path))
     texts = {}
     for suffix in ('.sta', '.log'):
         try:
@@ -282,14 +310,16 @@ def require_completed(job, odb_path=None):
     combined = '\n'.join(texts.values())
     if any(word in combined for word in ('ABORTED', 'TERMINATED', 'EXITED WITH ERRORS',
                                          'HAS NOT BEEN COMPLETED', 'HAS NOT COMPLETED')):
-        raise RuntimeError('Analysis output reports failure; postprocessing cancelled: '+base)
+        fail('Analysis output reports failure; postprocessing cancelled: '+base)
+    if status == 'COMPLETED':
+        return 'CAE job.status=COMPLETED; ODB present and unlocked'
     evidence = []
     if 'THE ANALYSIS HAS COMPLETED SUCCESSFULLY' in texts['.sta']:
         evidence.append('.sta')
     if ('ABAQUS JOB %s COMPLETED' % os.path.basename(base).upper()) in texts['.log']:
         evidence.append('.log')
     if not evidence:
-        raise RuntimeError('Analysis status: %s; no successful completion marker for %s' % (status, base))
+        fail('Analysis status: %s; no successful completion marker for %s' % (status, base))
     return 'Successful completion in '+', '.join(evidence)+'; ODB present and unlocked'
 
 

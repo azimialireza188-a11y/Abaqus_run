@@ -5,6 +5,49 @@ import unittest
 import abaqus_step5_gmnia as step5
 
 
+@contextlib.contextmanager
+def _incremental_builder(directory, on_prepare=None, on_queue=None, stop_method='monitor'):
+    """Exercise file delivery with tiny stand-ins; no CAE import or solver."""
+    from pathlib import Path
+    from types import SimpleNamespace as NS
+    from unittest import mock
+    import tempfile
+    real_mkdtemp = tempfile.mkdtemp
+    output = Path(directory) / 'output'
+    sources = ['STEP4_first', 'STEP4_second']
+    database = NS(models={name: NS(name=name) for name in sources}, closed=False)
+    def save_as(pathName):
+        Path(pathName).write_bytes(b'fake final CAE')
+    def close():
+        database.closed = True
+    database.saveAs, database.close = save_as, close
+    args = NS(fy=240., output_dir=str(output), cpus=2, gpus=0, cpus_requested='auto',
+              gpus_requested='auto', postpeak_stop_ratio=.7, stop_method=stop_method)
+    def copy_model(db, source, name, perfect):
+        model = NS(name=name)
+        db.models[name] = model
+        return model
+    def prepare(model, unused):
+        if on_prepare:
+            on_prepare(model, output)
+        return dict(bolts=[], reference_force_N_per_end=100., settings=dict(stop_method=stop_method))
+    def write_input(db, name, info, unused, subroutine):
+        Path(name+'.inp').write_text('*Heading\n'+name+'\n', encoding='ascii')
+    real_queue = step5.write_queue_batch
+    def queue(*a, **kw):
+        if on_queue:
+            on_queue(database, output)
+        return real_queue(*a, **kw)
+    with mock.patch.multiple(step5,
+            open_step4_database=lambda unused: (database, sources, 'perfect'),
+            copy_source_model=copy_model, prepare_model=prepare,
+            write_job_input=write_input, write_queue_batch=queue), \
+            mock.patch.object(step5.tempfile, 'mkdtemp',
+                side_effect=lambda **kw: real_mkdtemp(dir=directory, **kw)), \
+            contextlib.redirect_stdout(io.StringIO()):
+        yield args, database, output
+
+
 def _fake_bending_mesh(nz=4, length=100.):
     """Four C4 copies of a lipped corner piece, extruded along Z (fake CAE objects)."""
     import math
@@ -67,6 +110,105 @@ class _FakeModel(object):
 
 
 class Step5Tests(unittest.TestCase):
+    def test_optional_riks_extrapolation_preserves_default_and_equilibrium_controls(self):
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        base=['--source-cae','source.cae','--output-dir','out','--fy','240']
+        self.assertEqual(step5.parse_arguments(base).riks_extrapolation,'linear')
+        for mode in ('linear','none'):
+            for stop in (None, 12.):
+                with self.subTest(mode=mode,stop=stop):
+                    args=step5.parse_arguments(base+['--riks-extrapolation',mode])
+                    args.max_end_displacement_mm=stop
+                    model=NS(StaticRiksStep=mock.Mock())
+                    region=object()
+                    constants=NS(ON=True,OFF=False,NONE='NONE')
+                    with mock.patch.dict('sys.modules',{'abaqusConstants':constants}):
+                        step5.create_riks_step(model,NS(sets={'STEP5_STOP':region}),args)
+                    kw=model.StaticRiksStep.call_args.kwargs
+                    self.assertEqual(kw['totalArcLength'],1.)
+                    self.assertEqual(kw['maxNumInc'],5000)
+                    self.assertEqual(kw['minArcInc'],1e-8)
+                    self.assertEqual(kw['nodeOn'],stop is not None)
+                    self.assertNotIn('noStop',kw) # never accept unconverged increments
+                    if stop is not None:
+                        self.assertIs(kw['region'],region)
+                        self.assertEqual(kw['maximumDisplacement'],stop)
+                    if mode=='none': self.assertEqual(kw['extrapolation'],'NONE')
+                    else: self.assertNotIn('extrapolation',kw) # preserve Abaqus's existing default
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            step5.parse_arguments(base+['--riks-extrapolation','parabolic'])
+
+    def test_explicit_load_case_cannot_convert_a_compression_source_to_bending(self):
+        import json
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        base = ['--source-cae', 'source.cae', '--output-dir', 'out', '--fy', '240']
+        self.assertIsNone(step5.parse_arguments(base).load_case)
+        args = step5.parse_arguments(base+['--load-case', 'bending'])
+        reference = dict(instances=['P1','P2','P3','P4'], element_type='S4R',
+                         connection_model='BEAM_MPC', expected_links=1, rigid_links=1,
+                         load_case=dict(type='compression'))
+        model = NS(rootAssembly=NS(), description=step5.STEP4_PREFIX+json.dumps(dict(
+            specification=dict(stage=4, reference_pipeline=reference), current_case={})))
+        constants = NS(ON=True, OFF=False, UNIFORM='UNIFORM', GENERAL='GENERAL')
+        with mock.patch.dict('sys.modules', {'abaqusConstants':constants}), \
+                self.assertRaisesRegex(ValueError, 'bending.*compression'):
+            step5.prepare_model(model, args)
+
+    def test_each_verified_case_is_delivered_before_next_case_is_prepared(self):
+        import json, tempfile
+        for method in ('monitor', 'urdfil'):
+            with self.subTest(stop_method=method), tempfile.TemporaryDirectory() as directory:
+                def before_prepare(model, output):
+                    self.assertTrue((output/'abaqus_v6.env').is_file())
+                    self.assertTrue((output/step5.STOP_SUBROUTINE_NAME).is_file())
+                    self.assertFalse((output/'run_step5_queue_70_pct.bat').exists())
+                    if model.name == 'STEP5_second_FY240':
+                        name = 'STEP5_first_FY240'
+                        self.assertTrue((output/(name+'.inp')).is_file())
+                        info = json.loads((output/(name+step5.METADATA_SUFFIX)).read_text())
+                        self.assertEqual(info['input_sha256'],
+                            step5.pipeline_contract.file_sha256(str(output/(name+'.inp'))))
+                        if method == 'urdfil':
+                            self.assertEqual(info['stop_subroutine_sha256'],
+                                step5.pipeline_contract.file_sha256(str(output/step5.STOP_SUBROUTINE_NAME)))
+                with _incremental_builder(directory, on_prepare=before_prepare, stop_method=method) as (args, db, output):
+                    step5.build(args)
+                self.assertEqual(len(list(output.iterdir())), 8)
+                self.assertTrue((output/'run_step5_queue_70_pct.bat').is_file())
+                self.assertTrue((output/'Step5_GMNIA_FY240.cae').is_file())
+
+    def test_failed_later_case_preserves_delivered_cases_without_a_queue(self):
+        import os, tempfile
+        previous = os.getcwd()
+        def fail_second(model, output):
+            if model.name == 'STEP5_second_FY240':
+                raise RuntimeError('second-case failure')
+        with tempfile.TemporaryDirectory() as directory:
+            with _incremental_builder(directory, on_prepare=fail_second) as (args, db, output):
+                with self.assertRaisesRegex(RuntimeError, 'second-case failure'):
+                    step5.build(args)
+            self.assertEqual(os.getcwd(), previous)
+            self.assertTrue((output/'STEP5_first_FY240.inp').is_file())
+            self.assertTrue((output/'STEP5_first_FY240_step5.json').is_file())
+            self.assertFalse((output/'STEP5_second_FY240.inp').exists())
+            self.assertFalse((output/'run_step5_queue_70_pct.bat').exists())
+            self.assertFalse((output/'Step5_GMNIA_FY240.cae').exists())
+
+    def test_queue_is_written_only_after_final_cae_and_all_cases_are_delivered(self):
+        import tempfile
+        def before_queue(db, output):
+            self.assertTrue(db.closed)
+            self.assertTrue((output/'Step5_GMNIA_FY240.cae').is_file())
+            for case in ('first', 'second'):
+                name = 'STEP5_'+case+'_FY240'
+                self.assertTrue((output/(name+'.inp')).is_file())
+                self.assertTrue((output/(name+step5.METADATA_SUFFIX)).is_file())
+        with tempfile.TemporaryDirectory() as directory:
+            with _incremental_builder(directory, on_queue=before_queue) as (args, db, output):
+                step5.build(args)
+
     def test_compression_load_preserves_the_reference_force_in_nlgeom(self):
         """The LPF force formula requires dead loading per original edge length."""
         import json
@@ -134,6 +276,35 @@ class Step5Tests(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_cpus_space_form_reaches_jobs_env_and_queue_batch(self):
+        import os
+        import tempfile
+        from unittest import mock
+        import runtime_resources
+        base = ['--source-cae', 'source.cae', '--output-dir', 'out', '--fy', '240']
+        inventory = runtime_resources.ResourceInventory(16, 8, 1, 1, [])
+        with mock.patch.object(runtime_resources, 'detect_resources', return_value=inventory):
+            args = step5.parse_arguments(base+['--cpus', '4', '--initial-arc', '0.01', '--min-arc', '1e-8',
+                                               '--max-arc', '0.05', '--max-increments', '5000',
+                                               '--field-frequency', '1', '--postpeak-stop-ratio', '0.70'])
+            self.assertEqual((args.cpus, args.cpus_requested), (4, 4))
+            auto = step5.parse_arguments(base)
+            self.assertEqual((auto.cpus, auto.cpus_requested), (8, 'auto'))
+            for bad in ('0', 'four'):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    step5.parse_arguments(base+['--cpus', bad])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'q.bat')
+            step5.write_queue_batch(path, ['STEP5_PERFECT_FY240', 'STEP5_LDG_pp_FY240'], args.cpus_requested,
+                                    ratio=args.postpeak_stop_ratio, gpus=args.gpus_requested)
+            with open(path) as stream:
+                text = stream.read()
+            self.assertIn(' --cpus 4 --gpus auto --ratio 0.7 ', text)
+            self.assertNotRegex(text, r'--[a-z-]+=')            # the Abaqus launcher rejects --name=value
+            self.assertTrue(all(line.strip() for line in text.split('\n')[:-1]))   # no blank line inside
+            with self.assertRaises(Exception):
+                step5.write_queue_batch(path, ['STEP5_D_FY240'], 0)
+
     def test_fy_is_required_and_arc_limits_are_consistent(self):
         base = ['--source-cae', 'source.cae', '--output-dir', 'out']
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -155,6 +326,7 @@ class Step5Tests(unittest.TestCase):
             step5.parse_arguments(base+['--postpeak-stop-ratio', '0'])
 
     def test_urdfil_tracks_peak_and_stops_at_ratio(self):
+        import os, tempfile
         source = step5.render_postpeak_urdfil(0.70)
         self.assertIn('SUBROUTINE URDFIL', source)
         self.assertIn('CALL POSFIL(KSTEP,KINC,ARRAY,JRCD)', source)
@@ -164,6 +336,14 @@ class Step5Tests(unittest.TestCase):
         self.assertIn('CURRLPF.LE.RATIO*PEAKLPF', source)
         self.assertIn('LSTOP=1', source)
         self.assertIn('RATIO=0.7D0', source)
+        self.assertIn('RATIO=1D-07', step5.render_postpeak_urdfil(1e-7))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'queue.bat')
+            step5.write_queue_batch(path, ['STEP5_TEST'], ratio=.701234567, stop_method='urdfil')
+            with open(path) as stream:
+                import re
+                value = re.search(r'--ratio (\S+)', stream.read()).group(1)
+            self.assertEqual(float(value), .701234567)
 
     def test_perfect_reference_is_a_default_step5_case(self):
         with open(step5.__file__, encoding='utf-8') as stream:
@@ -296,6 +476,15 @@ class Step5Tests(unittest.TestCase):
                 self.assertAlmostEqual(force, 240.*model.loads[name].cf3, places=9)
             self.assertAlmostEqual(info['reference_moment_Nmm'], 240.*definition['I_nn_mm4']/definition['c_extreme_mm'])
             self.assertAlmostEqual(info['first_yield_moment_Nmm'], info['reference_moment_Nmm'])
+            if theta == 0.:
+                # Translating one whole piece along the neutral axis preserves axial
+                # resultant, end area and primary moment, but introduces another moment.
+                shifted = [(name, {i:(p[0]+(10. if name=='P1' else 0.),p[1],p[2])
+                                    for i,p in xyz.items()}, topology)
+                           for name,xyz,topology in pieces]
+                with self.assertRaisesRegex(ValueError, 'other axis'):
+                    step5.bending_end_loads(model, shifted, 2., 0., 100., snap,
+                                           240., len(model.loads), 240.)
             # rigid rotations beta_b (bottom) and beta_t (top) of plane end sections + axial shift
             nx, ny = definition['compression_normal']
             coords = dict(((n.instanceName, n.label), n.coordinates) for inst in instances.values() for n in inst.nodes)

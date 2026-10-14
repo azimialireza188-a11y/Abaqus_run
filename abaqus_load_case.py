@@ -25,10 +25,21 @@ BENDING (CUFSM-consistent reference stress)
   The stress is applied as CONSISTENT NODAL FORCES of the linear edge traction
   on the meshed end edges (exact for linear S4R edges, identical to a linearly
   varying shell edge traction), so the reference load is fully under control.
+
+COMBINED P-M (beam-column; abaqus_pm_interaction.py)
+  Proportional end stress along a ray of angle psi in the normalized
+  (P/P_y, M/M_y) plane, psi = 0: pure compression, psi = 90: pure bending,
+      sigma(x, y) = sigma_ref * s * (cos(psi) + sin(psi) * eta / c),
+      s = 1 / (cos(psi) + sin(psi)),
+  so the extreme compression fibre carries exactly sigma_ref (first-order
+  first yield at sigma_ref = f_y: P/P_y + M/M_y = 1 at LPF = 1), and
+      P = LPF * s cos(psi) * A * sigma_ref,  M = LPF * s sin(psi) * M_ref * sigma_ref.
+  The ratio M/P (eccentricity e = tan(psi) * M_y / P_y) is fixed by psi.
 """
 import math
 
 LOAD_CASES = ('compression', 'bending')
+COMBINED = 'combined'          # P-M interaction cases (abaqus_pm_interaction.py), never a Step-3 run
 REFERENCE_STRESS_MPA = 1.0
 
 
@@ -205,12 +216,90 @@ def compression_reference(section, thickness):
 
 
 def unit_stress(reference, x, y):
-    """sigma/sigma_ref at (x, y): 1 for compression, eta/c for bending."""
+    """sigma/sigma_ref at (x, y): 1 for compression, eta/c for bending,
+    a_P + a_M*eta/c for a combined P-M case."""
     if reference['type'] == 'compression':
         return 1.0
     nx, ny = reference['compression_normal']
     xc, yc = reference['centroid_mm']
-    return (nx * (x - xc) + ny * (y - yc)) / reference['c_extreme_mm']
+    eta = (nx * (x - xc) + ny * (y - yc)) / reference['c_extreme_mm']
+    if reference['type'] == COMBINED:
+        return reference['axial_weight'] + reference['bending_weight'] * eta
+    return eta
+
+
+def pm_token(psi_deg):
+    """P-M ray angle -> file-name token: 0 -> '00', 45 -> '45', 22.5 -> '22p5'."""
+    value = float(psi_deg)
+    whole, frac = ('%.6f' % value).split('.')
+    frac = frac.rstrip('0')
+    return '%02d' % int(whole) + ('p' + frac if frac else '')
+
+
+def combined_reference(section, thickness, theta_deg, psi_deg):
+    """Proportional P-M reference stress (see module docstring). psi in [0, 90] degrees."""
+    psi = float(psi_deg)
+    if not math.isfinite(psi) or not 0.0 <= psi <= 90.0:
+        raise ValueError('P-M ray angle psi must lie in [0, 90] degrees (0: compression, 90: bending)')
+    definition = bending_reference(section, thickness, theta_deg)
+    cp, sp = math.cos(math.radians(psi)), math.sin(math.radians(psi))
+    if psi == 0.0:
+        sp = 0.0
+    if psi == 90.0:
+        cp = 0.0
+    scale = 1.0 / (cp + sp)
+    definition.update(
+        type=COMBINED, pm_angle_deg=psi, axial_weight=scale * cp, bending_weight=scale * sp,
+        reference_axial_force_N_per_MPa=scale * cp * definition['area_mm2'],
+        reference_moment_Nmm_per_MPa=scale * sp * definition['I_nn_mm4'] / definition['c_extreme_mm'],
+        pure_bending_moment_Nmm_per_MPa=definition['I_nn_mm4'] / definition['c_extreme_mm'],
+        stress_definition=('sigma = 1 MPa * (a_P + a_M * eta / c), a_P = cos(psi)/(cos(psi)+sin(psi)), '
+                           'a_M = sin(psi)/(cos(psi)+sin(psi)); compression positive on +n; c = max |eta| '
+                           'over the CUFSM centre-line nodes'),
+        eigenvalue_meaning=('lambda = critical extreme-fibre stress of the proportional P-M pattern; '
+                            'P_cr = lambda * P_ref, M_cr = lambda * M_ref'))
+    return definition
+
+
+def plastic_interaction(section, thickness, theta_deg, points=181):
+    """Full-plastic P-M interaction of the centre-line section about the neutral-axis direction
+    theta, per MPa of yield stress: rows (d, P_N_per_MPa, M_Nmm_per_MPa) for a plastic neutral
+    axis at eta = d (compression where eta > d). Exact for the straight segments, no local
+    buckling, no residual stress; P >= 0 branch (compression side of the diagram) only."""
+    if points < 3:
+        raise ValueError('At least three plastic-interaction points are required')
+    segments = _segments(section)
+    t = float(thickness)
+    props = section_properties(segments, t)
+    xc, yc = props['centroid_mm']
+    (unused_tx, unused_ty), (nx, ny) = _direction(theta_deg)
+    pieces = []
+    for x1, y1, x2, y2 in segments:
+        pieces.append((nx * (x1 - xc) + ny * (y1 - yc), nx * (x2 - xc) + ny * (y2 - yc),
+                       math.hypot(x2 - x1, y2 - y1)))
+    d_pna = _plastic(segments, t, lambda x, y: nx * (x - xc) + ny * (y - yc))[0]
+    lo = min(min(a, b) for a, b, _ in pieces)
+    # the last point lies just below the lowest fibre: whole section in compression (squash load)
+    lo -= 1e-9 * max(1.0, max(max(abs(a), abs(b)) for a, b, _ in pieces))
+    rows = []
+    for k in range(points):
+        d = d_pna + (lo - d_pna) * k / float(points - 1)
+        axial = moment = 0.0
+        for a, b, length in pieces:
+            # split the segment at eta = d; sign +1 (compression) above, -1 below
+            if (a - d) * (b - d) >= 0.0:
+                sign = 1.0 if (a + b) / 2.0 > d else -1.0
+                axial += sign * t * length
+                moment += sign * t * length * (a + b) / 2.0
+            else:
+                f = (d - a) / (b - a)
+                parts = ((a, d, f * length), (d, b, (1.0 - f) * length))
+                for e1, e2, ln in parts:
+                    sign = 1.0 if (e1 + e2) / 2.0 > d else -1.0
+                    axial += sign * t * ln
+                    moment += sign * t * ln * (e1 + e2) / 2.0
+        rows.append((d, axial, moment))
+    return rows
 
 
 def consistent_edge_forces(coordinates, edges, thickness, reference):

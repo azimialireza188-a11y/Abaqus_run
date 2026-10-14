@@ -37,6 +37,15 @@ def valid_state(run_dir):
 
 
 class PipelineContractTests(unittest.TestCase):
+    def test_explicit_step4_load_case_asserts_the_recorded_case(self):
+        self.assertEqual(contract.load_case_snapshot({},expected_type='compression'),dict(type='compression'))
+        build=dict(load_case=dict(type='bending',neutral_axis_angle_deg=0.))
+        self.assertEqual(contract.load_case_snapshot(build,expected_type='bending')['type'],'bending')
+        with self.assertRaisesRegex(ValueError,'load.case'):
+            contract.load_case_snapshot(build,expected_type='compression')
+        with self.assertRaisesRegex(ValueError,'load.case'):
+            contract.load_case_snapshot({},expected_type='bending')
+
     def make_run(self):
         root = tempfile.mkdtemp()
         state = valid_state(root)
@@ -76,6 +85,26 @@ class PipelineContractTests(unittest.TestCase):
             json.dump(state, stream)
         with self.assertRaisesRegex(ValueError, 'not COMPLETED'):
             contract.load_reference_run(root)
+
+    def test_built_only_reference_is_accepted_only_on_request_and_without_odb(self):
+        root, state = self.make_run()
+        state['status'] = 'BUILT'
+        with open(os.path.join(root, 'pipeline_status.json'), 'w') as stream:
+            json.dump(state, stream)
+        os.remove(os.path.join(root, state['build']['job_name']+'.odb'))      # --build-only: no .odb
+        with self.assertRaisesRegex(ValueError, 'not COMPLETED: BUILT'):
+            contract.load_reference_run(root)
+        loaded = contract.load_reference_run(root, allow_built=True)
+        self.assertFalse(loaded['solved'])
+        snap = contract.reference_snapshot(loaded, include_hashes=True)
+        self.assertIsNone(snap['source_odb_sha256'])
+        self.assertFalse(snap['reference_solved'])
+        self.assertTrue(snap['source_cae_sha256'])
+        state['status'] = 'FAILED'                                             # only BUILT, never FAILED
+        with open(os.path.join(root, 'pipeline_status.json'), 'w') as stream:
+            json.dump(state, stream)
+        with self.assertRaisesRegex(ValueError, 'not COMPLETED: FAILED'):
+            contract.load_reference_run(root, allow_built=True)
 
     def test_explicit_artifact_must_belong_to_same_reference_job(self):
         root, state = self.make_run()
