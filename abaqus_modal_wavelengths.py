@@ -235,8 +235,17 @@ def read_displacements(frame, lookup, count, tables=None):
                 if block.instance is None or block.instance.name not in tables:
                     continue
                 table = tables[block.instance.name]
-                for accessor in ('localCoordSystemDouble', 'localCoordSystem'):
-                    system = getattr(block, accessor, None)
+                # Only the accessor of the block's own precision is valid: Abaqus raises
+                # (not AttributeError) for the other one, which would abandon the bulk path.
+                precision = str(getattr(block, 'precision', ''))
+                accessors = {'DOUBLE_PRECISION': ('localCoordSystemDouble',),
+                             'SINGLE_PRECISION': ('localCoordSystem',)}.get(
+                                 precision, ('localCoordSystemDouble', 'localCoordSystem'))
+                for accessor in accessors:
+                    try:
+                        system = getattr(block, accessor, None)
+                    except Exception:
+                        system = None
                     if system is not None and np.size(system):
                         raise ValueError('Bulk U is not in global coordinates; inspect individual values')
                 labels = np.asarray(block.nodeLabels,dtype=int).ravel()
@@ -346,7 +355,8 @@ def process(args):
                 warnings.append('Requested %d modes, but ODB contains only %d.' % (args.modes,available))
             frames = frames[:args.modes]
         names = args.instances or [name for name,inst in odb.rootAssembly.instances.items()
-                                   if any(shell_corners(e) for e in inst.elements)]
+                                   if not name.upper().startswith('STEEL_PLATE_')
+                                   and any(shell_corners(e) for e in inst.elements)]
         if len(names)!=4 or len(set(names))!=4 or any(name not in odb.rootAssembly.instances for name in names):
             raise ValueError('Select exactly four shell instances using --instances NAME1 NAME2 NAME3 NAME4')
         axis = 'xyz'.index(args.axis)

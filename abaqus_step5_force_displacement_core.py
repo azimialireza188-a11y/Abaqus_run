@@ -13,6 +13,11 @@ Outputs: CSV, JSON summary, PNG and a dependency-free SVG plot.
 Bending models (STEP5 metadata load_case.type == 'bending') give the moment -
 end-rotation curve instead: M = LPF*reference_moment_Nmm and the work-conjugate
 rotation theta = sum k_i*U3_i over both ends (files *_moment_rotation.*).
+Combined P-M models (abaqus_pm_interaction.py) give P = LPF*P_ref and M = LPF*M_ref
+together with delta, theta and the extreme-fibre shortening delta + theta*c,
+plotted as the first-yield utilization P/P_y + M/M_y (files *_pm_response.*).
+The metadata comes from the <model>_step5.json sidecar next to the ODB when it
+exists (always written by the current builders); --cae is then optional.
 No analysis is submitted; the CAE is closed without saving and the ODB is read-only.
 """
 import argparse
@@ -47,12 +52,47 @@ RESPONSE_AXES = dict(
                  queue_x_label='End rotation (mrad)', queue_y_short='Bending moment (kN m)',
                  capacity_label='My = %.3f kN m', combined='STEP5_all_moment_rotation_combined',
                  combined_title='STEP5 GMNIA - Combined moment-rotation curves',
-                 peak_text='Peak %.3f kN m @ %.4g mrad'))
+                 peak_text='Peak %.3f kN m @ %.4g mrad'),
+    combined=dict(kind='combined', x='extreme_fibre_shortening_mm', y='utilization', stem='_pm_response',
+                  title='Riks P-M response', response='P-M response',
+                  x_label='Extreme-fibre end shortening, delta + theta*c (mm)',
+                  y_label='First-yield utilization, P/Py + M/My (-)',
+                  queue_y_label='First-yield utilization, P/Py + M/My (-)',
+                  queue_x_label='Extreme-fibre shortening (mm)', queue_y_short='P/Py + M/My (-)',
+                  capacity_label='First yield = %.3f', combined='STEP5_all_pm_response_combined',
+                  combined_title='P-M GMNIA - Combined response curves',
+                  peak_text='Peak utilization %.4f @ %.4g mm'))
 
 
 def response_kind(info):
-    """'bending' for STEP5 models built from a bending run, else 'compression'."""
-    return 'bending' if ((info or {}).get('load_case') or {}).get('type') == 'bending' else 'compression'
+    """'bending' / 'combined' from the STEP5 metadata load case, else 'compression'."""
+    kind = ((info or {}).get('load_case') or {}).get('type')
+    return kind if kind in ('bending', 'combined') else 'compression'
+
+
+METADATA_SUFFIX = '_step5.json'
+
+
+def load_metadata(odb_path, model_name, cae=None):
+    """STEP5 metadata: the <model>_step5.json sidecar beside the ODB, else the CAE description."""
+    sidecar = os.path.join(os.path.dirname(os.path.abspath(odb_path)), model_name+METADATA_SUFFIX)
+    if os.path.isfile(sidecar):
+        with open(sidecar, encoding='utf-8') as stream:
+            info = json.load(stream)
+        if not isinstance(info, dict) or info.get('stage') != 5:
+            raise ValueError('Invalid STEP5 metadata sidecar: '+sidecar)
+        return info, sidecar
+    if not cae:
+        raise ValueError('No metadata sidecar %s and no --cae given' % sidecar)
+    import caeModules
+    database = pipeline_contract.open_working_mdb(cae)
+    try:
+        if model_name not in database.models.keys():
+            raise ValueError('STEP5 model not found in CAE: '+model_name)
+        return pipeline_contract.parse_prefixed_json(
+            database.models[model_name].description, STEP5_PREFIX), cae
+    finally:
+        database.close()
 
 
 def response_axes(info):
@@ -74,7 +114,7 @@ def parse_arguments(argv=None):
                 clean.append(argv[i]); i += 1
         argv = clean
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--cae', required=True, help='STEP5_GMNIA_FY*.cae')
+    p.add_argument('--cae', help='STEP5_GMNIA_FY*.cae; only needed when no <model>_step5.json sidecar exists')
     p.add_argument('--odb', required=True, help='Solved STEP5_*.odb')
     p.add_argument('--model', help='STEP5 model name; default is ODB basename')
     p.add_argument('--step', default='GMNIA')
@@ -82,11 +122,11 @@ def parse_arguments(argv=None):
     p.add_argument('--allow-partial', action='store_true',
                    help='Allow extraction from an in-progress ODB by using only the common complete frame/LPF prefix')
     args = p.parse_args(argv)
-    args.cae = os.path.abspath(os.path.expanduser(args.cae))
+    args.cae = os.path.abspath(os.path.expanduser(args.cae)) if args.cae else None
     args.odb = os.path.abspath(os.path.expanduser(args.odb))
     args.output_dir = os.path.abspath(os.path.expanduser(
         args.output_dir or os.path.dirname(args.odb)))
-    if not os.path.isfile(args.cae):
+    if args.cae and not os.path.isfile(args.cae):
         p.error('CAE not found: '+args.cae)
     if not os.path.isfile(args.odb):
         p.error('ODB not found: '+args.odb)
@@ -184,7 +224,10 @@ def lpf_history(step):
             key = str(output_name).strip().upper()
             description = str(getattr(output, 'description', '')).upper()
             if key == 'LPF' or 'LOAD PROPORTIONALITY FACTOR' in description:
-                data = [(float(x), float(y)) for x, y in output.data]
+                raw = output.data
+                if raw is None:
+                    continue  # Failed/in-progress increment may have an unwritten LPF repository.
+                data = [(float(x), float(y)) for x, y in raw]
                 if data:
                     matches.append((str(region_name), str(output_name), data))
     if not matches:
@@ -267,8 +310,30 @@ def curve_rows(odb, step_name, info, allow_partial=False):
     step = odb.steps[step_name]
     if not step.frames:
         raise ValueError('ODB step has no frames: '+step_name)
-    bending = response_kind(info) == 'bending'
-    if bending:
+    kind = response_kind(info)
+    bending = kind == 'bending'
+    combined = kind == 'combined'
+    if combined:
+        tables = [info.get('end_area_weights'), info.get('end_rotation_weights')]
+        if any(not isinstance(t, list) or len(t) != 2 for t in tables):
+            raise ValueError('P-M metadata lacks the end_area_weights / end_rotation_weights tables')
+        area_maps = [weight_map(t) for t in tables[0]]
+        rotation_maps = [coefficient_map(t) for t in tables[1]]
+        section = info.get('section_for_PM') or {}
+        p_ref = float(info.get('reference_axial_force_N', float('nan')))
+        m_ref = float(info.get('reference_moment_Nmm', float('nan')))
+        p_y = float(section.get('squash_load_N') or float('nan'))
+        m_y = float(section.get('first_yield_moment_Nmm') or float('nan'))
+        c_extreme = float(section.get('c_extreme_mm') or float('nan'))
+        # Summing consistent nodal forces leaves roundoff at pure-P / pure-M endpoints.
+        if abs(p_ref) <= 1e-10*abs(p_y):
+            p_ref = 0.
+        if abs(m_ref) <= 1e-10*abs(m_y):
+            m_ref = 0.
+        if (not all(math.isfinite(v) for v in (p_ref, m_ref, p_y, m_y, c_extreme)) or min(p_ref, m_ref) < 0
+                or p_ref+m_ref <= 0 or min(p_y, m_y, c_extreme) <= 0):
+            raise ValueError('Invalid P-M reference quantities in STEP5 metadata')
+    elif bending:
         weights = info.get('end_rotation_weights')
         if not isinstance(weights, list) or len(weights) != 2:
             raise ValueError('STEP5 bending metadata lacks the two end_rotation_weights tables')
@@ -286,7 +351,7 @@ def curve_rows(odb, step_name, info, allow_partial=False):
         raise ValueError('ODB lacks STEP5_BOTTOM/STEP5_TOP node sets')
     bottom = node_sets['STEP5_BOTTOM']
     top = node_sets['STEP5_TOP']
-    if not bending:
+    if not bending and not combined:
         pref = float(info['reference_force_N_per_end'])
         if not math.isfinite(pref) or pref <= 0:
             raise ValueError('Invalid reference_force_N_per_end in STEP5 metadata')
@@ -297,6 +362,11 @@ def curve_rows(odb, step_name, info, allow_partial=False):
     partial = False
     dropped_field_frames = 0
     dropped_history_samples = 0
+    duplicate_initial_zero_samples = 0
+    while (len(lpf_data) > 1 and all(abs(float(v)) <= 1e-10 for v in lpf_data[0])
+           and all(abs(float(v)) <= 1e-10 for v in lpf_data[1])):
+        lpf_data = lpf_data[1:]
+        duplicate_initial_zero_samples += 1
     initial_history_zero = bool(lpf_data and abs(lpf_data[0][0]) <= 1e-10 and abs(lpf_data[0][1]) <= 1e-10)
     available_history_slots = len(frames) if initial_history_zero else max(0,len(frames)-1)
     if allow_partial and len(lpf_data) > available_history_slots:
@@ -329,12 +399,27 @@ def curve_rows(odb, step_name, info, allow_partial=False):
     lpf_alignment['partial'] = partial
     lpf_alignment['dropped_field_frames'] = dropped_field_frames
     lpf_alignment['dropped_history_samples'] = dropped_history_samples
+    lpf_alignment['duplicate_initial_zero_samples'] = duplicate_initial_zero_samples
     rows = []
     for index, frame in enumerate(frames):
         if 'U' not in frame.fieldOutputs:
             raise ValueError('Frame %d has no U field output' % index)
         frame_value = float(frame.frameValue)
         lpf = aligned_lpf[index]
+        if combined:
+            field = frame.fieldOutputs['U']
+            u3 = [weighted_u3(field, region, area_maps[side]) for side, region in ((0, bottom), (1, top))]
+            rot = [coefficient_u3(field, region, rotation_maps[side]) for side, region in ((0, bottom), (1, top))]
+            shortening, rotation = u3[0]-u3[1], rot[0]+rot[1]
+            force_n, moment = lpf*p_ref, lpf*m_ref
+            rows.append(dict(
+                frame=index, frame_value=frame_value, lpf=lpf,
+                shortening_mm=shortening, rotation_rad=rotation, rotation_mrad=1000.0*rotation,
+                extreme_fibre_shortening_mm=shortening+rotation*c_extreme,
+                force_N=force_n, force_kN=force_n/1000.0, moment_Nmm=moment, moment_kNm=moment/1e6,
+                P_over_Py=force_n/p_y, M_over_My=moment/m_y, utilization=force_n/p_y+moment/m_y,
+                nominal_extreme_stress_MPa=lpf*reference_stress if math.isfinite(reference_stress) else None))
+            continue
         if bending:
             rot_bottom = coefficient_u3(frame.fieldOutputs['U'], bottom, bottom_weights)
             rot_top = coefficient_u3(frame.fieldOutputs['U'], top, top_weights)
@@ -363,6 +448,13 @@ def curve_rows(odb, step_name, info, allow_partial=False):
 def peak_summary(rows):
     if not rows:
         raise ValueError('No curve rows')
+    if 'utilization' in rows[0]:
+        # proportional loading: P and M peak together at the largest LPF
+        peak = max(rows, key=lambda row: row['lpf'])
+        return dict((key, peak[key]) for key in (
+            'frame', 'lpf', 'force_N', 'force_kN', 'moment_Nmm', 'moment_kNm', 'P_over_Py', 'M_over_My',
+            'utilization', 'shortening_mm', 'rotation_mrad', 'extreme_fibre_shortening_mm',
+            'nominal_extreme_stress_MPa'))
     if 'moment_Nmm' in rows[0]:
         peak = max(rows, key=lambda row: row['moment_Nmm'])
         return dict(
@@ -472,6 +564,8 @@ def write_svg(path, rows, peak, title, axes=None):
 def capacity_lines(info):
     """Reference lines in plot units: AsFy (kN) for compression, My (kN m) for bending."""
     fy = float((info.get('settings') or {}).get('fy', 0) or 0)
+    if response_kind(info) == 'combined':
+        return [1.0]
     if response_kind(info) == 'bending':
         my = float(info.get('first_yield_moment_Nmm') or 0)
         return [my/1e6] if my > 0 else []
@@ -480,25 +574,18 @@ def capacity_lines(info):
 
 
 def extract(args):
-    import caeModules
-    from abaqus import openMdb
     from odbAccess import openOdb
 
     locked_at_start = os.path.exists(os.path.splitext(args.odb)[0]+'.lck')
     if locked_at_start and not args.allow_partial:
         raise ValueError('ODB is locked; use --allow-partial for a read-only snapshot')
     model_name = args.model or os.path.splitext(os.path.basename(args.odb))[0]
-    database = openMdb(pathName=args.cae)
-    try:
-        if model_name not in database.models.keys():
-            raise ValueError('STEP5 model not found in CAE: '+model_name)
-        info = pipeline_contract.parse_prefixed_json(
-            database.models[model_name].description, STEP5_PREFIX)
-    finally:
-        database.close()
+    info, metadata_source = load_metadata(args.odb, model_name, getattr(args, 'cae', None))
 
     odb = openOdb(path=args.odb, readOnly=True)
     try:
+        diagnostic = getattr(odb, 'diagnosticData', None)
+        odb_job_status = str(getattr(diagnostic, 'jobStatus', '') or '') or None
         rows, lpf_alignment = curve_rows(odb, args.step, info, allow_partial=args.allow_partial)
     finally:
         odb.close()
@@ -513,7 +600,7 @@ def extract(args):
     json_path = os.path.join(args.output_dir, stem+'.json')
     svg_path = os.path.join(args.output_dir, stem+'.svg')
     png_path = os.path.join(args.output_dir, stem+'.png')
-    fields = list(rows[0].keys()) if axes['kind'] == 'bending' else [
+    fields = list(rows[0].keys()) if axes['kind'] in ('bending', 'combined') else [
         'frame', 'frame_value', 'lpf', 'u3_bottom_mm', 'u3_top_mm', 'shortening_mm',
         'force_N', 'force_kN', 'nominal_stress_MPa']
     with open(csv_path, 'w', newline='', encoding='utf-8-sig') as stream:
@@ -522,8 +609,11 @@ def extract(args):
         writer.writerows(rows)
 
     peak = peak_summary(rows)
+    odb_stat = os.stat(args.odb)
     summary = dict(
-        source_cae=args.cae, source_odb=args.odb, model=model_name, step=args.step,
+        odb_job_status=odb_job_status, source_odb_size=odb_stat.st_size,
+        source_odb_mtime_ns=odb_stat.st_mtime_ns,
+        source_cae=args.cae, metadata_source=metadata_source, source_odb=args.odb, model=model_name, step=args.step,
         convention=info.get('force_formula'),
         shortening_convention=info.get('shortening_formula'),
         reference_force_N_per_end=info.get('reference_force_N_per_end'),
@@ -536,6 +626,13 @@ def extract(args):
     if axes['kind'] == 'bending':
         summary.update(convention=info.get('moment_formula'), rotation_convention=info.get('rotation_formula'),
                        load_case=info.get('load_case'), bending_axis_deg=info.get('bending_axis_deg'),
+                       reference_moment_Nmm=info.get('reference_moment_Nmm'),
+                       section_for_PM=info.get('section_for_PM'))
+        summary.pop('shortening_convention'); summary.pop('reference_force_N_per_end')
+    if axes['kind'] == 'combined':
+        summary.update(convention=info.get('pm_formula'), load_case=info.get('load_case'),
+                       bending_axis_deg=info.get('bending_axis_deg'), pm_angle_deg=info.get('pm_angle_deg'),
+                       reference_axial_force_N=info.get('reference_axial_force_N'),
                        reference_moment_Nmm=info.get('reference_moment_Nmm'),
                        section_for_PM=info.get('section_for_PM'))
         summary.pop('shortening_convention'); summary.pop('reference_force_N_per_end')
@@ -559,7 +656,10 @@ def extract(args):
         print('Partial: dropped %d field frame(s) and %d history sample(s) outside the synchronized prefix' %
               (lpf_alignment.get('dropped_field_frames', 0),
                lpf_alignment.get('dropped_history_samples', 0)))
-    if axes['kind'] == 'bending':
+    if axes['kind'] == 'combined':
+        print('Peak   : P=%.6g kN, M=%.6g kN m, P/Py+M/My=%.4f (LPF %.6g)' %
+              (peak['force_kN'], peak['moment_kNm'], peak['utilization'], peak['lpf']))
+    elif axes['kind'] == 'bending':
         print('Peak   : %.6g kN m at %.6g mrad (LPF %.6g)' %
               (peak['moment_kNm'], peak['rotation_mrad'], peak['lpf']))
     else:

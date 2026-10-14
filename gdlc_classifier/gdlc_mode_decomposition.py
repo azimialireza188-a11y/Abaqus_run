@@ -13,22 +13,31 @@ Usage (Windows example)
     python gdlc_mode_decomposition.py "D:\CFS-Column"               # every run below this folder
     python gdlc_mode_decomposition.py "D:\CFS-Column\<run folder>"   # one run
     python gdlc_mode_decomposition.py <run> --selftest-only          # basis + self-test, no modes read
+    python gdlc_mode_decomposition.py <run> --stiffness never        # kinematic split only, no Abaqus matrix job
     python gdlc_mode_decomposition.py "D:\CFS-Column" --make-reference-models
         # writes <run>_REF_G (in-plane rigid sections -> pure G eigenvalue/shape) and
         # <run>_REF_L (fold virtual corners held -> local reference) Abaqus inputs next to every run
 
 Integrated pipeline (one command): for every run folder below the given paths
-  1. (--solve-reference-models) solve <run>_REF_G / _REF_L folders whose .odb is missing,
-     failed or older than the .inp (Lanczos; automatic subspace fallback if refused);
+  1. (--solve-reference-models) solve <run>_REF_G / _REF_L folders that have no completed
+     .odb (Lanczos, eigenvalues >= 0, unless model features or an Abaqus refusal require
+     subspace iteration); a failed/interrupted earlier attempt is moved, never deleted, to
+     <ref>/superseded_attempts/ first;
   2. export the CURRENT <job>.odb with abaqus_mfsm_export.py (called through
      'abaqus python', same folder as this script) unless an export whose recorded
      sha256 matches the .odb and .inp already exists (--export auto|always|never);
-  3. classify; results go to <run>/mode_decomposition_GDLC/.
+  3. (--stiffness auto, default) once per run and .inp: write <run>/stiffness_export/<job>_KE.inp
+     (the run's model data + one *MATRIX GENERATE step: raw elastic stiffness, MPC=NO, no
+     boundary condition), solve it with Abaqus, read and check the matrix (gdlc_stiffness.py);
+  4. classify; results go to <run>/mode_decomposition_GDLC/. With the stiffness, every class
+     component is also evaluated in strain energy (E_*_pct columns, mode_energy.npz).
 A run folder is a folder holding a modal export (*/modal_export.json), or a buckling
-pipeline folder: <job>.odb + <job>.inp with a *Buckle step + <job>_build.json (or
-gdlc_reference.json). Both export formats are read: npz (abaqus_mfsm_export.py:
-raw_dof_map.npz + modes_####.npz; element connectivity taken from the matching .inp,
-checked by sha256) and the legacy parquet export.
+pipeline folder: one <job>.inp with a *Buckle step + <job>_build.json (or
+gdlc_reference.json), solved (<job>.odb) or built only. --make-reference-models needs only
+the .inp (geometry from the modal export when one exists, else from the .inp itself);
+classification skips an unsolved run until its .odb exists. Both export formats are read:
+npz (abaqus_mfsm_export.py: raw_dof_map.npz + modes_####.npz; element connectivity taken
+from the matching .inp, checked by sha256) and the legacy parquet export.
 Load case: compression and bending runs (abaqus_complete_model_m20.py --load-case) are
 handled alike; the decomposition is kinematic and load independent. For bending the
 eigenvalue is the critical extreme-fibre stress, M_cr_kNm = eigenvalue * M_ref is added,
@@ -110,6 +119,21 @@ Method (what each number means)
    Both measures come from the same unique decomposition; they differ only in how
    the cross terms are allotted.
 
+4b. Strain energy (when <run>/stiffness_export exists; gdlc_stiffness.py). The kinematic
+   classes above are not changed; each class component of a mode (its in-plane field) is
+   completed to a full displacement field by MINIMUM STRAIN ENERGY with the real elastic
+   stiffness K of the shell model (axial translation and rotations free, supports and the
+   axial/rotational bolt MPC rows kept), E_fg = w_f^T S w_g. Unlike the transverse-bending
+   proxy used to build D, this includes longitudinal bending, warping, shear and the
+   composite action through the bolts (a rigid-section G field stores the real flexural /
+   torsional energy). Reported: E_<X>_pct (E_ff / sum E_gg), E_<X>_signed_pct (sum_g E_fg /
+   sum E, exactly additive), E_cross_term_pct, E_rel_* (group result, basis-invariant),
+   E_beyond_section_pct (energy of the mode v^T K v - with its own U3 and UR - not implied by
+   its in-plane field), bolt_incompatibility_pct (relative motion along the bolt axes that the
+   components carry individually; it cancels in the sum). Checks before any number is used:
+   rigid-body null space of K, every exported mode satisfies every MPC/support of the .inp,
+   K-orthogonality of modes with distinct eigenvalues.
+
 5. Reliability checks (conventions; calibrate on benchmarks):
    * O share > max_other_pct           -> flag UNRELIABLE_OTHER
    * dominant class differs between the normalised and the signed measure
@@ -127,7 +151,12 @@ Method (what each number means)
      pieces where they are bolted - near 0 when the fasteners enforce composite action.
    * RELIABLE result per mode (rel_*_pct, reliable_label, reliable_dominant): the cluster
      result when the mode belongs to a near-degenerate group, its own result otherwise.
-     All statistics (dominant mechanism, mechanism_critical_stresses) use it.
+     Cluster averages are not evidence that every member is a mixed mode. Family-share
+     bounds over the whole subspace are reported; when another family can overtake
+     the average leader, reliable_dominant is UNRESOLVED and critical-mode selection
+     excludes that assignment. The individual label and shares remain available.
+     MIXED_KINEMATICS describes simultaneous components, not proof of nonlinear
+     interaction; C always means relative rigid motion of the connected pieces.
    * split sensitivity: the decomposition is repeated with the fold-arc rotation taken from
      either side of every rounded arc (both admissible measures of a rigid arc's rotation;
      FE arcs are not exactly rigid). split_spread_pct = largest change of a reliable share,
@@ -139,8 +168,10 @@ Method (what each number means)
      classes are cross-sectional, so a G or C component at the local half-wavelength is a
      section motion that follows the local buckles, not member-level global buckling.
    * confidence per mode: low = UNRELIABLE_OTHER, AMBIGUOUS_DOMINANT, DOMINANT_UNSTABLE or
-     margin < 5 % (LOW_MARGIN); medium = margin < 20 % (MIXED), CROSS_TERM or
-     DEFINITION_SENSITIVE; high otherwise (margin = gap between the first and second
+     margin < 5 % (LOW_MARGIN); medium = margin < 20 % (MIXED), CROSS_TERM,
+     DEFINITION_SENSITIVE or ENERGY_DISAGREES (the energy dominant class - resolved, i.e. its
+     normalised and signed energy measures agree - differs from the kinematic one); high
+     otherwise (margin = gap between the first and second
      mechanism, smaller of the two measures). Thresholds are conventions. Flags and
      confidence always refer to the reliable (cluster or mode) result.
    * Built-in self-test: synthetic fields with known components must be recovered
@@ -159,7 +190,7 @@ Beregszaszi & Adany (2019) cFSM with rigid corner elements (rounded corners).
 The C class (relative rigid motion of the pieces of a built-up section) is an extension
 of the cFSM G/D split to multi-piece sections proposed in this project.
 
-Resource use: all logical CPUs for BLAS and I/O threads, all shards held in RAM,
+Resource use: available logical CPUs for useful BLAS/I/O work, live-memory chunks and temporary maps,
 optional CUDA (CuPy) for the projections, process pool for plots.
 """
 from __future__ import annotations
@@ -167,13 +198,22 @@ from __future__ import annotations
 import os
 import sys
 
+# The same stdlib-only policy configures the solver and postprocessor.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import runtime_resources as resources
+
 
 # ----------------------------------------------------------------------------
 # 0. Resource set-up (must run before numpy is imported)
 # ----------------------------------------------------------------------------
 def _requested_threads() -> int:
-    n = os.cpu_count() or 1
+    n = resources.logical_cpu_count()
     for i, a in enumerate(sys.argv):
+        if a.startswith('--threads='):
+            try:
+                n = max(1, int(a.split('=', 1)[1]))
+            except ValueError:
+                pass
         if a == "--threads" and i + 1 < len(sys.argv):
             try:
                 n = max(1, int(sys.argv[i + 1]))
@@ -195,8 +235,11 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import subprocess
 import time
+import tempfile
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -221,11 +264,16 @@ try:
 except Exception:
     pass
 
+try:                                          # package import (tests) or script folder
+    from . import gdlc_stiffness as gst
+except ImportError:
+    import gdlc_stiffness as gst
+
 CLASSES = ("G", "D", "L", "C", "O")
 CLASS_NAMES = {"G": "G global (rigid section)", "D": "D distortional (pieces' sections)",
                "L": "L local (folds fixed)", "C": "C relative rigid motion of the pieces",
                "O": "O other (extension, arc deformation)"}
-VERSION = "1.7.1"
+VERSION = "1.11.1"
 
 
 # ----------------------------------------------------------------------------
@@ -239,6 +287,8 @@ class Settings:
     max_other_pct: float = 5.0
     max_cross_pct: float = 100.0          # |cross term| above this -> CROSS_TERM flag, confidence <= medium
     max_spread_pct: float = 10.0          # split spread over corner-kinematics variants above this -> DEFINITION_SENSITIVE
+    max_energy_beyond_pct: float = 10.0  # diagnostic screening policy, not a code/standard limit
+    max_bolt_incompat_pct: float = 5.0   # diagnostic screening policy, not a connection-strength limit
     sensitivity: bool = True              # compute the split spread (2 extra projections)
     conf_low_margin_pct: float = 5.0      # margin below this -> confidence "low"
     conf_high_margin_pct: float = 20.0    # margin at/above this (and no flag) -> "high"
@@ -255,12 +305,45 @@ class Settings:
     top_modes: int = 3                    # figures: top-k modes of the dominant mechanism
     export: str = "auto"                  # auto | always | never  (ODB -> modal export)
     abaqus_cmd: str = "abaqus"
+    abaqus_cpus: int | str | None = None  # cpus= of the Abaqus solves (auto/None: physical cores)
     exporter: str | None = None           # default: abaqus_mfsm_export.py next to this script
     export_compression: str = "store"     # store (fast, larger) | zlib
+    stiffness: str = "auto"               # auto | always | required | never (elastic K export + energy split)
+    ref_g_twist: str = "auto"             # REF_G: auto | restrained | free  (section rotation about the axis)
 
 
 def log(msg: str) -> None:
     print(f"[{_dt.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _available_ram() -> int:
+    return resources.available_memory()[1]
+
+
+def _mode_array(shape):
+    """Use anonymous disk backing when a modal array does not fit live RAM.
+
+    The temporary backing file is outside the run/export folders and is owned
+    by the array; original simulation artifacts are never used as scratch.
+    """
+    nbytes = math.prod(shape) * 8
+    if nbytes <= _available_ram():
+        try:
+            return np.full(shape, np.nan, dtype=np.float64)
+        except MemoryError:
+            pass
+    backing = tempfile.TemporaryFile(prefix="gdlc_modes_")
+    backing.truncate(nbytes)
+    a = np.memmap(backing, dtype=np.float64, mode="r+", shape=shape)
+    a._backing_file = backing
+    a[:] = np.nan
+    return a
+
+
+def _process_pool(tasks):
+    workers = resources.process_workers(tasks, N_THREADS)
+    return cf.ProcessPoolExecutor(max_workers=workers, initializer=resources.initialise_worker,
+                                  initargs=(max(1, N_THREADS // workers),))
 
 
 # ----------------------------------------------------------------------------
@@ -375,17 +458,21 @@ def _is_buckle_run(run_dir: Path) -> bool:
 
 def find_runs(paths: list[str]) -> list[Path]:
     """Run folders below the given paths: folders that hold a complete modal export, and
-    buckling-pipeline folders (.odb/.inp + *_build.json or gdlc_reference.json) that can be
-    exported. Unrelated .odb files (GMNIA, single-piece studies, ...) are not picked up."""
+    buckling-pipeline folders (<job>.inp with a *Buckle step + *_build.json or
+    gdlc_reference.json), solved or not. A built but unsolved run (pipeline BUILD_ONLY: .inp,
+    no .odb yet) is a run folder too: --make-reference-models needs only its .inp, and the
+    classification skips it with a message until it is solved and exported. Unrelated .odb
+    files (GMNIA, single-piece studies, ...) and preserved earlier reference attempts
+    (superseded_attempts/) are not picked up."""
     cand = []
     for p in paths:
         p = Path(p)
-        roots = [p] + [d for d in p.rglob("*") if d.is_dir()] if p.is_dir() else []
+        roots = ([p] + [d for d in p.rglob("*") if d.is_dir()
+                        and ARCHIVE_DIR not in d.relative_to(p).parts]) if p.is_dir() else []
         for d in roots:
             if (d / "modal_export.json").is_file():
                 continue                                  # an export folder itself
-            if list_exports(d) or ((any(d.glob("*.odb")) or (d / "gdlc_reference.json").is_file())
-                                   and _is_buckle_run(d)):
+            if list_exports(d) or _is_buckle_run(d):
                 cand.append(d)
     out, seen = [], set()
     for r in cand:
@@ -427,51 +514,83 @@ def _run_cmd(cmd: list[str], cwd: Path) -> int:
     return subprocess.call(cmd, cwd=str(cwd))
 
 
+def abaqus_cpus(st: Settings) -> int:
+    """cpus= of the Abaqus solves: --cpus, else all physical cores. Abaqus/Standard counts
+    cores, not SMT threads, and refuses a larger request; ../runtime_resources.py (the
+    pipeline's policy) clamps a request above the physical cores with a warning."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import runtime_resources
+        return runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(),
+                                                       st.abaqus_cpus, 0).cpus
+    except Exception as error:                       # pipeline module absent: no clamping
+        if st.abaqus_cpus is None:
+            log(f"  cpu policy unavailable ({error}); using --threads = {N_THREADS} Abaqus cpus")
+        return int(st.abaqus_cpus or N_THREADS)
+
+
+def abaqus_resources(st: Settings) -> list[str]:
+    policy = resources.resolve_solver_policy(resources.detect_resources(), st.abaqus_cpus, "auto")
+    return [f"cpus={policy.cpus}", f"gpus={policy.gpus}", "memory=100%", "standard_parallel=all"]
+
+
+def _solve_reference_job(run_dir: Path, inp: Path, st: Settings) -> bool:
+    job = inp.stem
+    cmd = [st.abaqus_cmd, f"job={job}", f"input={inp.name}"] + abaqus_resources(st) + [
+           "ask_delete=OFF", "interactive"]
+    t0 = time.time()
+    rc = _run_cmd(cmd, run_dir)
+    ok = rc == 0 and odb_status(run_dir / f"{job}.odb") == "ok"
+    log(f"  reference model {job}: {'solved' if ok else 'SOLVE FAILED (see the .msg/.dat files)'} "
+        f"in {time.time() - t0:.0f} s")
+    return ok
+
+
 def solve_reference_model(run_dir: Path, st: Settings) -> bool:
-    """Solve a GDLC reference model (folder with gdlc_reference.json and no .odb yet)."""
+    """Solve a GDLC reference model (folder with gdlc_reference.json) unless its .odb is
+    complete. Returns True when a solve was run and completed.
+      - a running job (<job>.lck) is never touched: RuntimeError;
+      - an earlier failed, interrupted or stale attempt cannot be reused; its files are moved
+        (not deleted, not overwritten) to superseded_attempts/<time>_<reason>/ and the
+        unchanged input is solved again;
+      - if Abaqus refuses the Lanczos eigensolver, that attempt is preserved the same way,
+        the *Buckle is rewritten for subspace iteration (same number of modes, same source
+        range semantics), gdlc_reference.json records lanczos_refused, and it is solved once more."""
     if not (run_dir / "gdlc_reference.json").is_file():
         return False
     inps = sorted(run_dir.glob("*.inp"))
     if len(inps) != 1:
         log(f"  cannot solve {run_dir.name}: expected one .inp, found {len(inps)}")
         return False
-    job = inps[0].stem
+    inp = inps[0]
+    job = inp.stem
+    if (run_dir / f"{job}.lck").exists():
+        raise RuntimeError(running_job_message(run_dir, job))
     status = odb_status(run_dir / f"{job}.odb")
-    if status in ("ok", "locked"):
+    if status == "ok":
         return False
-    if status != "missing":
-        log(f"  {job}.odb is {status} - solving again")
-    cmd = [st.abaqus_cmd, f"job={job}", f"input={inps[0].name}", f"cpus={N_THREADS}",
-           "ask_delete=OFF", "interactive"]
-    t0 = time.time()
-    rc = _run_cmd(cmd, run_dir)
-    ok = rc == 0 and odb_status(run_dir / f"{job}.odb") == "ok"
-    lines = inps[0].read_text(encoding="utf-8", errors="replace").splitlines()
-    lanczos = any(l.strip().lower().startswith("*buckle") and "lanczos" in l.lower() for l in lines)
-    if not ok and lanczos:
-        # Abaqus refuses Lanczos for some model features (see lanczos_restrictions); the
-        # refusal comes at the start of the solve, so falling back costs seconds.
-        errs = []
-        for ext in (".dat", ".msg"):
-            fp = run_dir / f"{job}{ext}"
-            if fp.is_file():
-                errs += [x.strip() for x in fp.read_text(errors="replace").splitlines() if "***ERROR" in x]
-        log(f"  {job}: Lanczos solve failed ({'; '.join(errs[:3]) or 'no ***ERROR line found'}) - "
-            f"falling back to subspace iteration")
-        i = next(k for k, l in enumerate(lines) if l.strip().lower().startswith("*buckle"))
-        n_modes = int(lines[i + 1].split(",")[0])
-        min_eig = buckle_min_eigenvalue(lines)
-        inps[0].write_text("\n".join(set_buckle_solver(lines, n_modes, "subspace", min_eig)) + "\n",
-                           encoding="utf-8")
-        ref = run_dir / "gdlc_reference.json"
-        info = json.loads(ref.read_text(encoding="utf-8"))
-        info.update(eigensolver="subspace", lanczos_refused=True, lanczos_errors=errs[:5])
-        ref.write_text(json.dumps(info, indent=2), encoding="utf-8")
-        rc = _run_cmd(cmd, run_dir)
-        ok = rc == 0 and odb_status(run_dir / f"{job}.odb") == "ok"
-    log(f"  reference model {job}: {'solved' if ok else 'SOLVE FAILED (see the .msg/.dat files)'} "
-        f"in {time.time() - t0:.0f} s")
-    return ok
+    if solver_artifacts(run_dir, job):
+        archive_attempt(run_dir, job, f"unfinished_{status}")
+    ok = _solve_reference_job(run_dir, inp, st)
+    if ok:
+        return True
+    refusal = lanczos_refusal(run_dir, job)
+    text = inp.read_text(encoding="utf-8", errors="replace")
+    if refusal is None or "eigensolver=lanczos" not in text.lower().replace(" ", ""):
+        return False
+    log(f"  Abaqus refused the Lanczos eigensolver: {refusal[:300]}")
+    archive_attempt(run_dir, job, "lanczos_refused")
+    meta_path = run_dir / "gdlc_reference.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+    n_modes = int(meta.get("n_modes") or 20)
+    source_min = meta.get("source_min_eigenvalue")
+    lines = set_buckle_solver(text.splitlines(), n_modes, "subspace", source_min)
+    inp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    meta.update(eigensolver="subspace", lanczos_refused=True, lanczos_refusal=refusal[:1000],
+                min_eigenvalue=source_min, input_sha256=file_sha256(inp))
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    log(f"  {job}: *Buckle rewritten for subspace iteration; solving again")
+    return _solve_reference_job(run_dir, inp, st)
 
 
 def ensure_export(run_dir: Path, st: Settings) -> Path | None:
@@ -510,12 +629,73 @@ def ensure_export(run_dir: Path, st: Settings) -> Path | None:
     return out
 
 
+def ensure_stiffness(run_dir: Path, st: Settings) -> dict | None:
+    """Make sure the run has the raw elastic stiffness of its CURRENT .inp
+    (<run>/stiffness_export, see gdlc_stiffness.py): otherwise write the matrix-generation
+    job, run it with Abaqus, read the .mtx files and check the matrix (symmetry, rigid-body
+    null space). Reference models (gdlc_reference.json) are skipped. With --stiffness auto a
+    failure is logged and the classification continues without the energy evaluation;
+    --stiffness required stops."""
+    if st.stiffness == "never" or (run_dir / "gdlc_reference.json").is_file():
+        return None
+    try:
+        exp_dir, emeta = choose_export(run_dir, st.export_dir)
+        inp = find_inp(run_dir, emeta, st.inp)
+        if inp is None:
+            raise FileNotFoundError("no unique <job>.inp in the run folder")
+        inp_sha = file_sha256(inp)
+        if st.stiffness != "always":
+            meta = gst.stiffness_status(run_dir, inp_sha)
+            if meta:
+                return meta
+        import scipy.sparse  # noqa: F401  (needed to assemble and factorise K)
+        mesh = load_mesh(exp_dir, emeta, inp)
+        t0 = time.time()
+        recovered = gst.completed_matrix_job(run_dir, inp) if st.stiffness != 'always' else None
+        if recovered:
+            folder, job = recovered
+            log(f'  reusing completed matrix job: {folder.name}/{job} (input and node codes match)')
+        else:
+            folder, job = gst.write_matrix_job(run_dir, inp)
+            rc = _run_cmd([st.abaqus_cmd, f"job={job}", f"input={job}.inp"] + abaqus_resources(st) + [
+                           "ask_delete=OFF", "interactive"], folder)
+            if rc != 0 or not any(folder.glob(f"{job}_STIF*.mtx")):
+                raise RuntimeError(f"Abaqus matrix generation failed (exit code {rc}); see "
+                                   f"{folder / (job + '.dat')} and .msg. Contact/model data were not removed.")
+        nodes = gst.instance_nodes(inp.read_text(encoding="utf-8", errors="replace").splitlines())
+        xyz_of = {(i, int(l)): mesh.xyz[k] for k, (i, l) in enumerate(zip(mesh.instance, mesh.label))}
+        info = gst.ingest_matrix_job(folder, job, nodes, xyz_of)
+        inactive = info['matrix'].get('inactive_internal_entries_removed', 0)
+        if inactive:
+            log(f"  ignored {inactive} exactly-zero internal matrix entries at "
+                f"{info['matrix']['inactive_internal_nodes_removed']} internal nodes; no nonzero internal coupling discarded")
+        meta = dict(format_version=gst.FORMAT_VERSION, program=f"gdlc_mode_decomposition.py v{VERSION}",
+                    source_inp=inp.name, source_inp_sha256=inp_sha, job=job,
+                    created_at=_dt.datetime.now().isoformat(timespec="seconds"),
+                    solve_and_read_s=time.time() - t0, contact_removed=False, matrix_job_reused=bool(recovered),
+                    content="raw assembled elastic stiffness of the elements: MPC=NO, no boundary "
+                            "condition (applied from the .inp by the energy evaluation); base state = "
+                            "initial state of the buckling step (no initial-stress term)",
+                    **info)
+        (folder / gst.EXPORT_JSON).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        log(f"  stiffness: {info['n_dofs']} DOF, nnz {info['matrix']['nnz']}, node map: {info['node_map']}, "
+            f"rigid-body residual {max(info['rigid_body_residual']):.1e} -> {folder.name}")
+        return meta
+    except Exception as e:
+        if st.stiffness == "required":
+            raise
+        log(f"  WARNING: no elastic stiffness for {run_dir.name} ({str(e).splitlines()[0][:200]}); "
+            "the energy evaluation is skipped")
+        return None
+
+
 # ----------------------------------------------------------------------------
 # 3. Minimal Abaqus .inp reader (thickness, assembly node sets, connections)
 # ----------------------------------------------------------------------------
 @dataclass
 class InpInfo:
     thicknesses: list = field(default_factory=list)
+    plate_thicknesses: list = field(default_factory=list)
     pairs: list = field(default_factory=list)          # (kind, (instA,labelA), (instB,labelB))
     notes: list = field(default_factory=list)
     nsets: dict = field(default_factory=dict)          # assembly node sets -> [(inst,label)]
@@ -547,6 +727,8 @@ def read_inp(path: Path) -> InpInfo:
     conn_elements: dict[str, list] = {}
     elset_members: dict[str, list] = {}
     cur_elset = None
+    step_index, buckle_step = -1, None
+    bc_records = []
 
     def ref_nodes(tok: str, default_inst: str | None = None):
         tok = tok.strip()
@@ -574,14 +756,20 @@ def read_inp(path: Path) -> InpInfo:
             cur = None
             pending_section = False
             cur_elset = None
-            if kw == "assembly":
+            if kw == "step":
+                step_index += 1
+            elif kw == "buckle":
+                if buckle_step is not None:
+                    raise ValueError("multiple buckling steps require an explicit step selection")
+                buckle_step = step_index
+            elif kw == "assembly":
                 in_assembly = True
             elif kw == "end assembly":
                 in_assembly = False
             elif kw == "shell section":
                 if "composite" in prm:
                     raise ValueError("GDLC requires a homogeneous shell section, not a composite layup")
-                pending_section = True
+                pending_section = 'plate' if str(prm.get('material', '')).upper() == 'STEELPLATE' else 'wall'
             elif kw == "nset" and in_assembly:
                 name = str(prm.get("nset")).upper()
                 nsets.setdefault(name, [])
@@ -594,7 +782,7 @@ def read_inp(path: Path) -> InpInfo:
             elif kw == "mpc":
                 cur = ("mpc",)
             elif kw == "boundary":
-                cur = ("bc",)
+                cur = ("bc", step_index, prm)
             elif kw == "element" and in_assembly and str(prm.get("type", "")).upper().startswith("CONN"):
                 cur = ("conn", prm.get("elset"))
             elif kw == "connector section":
@@ -603,9 +791,10 @@ def read_inp(path: Path) -> InpInfo:
             continue
         if pending_section:
             try:
-                info.thicknesses.append(float(line.split(",")[0]))
+                values = info.plate_thicknesses if pending_section == 'plate' else info.thicknesses
+                values.append(float(line.split(",")[0]))
             except ValueError:
-                pass
+                raise ValueError('Invalid homogeneous shell thickness')
             pending_section = False
             continue
         if cur is None:
@@ -648,7 +837,7 @@ def read_inp(path: Path) -> InpInfo:
                     if t1 not in types:
                         raise ValueError(f"Unsupported boundary type {t1}")
                     dofs = types[t1]
-                info.boundaries.append((nodes, dofs))
+                bc_records.append((cur[1], cur[2], (nodes, dofs)))
         elif cur[0] == "conn":
             if len(toks) >= 3:
                 na, nb = ref_nodes(toks[1]), ref_nodes(toks[2])
@@ -666,7 +855,26 @@ def read_inp(path: Path) -> InpInfo:
     if info.thicknesses and (not np.all(np.isfinite(info.thicknesses)) or min(info.thicknesses) <= 0
                             or not np.allclose(info.thicknesses, info.thicknesses[0], rtol=1e-8, atol=0)):
         raise ValueError("GDLC currently requires uniform positive finite shell thickness")
+    if info.plate_thicknesses and (not np.all(np.isfinite(info.plate_thicknesses)) or min(info.plate_thicknesses) <= 0):
+        raise ValueError('GDLC requires positive finite steel plate thickness')
     info.nsets = nsets
+    if buckle_step is None:
+        info.boundaries = [bc for _, _, bc in bc_records]
+    else:
+        # LOAD CASE=1 defines the perturbation stress problem; LOAD CASE=2
+        # defines the eigenvector constraints. OP=NEW applies to the whole
+        # step/load case, not independently to each repeated *Boundary block.
+        active = []
+        for stage in sorted({s for s, _, _ in bc_records if s <= buckle_step}):
+            has_case_two = any(s == stage and str(p.get("load case", "1")) == "2"
+                               for s, p, _ in bc_records)
+            selected = [(p, bc) for s, p, bc in bc_records if s == stage
+                        and (stage != buckle_step or not has_case_two
+                             or str(p.get("load case", "1")) == "2")]
+            if any(str(p.get("op", "MOD")).upper() == "NEW" for p, _ in selected):
+                active = []
+            active.extend(bc for _, bc in selected)
+        info.boundaries = active
     return info
 
 
@@ -688,6 +896,7 @@ class Mesh:
     ring_of: np.ndarray          # (N,) ring id
     ring_z: np.ndarray           # (R,)
     size: float
+    geometry: dict = field(default_factory=dict)
 
 
 def _read_parquet(path: Path):
@@ -739,17 +948,48 @@ def inp_shell_elements(inp_path: Path) -> list:
     return out
 
 
-def load_mesh(exp_dir: Path, meta: dict | None = None, inp_path: Path | None = None) -> Mesh:
-    meta = meta or json.loads((exp_dir / "modal_export.json").read_text(encoding="utf-8"))
-    if export_format(meta) == "npz":
-        d = np.load(exp_dir / "raw_dof_map.npz", allow_pickle=False)
-        inst = np.char.upper(d["node_instances"].astype(str))
-        lab = d["node_labels"].astype(np.int64)
-        xyz = d["node_coordinates"].astype(np.float64)
+def inp_assembly_nodes(inp_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(INSTANCE, label, xyz) of every part-instance node of the .inp in assembly coordinates
+    (instance translation and rotation applied). Read with the exporter's own INP reader
+    (abaqus_mfsm_export.read_input, next to this script), so the node order, the transforms
+    and the instance names are exactly those an npz export of the solved run carries."""
+    import importlib.util
+    src = Path(__file__).resolve().parent / "abaqus_mfsm_export.py"
+    spec = importlib.util.spec_from_file_location("abaqus_mfsm_export", src)
+    if spec is None or not src.is_file():
+        raise FileNotFoundError(f"INP reader not found: {src}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    nodes = mod.read_input(inp_path)["nodes"]
+    inst = np.char.upper(np.array([k[0] for k in nodes], dtype=str))
+    lab = np.array([k[1] for k in nodes], dtype=np.int64)
+    xyz = np.array([nodes[k] for k in nodes], dtype=np.float64).reshape(-1, 3)
+    return inst, lab, xyz
+
+
+def load_mesh(exp_dir: Path | None, meta: dict | None = None, inp_path: Path | None = None) -> Mesh:
+    """Preserve export node order; use matching INP geometry at its original precision.
+
+    Without an INP (legacy parquet only), retain exported geometry and its validation
+    requirements. With no export, read the built model's INP directly.
+    """
+    geometry = dict(source='inp' if exp_dir is None else 'modal_export')
+    if exp_dir is not None:
+        meta = meta or json.loads((exp_dir / "modal_export.json").read_text(encoding="utf-8"))
+    if exp_dir is None or export_format(meta) == "npz":     # .inp elements, as for an npz export
+        if inp_path is None:
+            raise RuntimeError("an npz export or a mesh without export needs the run's .inp "
+                               "for the element connectivity")
+        if exp_dir is None:
+            inst, lab, xyz = inp_assembly_nodes(inp_path)
+        else:
+            with np.load(exp_dir / "raw_dof_map.npz", allow_pickle=False) as d:
+                inst = np.char.upper(d["node_instances"].astype(str))
+                lab = d["node_labels"].astype(np.int64)
+                xyz = d["node_coordinates"].astype(np.float64)
+            xyz, geometry = verified_input_coordinates(inst, lab, xyz, inp_path)
         idx = np.arange(len(lab), dtype=np.int64)
         key = {(i, int(l)): k for k, (i, l) in enumerate(zip(inst, lab))}
-        if inp_path is None:
-            raise RuntimeError("an npz export needs the run's .inp for the element connectivity")
         els = inp_shell_elements(inp_path)
         try:
             E = np.array([[key[(i, n)] for n in conn] for i, _, conn in els], dtype=np.int64)
@@ -770,6 +1010,8 @@ def load_mesh(exp_dir: Path, meta: dict | None = None, inp_path: Path | None = N
         for j, c in enumerate(cols):
             lab_c = el[c].to_numpy()
             E[:, j] = [key[(a, int(b))] for a, b in zip(einst, lab_c)]
+        if inp_path is not None:
+            xyz, geometry = verified_input_coordinates(inst, lab, xyz, inp_path)
     # member axis = direction most orthogonal to every shell normal
     P = xyz[E[:, :4]] if E.shape[1] >= 4 else xyz[E]
     nrm = np.cross(P[:, 2] - P[:, 0], P[:, 3 if P.shape[1] > 3 else 1] - P[:, 1])
@@ -794,14 +1036,17 @@ def load_mesh(exp_dir: Path, meta: dict | None = None, inp_path: Path | None = N
     p = np.c_[xyz @ e1, xyz @ e2]
     size = float(max(np.ptp(p[:, 0]), np.ptp(p[:, 1]), np.ptp(s)))
     tol = 1e-6 * size
-    order = np.argsort(s)
+    member_rows = np.nonzero(~np.char.startswith(inst.astype(str), 'STEEL_PLATE_'))[0]
+    if not len(member_rows):
+        raise ValueError('No longitudinal member nodes remain after excluding transverse steel plates')
+    order = member_rows[np.argsort(s[member_rows])]
     ss = s[order]
     brk = np.r_[True, np.diff(ss) > tol]
     rid_sorted = np.cumsum(brk) - 1
-    ring_of = np.empty_like(rid_sorted)
+    ring_of = np.full(len(s), -1, dtype=rid_sorted.dtype)
     ring_of[order] = rid_sorted
     ring_z = np.array([ss[rid_sorted == r].mean() for r in range(rid_sorted[-1] + 1)])
-    return Mesh(idx, inst, lab, xyz, E, axis, e1, e2, s, p, ring_of, ring_z, size)
+    return Mesh(idx, inst, lab, xyz, E, axis, e1, e2, s, p, ring_of, ring_z, size, geometry)
 
 
 @dataclass
@@ -827,7 +1072,8 @@ class RingGeom:
 
 def build_ring_groups(mesh: Mesh) -> list[RingGeom]:
     R = len(mesh.ring_z)
-    E = mesh.elems[:, :4]
+    member = ~np.char.startswith(mesh.instance.astype(str), 'STEEL_PLATE_')
+    E = mesh.elems[np.all(member[mesh.elems[:, :4]], axis=1), :4]
     # in-ring edges
     ed = np.vstack([E[:, [0, 1]], E[:, [1, 2]], E[:, [2, 3]], E[:, [3, 0]]])
     ed = ed[mesh.ring_of[ed[:, 0]] == mesh.ring_of[ed[:, 1]]]
@@ -841,7 +1087,9 @@ def build_ring_groups(mesh: Mesh) -> list[RingGeom]:
     tol = 1e-6 * mesh.size
     groups: dict = {}
     for r in range(R):
-        rows = np.nonzero(mesh.ring_of == r)[0]
+        rows = np.nonzero((mesh.ring_of == r) & member)[0]
+        if not len(rows):
+            continue
         q = np.round(mesh.p[rows] / tol).astype(np.int64)
         ic = np.array([inst_codes[mesh.instance[i]] for i in rows])
         o = np.lexsort((q[:, 1], q[:, 0], ic))
@@ -952,6 +1200,21 @@ def detect_reference_points(g: RingGeom, t: float, st: Settings) -> None:
     g.ambiguous = [dict(node=int(i), R=float(Rloc[i]), R_fold=Rf) for i in np.nonzero(band)[0]]
 
 
+def member_seam_pairs(pairs):
+    """Physical member seams for diagnostics; do not alter exact MPC/energy pairs."""
+    out, through_plate = [], {}
+    for kind, a, b in pairs:
+        if a[0].upper().startswith('STEEL_PLATE_') and not b[0].upper().startswith('STEEL_PLATE_'):
+            through_plate.setdefault(a, []).append((kind, b))
+        else:
+            out.append((kind, a, b))
+    for root, ends in through_plate.items():
+        if len(ends) != 2 or ends[0][0] != ends[1][0]:
+            raise ValueError('Expected two same-kind bolt segments per steel plate bolt node')
+        out.append((ends[0][0], ends[0][1], ends[1][1]))
+    return out
+
+
 def attach_seams(g: RingGeom, mesh: Mesh, inp: InpInfo | None) -> None:
     g.seams = []
     if inp is None or not inp.pairs:
@@ -959,7 +1222,7 @@ def attach_seams(g: RingGeom, mesh: Mesh, inp: InpInfo | None) -> None:
     key = {(i, int(l)): k for k, (i, l) in enumerate(zip(mesh.instance, mesh.label))}
     tol_match = 1e-3 * mesh.size
     seen = {}
-    for kind, a, b in inp.pairs:
+    for kind, a, b in member_seam_pairs(inp.pairs):
         ka, kb = key.get((a[0], a[1])), key.get((b[0], b[1]))
         if ka is None or kb is None:
             continue
@@ -968,6 +1231,13 @@ def attach_seams(g: RingGeom, mesh: Mesh, inp: InpInfo | None) -> None:
         ib = np.nonzero((g.inst == b[0]) & (np.linalg.norm(g.p - pb_, axis=1) < tol_match))[0]
         if len(ia) != 1 or len(ib) != 1:
             continue
+        # Split plate bolts can list the physical ends in the reverse order of
+        # direct bolts. A diagnostic seam is unordered; retain one orientation
+        # consistently without changing the exact MPC pairs used by mechanics.
+        if int(ia[0]) > int(ib[0]):
+            ia, ib = ib, ia
+            a, b = b, a
+            ka, kb = kb, ka
         k = (int(ia[0]), int(ib[0]))
         if k in seen:
             seen[k]["n_links"] += 1
@@ -1274,8 +1544,17 @@ def build_basis(g: RingGeom) -> dict:
     T = np.hstack([G, D, L, C, O])
     if T.shape[1] != n2:
         raise RuntimeError(f"class spaces do not span the slice space: {T.shape[1]} != {n2}")
-    cond = float(np.linalg.cond(np.sqrt(w2)[:, None] * T))
-    Tinv = np.linalg.inv(T)
+    # Equilibrate columns in the physical W metric, then solve for the dual via QR.
+    # This changes neither the class spaces nor the oblique split. No singular
+    # direction is dropped/regularised; an unstable split must still fail self_test.
+    sq = np.sqrt(w2)
+    norms = np.linalg.norm(sq[:,None]*T, axis=0)
+    if not np.all(np.isfinite(norms)) or np.any(norms <= 0):
+        raise RuntimeError('Nonfinite/zero class basis column; check slice geometry')
+    T = T/norms
+    qt, rt = np.linalg.qr(sq[:,None]*T)
+    cond = float(np.linalg.cond(rt))
+    Tinv = np.linalg.solve(rt, qt.T*sq[None,:])
     sizes = dict(G=G.shape[1], D=D.shape[1], L=L.shape[1], C=C.shape[1], O=O.shape[1])
     proj, i0 = {}, 0
     for k in CLASSES:
@@ -1289,7 +1568,10 @@ def build_basis(g: RingGeom) -> dict:
     return g.basis
 
 
-def self_test(g: RingGeom, rng=np.random.default_rng(12345)) -> dict:
+def self_test(g: RingGeom, rng=None) -> dict:
+    # A private generator makes this diagnostic reproducible across runs and threads.
+    if rng is None:
+        rng = np.random.default_rng(12345)
     T, w2 = g.basis["T"], g.basis["w2"]
     sizes = g.basis["sizes"]
     worst = 0.0
@@ -1304,21 +1586,27 @@ def self_test(g: RingGeom, rng=np.random.default_rng(12345)) -> dict:
         for k in CLASSES:
             got = g.proj[k] @ phi
             err = np.sqrt((w2 * (got - parts[k]) ** 2).sum() / max((w2 * phi ** 2).sum(), 1e-300))
-            worst = max(worst, float(err))
+            worst = max(worst, float(err) if np.isfinite(err) else float('inf'))
     # pure rigid translation must be 100 % G
     rig = np.zeros(T.shape[0]); rig[0::2] = 1.0
     gshare = float((w2 * (g.proj["G"] @ rig) ** 2).sum() / (w2 * rig ** 2).sum())
-    # pure fold-fixed bending must be 100 % L (take a random L field)
-    ok = worst < 1e-8 and abs(gshare - 1) < 1e-10
-    return dict(max_rel_error=worst, rigid_translation_G_share=gshare, passed=bool(ok))
+    # Check both translations and rigid rotation, not just one scalar energy share.
+    rigid = _rigid_fields(g, np.arange(g.n))
+    rigid_error = np.sqrt(np.sum(w2[:,None]*(g.proj['G']@rigid-rigid)**2, axis=0)
+                          / np.maximum(np.sum(w2[:,None]*rigid**2, axis=0), 1e-300))
+    rigid_max = float(np.max(rigid_error))
+    ok = worst < 1e-8 and abs(gshare - 1) < 1e-10 and rigid_max < 1e-8
+    return dict(max_rel_error=worst, rigid_translation_G_share=gshare,
+                rigid_motion_max_rel_error=rigid_max, basis_condition_number=g.basis['cond'], passed=bool(ok))
 
 
 # ----------------------------------------------------------------------------
 # 8. Mode loading (all shards in RAM, parallel threads)
 # ----------------------------------------------------------------------------
-def _load_modes_npz(exp_dir: Path, meta: dict, mesh: Mesh, st: Settings):
+def _load_modes_npz(exp_dir: Path, meta: dict, mesh: Mesh, st: Settings, rotations: bool = False):
     """abaqus_mfsm_export.py shards: vectors (raw DOF x modes), node-major
-    [U1 U2 U3 UR1 UR2 UR3] in the node order of raw_dof_map.npz (verified, not assumed)."""
+    [U1 U2 U3 UR1 UR2 UR3] in the node order of raw_dof_map.npz (verified, not assumed).
+    rotations=True also returns UR (None when the export has no rotations)."""
     order = [int(m["mode"]) for m in meta["modes"]]
     want = order[:st.max_modes] if st.max_modes else order
     mps = int(meta.get("modes_per_shard") or 0)
@@ -1338,6 +1626,7 @@ def _load_modes_npz(exp_dir: Path, meta: dict, mesh: Mesh, st: Settings):
         key = {(i, int(l)): k for k, (i, l) in enumerate(zip(mesh.instance, mesh.label))}
         rnode = np.array([key[(i, int(l))] for i, l in zip(r_inst, r_lab)])
         sel = r_dof <= 3
+        selr = r_dof >= 4
     pos = {m: k for k, m in enumerate(want)}
     if len(set(order)) != len(order):
         raise ValueError("Duplicate mode IDs in export metadata")
@@ -1349,7 +1638,10 @@ def _load_modes_npz(exp_dir: Path, meta: dict, mesh: Mesh, st: Settings):
     required = {(str(i), int(l), d) for i, l in zip(mesh.instance, mesh.label) for d in (1, 2, 3)}
     if not required.issubset(set(raw_keys)):
         raise ValueError("Incomplete raw translation DOF map")
-    U = np.full((len(want), N, 3), np.nan, dtype=np.float64)
+    U = _mode_array((len(want), N, 3))
+    have_rot = rotations and {(str(i), int(l), d) for i, l in zip(mesh.instance, mesh.label)
+                              for d in (4, 5, 6)}.issubset(set(raw_keys))
+    UR = _mode_array((len(want), N, 3)) if have_rot else None
 
     def _one(name):
         z = np.load(exp_dir / name, allow_pickle=False)
@@ -1362,25 +1654,35 @@ def _load_modes_npz(exp_dir: Path, meta: dict, mesh: Mesh, st: Settings):
                 continue
             if node_major:
                 U[pos[m]] = vec[:, j].reshape(N, 6)[:, :3]
+                if have_rot:
+                    UR[pos[m]] = vec[:, j].reshape(N, 6)[:, 3:]
             else:
                 U[pos[m], rnode[sel], r_dof[sel] - 1] = vec[sel, j]
+                if have_rot:
+                    UR[pos[m], rnode[selr], r_dof[selr] - 4] = vec[selr, j]
         return ms
 
     t0 = time.time()
-    with cf.ThreadPoolExecutor(max_workers=max(N_THREADS, 1)) as ex:
+    shard_bytes = max(1, len(r_dof) * max(1, mps or len(want)) * 8)
+    workers = min(N_THREADS, len(shards), resources.batch_capacity(_available_ram(), shard_bytes))
+    with cf.ThreadPoolExecutor(max_workers=max(workers, 1)) as ex:
         got = [m for ms in ex.map(_one, shards) for m in ms]
     missing = sorted(set(want) - set(got))
     if missing:
         raise RuntimeError(f"modes missing from the shards: {missing[:10]}...")
     if len(got) != len(set(got)) or not np.all(np.isfinite(U)):
         raise ValueError("Duplicate modes or incomplete/nonfinite translations in shards")
-    log(f"  loaded {len(want)} modes x {N} nodes (npz) in {time.time()-t0:.1f} s ({N_THREADS} threads)")
-    return want, U
+    if have_rot and not np.all(np.isfinite(UR)):
+        raise ValueError("Incomplete/nonfinite rotations in shards")
+    log(f"  loaded {len(want)} modes x {N} nodes (npz{', U+UR' if have_rot else ''}) in "
+        f"{time.time()-t0:.1f} s ({N_THREADS} threads)")
+    return (want, U, UR) if rotations else (want, U)
 
 
-def load_modes(exp_dir: Path, meta: dict, mesh: Mesh, st: Settings):
+def load_modes(exp_dir: Path, meta: dict, mesh: Mesh, st: Settings, rotations: bool = False):
+    """(modes, U) or, with rotations=True, (modes, U, UR) - UR None when not exported."""
     if export_format(meta) == "npz":
-        return _load_modes_npz(exp_dir, meta, mesh, st)
+        return _load_modes_npz(exp_dir, meta, mesh, st, rotations)
     shards = meta["shards"]
     modes_all = [m for sh in shards for m in sh["modes"]]
     if len(set(modes_all)) != len(modes_all):
@@ -1392,7 +1694,9 @@ def load_modes(exp_dir: Path, meta: dict, mesh: Mesh, st: Settings):
     N = len(mesh.node_index)
     pos_of_index = np.full(int(mesh.node_index.max()) + 1, -1, np.int64)
     pos_of_index[mesh.node_index] = np.arange(N)
-    U = np.full((len(modes_all), N, 3), np.nan, dtype=np.float64)
+    U = _mode_array((len(modes_all), N, 3))
+    have_rot = bool(rotations and meta.get("rotations_available"))
+    UR = _mode_array((len(modes_all), N, 3)) if have_rot else None
     if psutil:
         need = U.nbytes * 2
         avail = psutil.virtual_memory().available
@@ -1414,16 +1718,23 @@ def load_modes(exp_dir: Path, meta: dict, mesh: Mesh, st: Settings):
             for c in range(3):
                 col = f"m{m:04d}_u{c+1}"
                 U[mode_pos[m], rows, c] = tab.column(col).to_numpy()
+                if have_rot:
+                    UR[mode_pos[m], rows, c] = tab.column(f"m{m:04d}_ur{c+1}").to_numpy()
         return len(sh["modes"])
 
     t0 = time.time()
-    with cf.ThreadPoolExecutor(max_workers=max(N_THREADS, 1)) as ex:
+    largest = max(len(sh["modes"]) for sh in shards)
+    shard_bytes = max(1, N * largest * (6 if have_rot else 3) * 8 * 2)
+    workers = min(N_THREADS, len(shards), resources.batch_capacity(_available_ram(), shard_bytes))
+    with cf.ThreadPoolExecutor(max_workers=max(workers, 1)) as ex:
         list(ex.map(_one, shards))
     if not np.all(np.isfinite(U)):
         raise ValueError("Incomplete/nonfinite modal translations in Parquet shards")
-    log(f"  loaded {len(modes_all)} modes x {N} nodes in {time.time()-t0:.1f} s "
-        f"({N_THREADS} threads)")
-    return modes_all, U
+    if have_rot and not np.all(np.isfinite(UR)):
+        raise ValueError("Incomplete/nonfinite modal rotations in Parquet shards")
+    log(f"  loaded {len(modes_all)} modes x {N} nodes{' (U+UR)' if have_rot else ''} in "
+        f"{time.time()-t0:.1f} s ({N_THREADS} threads)")
+    return (modes_all, U, UR) if rotations else (modes_all, U)
 
 
 # ----------------------------------------------------------------------------
@@ -1440,14 +1751,22 @@ def _xp(st: Settings):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             import cupy as cp
-            if cp.cuda.runtime.getDeviceCount() < 1:
-                raise RuntimeError("no CUDA device")
-            a = cp.arange(8.0).reshape(2, 4)
-            b = ((a * cp.sqrt(a + 1.0)) ** 2).sum(0)               # elementwise + reduction kernels
-            c = cp.ascontiguousarray(cp.transpose(a)) @ a          # cuBLAS
-            float((b.sum() + c.sum()).get())
-            cp.cuda.Stream.null.synchronize()
-        log("  GPU: CuPy/CUDA test kernel OK - projections on GPU")
+            usable = []
+            for device in range(cp.cuda.runtime.getDeviceCount()):
+                try:
+                    with cp.cuda.Device(device):
+                        a = cp.arange(8.0).reshape(2, 4)
+                        b = ((a * cp.sqrt(a + 1.0)) ** 2).sum(0)
+                        c = cp.ascontiguousarray(cp.transpose(a)) @ a
+                        float((b.sum() + c.sum()).get())
+                        cp.cuda.Stream.null.synchronize()
+                    usable.append(device)
+                except Exception as error:
+                    log(f"  CUDA device {device} unavailable: {str(error)[:120]}")
+            if not usable:
+                raise RuntimeError("no usable CUDA device")
+        st._gpu_devices = usable
+        log(f"  GPU: CuPy/CUDA test kernels OK on {len(usable)} device(s)")
         return cp, True
     except Exception as e:
         msg = str(e).splitlines()[0][:160] if str(e) else type(e).__name__
@@ -1456,6 +1775,110 @@ def _xp(st: Settings):
         elif "cupy" in sys.modules or not isinstance(e, ImportError):
             log(f"  GPU not usable ({msg}); using CPU x{N_THREADS}")
         return np, False
+
+
+def _projection_chunk(g, mesh, U, rows, dz, xp, on_gpu):
+    """One transactional slice block: no report accumulation until all operations succeed."""
+    nm, c, n2 = len(U), len(rows), 2 * g.n
+    X = np.einsum("mrnc,cd->ndrm", U[:, rows, :], np.c_[mesh.e1, mesh.e2], optimize=True).reshape(n2, c, nm)
+    Xc = xp.asarray(X)
+    sw = xp.asarray(np.sqrt(g.basis["w2"]))[:, None, None]
+    sdz = xp.asarray(np.sqrt(dz))[None, :, None]
+    Xw2 = xp.ascontiguousarray(xp.transpose(Xc * sw * sdz, (1, 0, 2))).reshape(c * n2, nm)
+    total = _np(Xw2.T @ Xw2, on_gpu)
+    Qf = xp.asarray(g.basis["Qf"])
+    fn = np.zeros(nm)
+    if Qf.shape[0]:
+        qx = (Qf @ Xc.reshape(n2, c * nm)).reshape(-1, c, nm)
+        fn = _np(((qx * sdz) ** 2).sum((0, 1)), on_gpu) / max(Qf.shape[0] // 2, 1)
+    fd = _np(((Xc * sw * sdz) ** 2).sum((0, 1)), on_gpu) / float(g.w.sum())
+    prof = np.empty((len(CLASSES) + 1, c, nm))
+    prof[-1] = _np(((Xc * sw) ** 2).sum(0), on_gpu)
+    H, Hs = {}, {}
+    for ci, k in enumerate(CLASSES):
+        Y = (xp.asarray(g.proj[k]) @ Xc.reshape(n2, c * nm)).reshape(n2, c, nm)
+        Yw = xp.ascontiguousarray(xp.transpose(Y * sw * sdz, (1, 0, 2))).reshape(c * n2, nm)
+        H[k] = _np(Yw.T @ Yw, on_gpu)
+        Hs[k] = _np(Yw.T @ Xw2, on_gpu)
+        prof[ci] = _np(((Y * sw) ** 2).sum(0), on_gpu)
+        del Y, Yw
+    jumps = slip = None
+    if g.J.shape[0]:
+        jumps = np.tensordot(g.J, X, axes=(1, 0))
+        ax = np.array([[s["A"], s["B"]] for s in g.seams])
+        ua = np.einsum("mrnc,c->nrm", U[:, rows[:, ax[:, 0]], :], mesh.axis, optimize=True)
+        ub = np.einsum("mrnc,c->nrm", U[:, rows[:, ax[:, 1]], :], mesh.axis, optimize=True)
+        slip = ub - ua
+    return dict(total=total, H=H, Hs=Hs, fn=fn, fd=fd, prof=prof, jumps=jumps, slip=slip)
+
+
+def _projection_range(g, mesh, U, ids, dz, xp, on_gpu, workers):
+    """Adapt to live RAM/VRAM and retry allocation failures without double-counting."""
+    nm, n2 = len(U), 2 * g.n
+    per_ring = n2 * nm * 8 * 16
+    fixed = (2 * len(CLASSES) + 1) * nm * nm * 8 + 6 * n2 * n2 * 8
+    result = None
+    offset, ceiling = 0, len(ids)
+    while offset < len(ids):
+        available = _available_ram() // workers
+        if on_gpu:
+            free, _ = xp.cuda.runtime.memGetInfo()
+            free += xp.get_default_memory_pool().free_bytes()
+            available = min(available, free)
+        try:
+            count = min(len(ids) - offset, ceiling, resources.batch_capacity(available, per_ring, fixed))
+        except MemoryError:
+            if on_gpu:
+                log("  VRAM cannot hold one projection ring; completing this range on CPU")
+                xp, on_gpu = np, False
+                continue
+            raise
+        chosen = ids[offset:offset + count]
+        try:
+            block = _projection_chunk(g, mesh, U, g.node_rows[chosen], dz[chosen], xp, on_gpu)
+        except MemoryError:
+            if on_gpu:
+                xp.get_default_memory_pool().free_all_blocks()
+            if count > 1:
+                ceiling = max(1, count // 2)
+                continue
+            if on_gpu:
+                log("  one-ring CUDA allocation failed; completing this range on CPU")
+                xp, on_gpu = np, False
+                continue
+            raise MemoryError("available RAM cannot hold one projection ring")
+        if result is None:
+            result = dict(total=np.zeros_like(block["total"]),
+                          H={k: np.zeros_like(block["H"][k]) for k in CLASSES},
+                          Hs={k: np.zeros_like(block["Hs"][k]) for k in CLASSES},
+                          fn=np.zeros(nm), fd=np.zeros(nm),
+                          prof=np.zeros((len(CLASSES) + 1, len(ids), nm)), jumps=None, slip=None)
+            if block["jumps"] is not None:
+                result["jumps"] = np.empty((block["jumps"].shape[0], len(ids), nm))
+                result["slip"] = np.empty((block["slip"].shape[0], len(ids), nm))
+        result["total"] += block["total"]
+        result["fn"] += block["fn"]; result["fd"] += block["fd"]
+        for k in CLASSES:
+            result["H"][k] += block["H"][k]; result["Hs"][k] += block["Hs"][k]
+        result["prof"][:, offset:offset + count] = block["prof"]
+        if block["jumps"] is not None:
+            result["jumps"][:, offset:offset + count] = block["jumps"]
+            result["slip"][:, offset:offset + count] = block["slip"]
+        offset += count
+        del block
+    return ids, result
+
+
+def member_ring_weights(groups, mesh):
+    """Localized plate stations must not change quadrature of the column walls."""
+    ids = np.array(sorted({r for g in groups for r in g.rings}), dtype=int)
+    out = np.zeros(len(mesh.ring_z))
+    z = mesh.ring_z[ids]
+    weights = np.zeros(len(ids))
+    weights[1:] += .5*np.diff(z)
+    weights[:-1] += .5*np.diff(z)
+    out[ids] = weights
+    return out
 
 
 def decompose(groups, mesh: Mesh, U: np.ndarray, st: Settings):
@@ -1467,9 +1890,7 @@ def decompose(groups, mesh: Mesh, U: np.ndarray, st: Settings):
     nm = U.shape[0]
     R = len(mesh.ring_z)
     z = mesh.ring_z
-    dz = np.zeros(R)
-    dz[1:] += 0.5 * np.diff(z)
-    dz[:-1] += 0.5 * np.diff(z)
+    dz = member_ring_weights(groups, mesh)
     H = {k: np.zeros((nm, nm)) for k in CLASSES}
     Hs = {k: np.zeros((nm, nm)) for k in CLASSES}      # <phi_M , phi>_W  (signed, additive)
     Htot = np.zeros((nm, nm))
@@ -1479,53 +1900,33 @@ def decompose(groups, mesh: Mesh, U: np.ndarray, st: Settings):
     prof = np.zeros((len(CLASSES) + 1, R, nm))       # per-ring ||u_M||_W^2 (+ total)
     seam_prof = []
     for g in groups:
-        rows = g.node_rows                            # (Rg, n)
-        Rg, n2 = rows.shape[0], 2 * g.n
-        E12 = np.c_[mesh.e1, mesh.e2]                 # (3,2)
-        X = np.empty((n2, Rg, nm))                    # DOF-major for one big GEMM
-        Xin = np.einsum("mrnc,cd->ndrm", U[:, rows, :], E12, optimize=True)   # (n,2,Rg,nm)
-        X[:] = Xin.reshape(n2, Rg, nm)
-        del Xin
-        w2 = g.basis["w2"]
-        dzg = dz[g.rings]
-        ring_ids = np.asarray(g.rings)
-        # ring chunk sized from free RAM (needed only to stay within physical memory)
-        bytes_per_ring = n2 * nm * 8 * 6
-        avail = psutil.virtual_memory().available if psutil else 16e9
-        chunk = int(max(1, min(Rg, (0.85 * avail) // max(bytes_per_ring, 1))))
-        sw = xp.asarray(np.sqrt(w2))[:, None, None]
-        Qf = xp.asarray(g.basis["Qf"])
-        nf = max(Qf.shape[0] // 2, 1)
-        perim = float(g.w.sum())
-        for r0 in range(0, Rg, chunk):
-            r1 = min(Rg, r0 + chunk)
-            c = r1 - r0
-            Xc = xp.asarray(X[:, r0:r1, :])                       # (n2, c, nm)
-            sdz = xp.asarray(np.sqrt(dzg[r0:r1]))[None, :, None]
-            Xw = (Xc * sw * sdz)
-            Xw2 = xp.ascontiguousarray(xp.transpose(Xw, (1, 0, 2))).reshape(c * n2, nm)
-            Htot += _np(Xw2.T @ Xw2, on_gpu)
-            if Qf.shape[0]:
-                qx = (Qf @ Xc.reshape(n2, c * nm)).reshape(-1, c, nm)
-                fold_num += _np((qx ** 2 * sdz ** 2).sum((0, 1)), on_gpu) / nf
-            fold_den += _np(((Xc * sw * sdz) ** 2).sum((0, 1)), on_gpu) / perim
-            prof[-1, ring_ids[r0:r1]] += _np(((Xc * sw) ** 2).sum(0), on_gpu)
-            Xflat = Xc.reshape(n2, c * nm)
-            for ci, k in enumerate(CLASSES):
-                Y = (xp.asarray(g.proj[k]) @ Xflat).reshape(n2, c, nm)
-                Yw = xp.ascontiguousarray(xp.transpose(Y * sw * sdz, (1, 0, 2))).reshape(c * n2, nm)
-                H[k] += _np(Yw.T @ Yw, on_gpu)
-                Hs[k] += _np(Yw.T @ Xw2, on_gpu)
-                prof[ci, ring_ids[r0:r1]] += _np(((Y * sw) ** 2).sum(0), on_gpu)
-                del Y, Yw
-            del Xc, Xw, Xw2, Xflat
-        if g.J.shape[0]:
-            Jx = np.tensordot(g.J, X, axes=(1, 0))               # (3*nseam, Rg, nm)
-            ax = np.array([[s["A"], s["B"]] for s in g.seams])
-            ua = np.einsum("mrnc,c->nrm", U[:, rows[:, ax[:, 0]], :], mesh.axis, optimize=True)
-            ub = np.einsum("mrnc,c->nrm", U[:, rows[:, ax[:, 1]], :], mesh.axis, optimize=True)
-            seam_prof.append(dict(g=g, jumps=Jx, axial_slip=ub - ua, z=mesh.ring_z[ring_ids]))
-        del X
+        devices = getattr(st, "_gpu_devices", [0]) if on_gpu else [None]
+        parts = [p for p in np.array_split(np.arange(len(g.rings)), len(devices)) if len(p)]
+        def work(item):
+            device, ids = item
+            ctx = xp.cuda.Device(device) if on_gpu else nullcontext()
+            with ctx:
+                return _projection_range(g, mesh, U, ids, dz[g.rings], xp, on_gpu, len(parts))
+        if len(parts) > 1:
+            limits = threadpool_limits(1, user_api="blas") if "threadpool_limits" in globals() else nullcontext()
+            with limits, cf.ThreadPoolExecutor(max_workers=len(parts)) as pool:
+                results = list(pool.map(work, zip(devices, parts)))
+        else:
+            results = [work((devices[0], parts[0]))]
+        jumps = slip = None
+        for ids, block in results:
+            Htot += block["total"]; fold_num += block["fn"]; fold_den += block["fd"]
+            for k in CLASSES:
+                H[k] += block["H"][k]; Hs[k] += block["Hs"][k]
+            prof[:, np.asarray(g.rings)[ids]] += block["prof"]
+            if block["jumps"] is not None:
+                if jumps is None:
+                    jumps = np.empty((block["jumps"].shape[0], len(g.rings), nm))
+                    slip = np.empty((block["slip"].shape[0], len(g.rings), nm))
+                jumps[:, ids] = block["jumps"]; slip[:, ids] = block["slip"]
+        if jumps is not None:
+            seam_prof.append(dict(g=g, jumps=jumps, axial_slip=slip, z=mesh.ring_z[g.rings]))
+        del results
     Ein = np.stack([np.diag(H[k]) for k in CLASSES], axis=1)
     Etot = np.diag(Htot).copy()
     # axial-slip diagnostic: rms seam slip / rms axial displacement of the whole member
@@ -1605,7 +2006,14 @@ def _assess(sh: dict, sg: dict, st: Settings, cross: float = 0.0) -> dict:
         flags.append("LOW_MARGIN")
     elif margin < st.conf_high_margin_pct:
         flags.append("MIXED")
-    return dict(dominant=dom, margin=margin, flags=flags, confidence=conf, label=label_of(sh, st))
+    label = label_of(sh, st)
+    mixed = '+' in label
+    if mixed and 'MIXED' not in flags:
+        flags.append('MIXED')
+    character = ('UNRESOLVED' if label == 'UNRESOLVED' or sh['O'] > st.max_other_pct
+                 else 'MIXED_KINEMATICS' if mixed else 'DOMINANT_'+dom)
+    return dict(dominant=dom, margin=margin, flags=flags, confidence=conf, label=label,
+                character=character)
 
 
 def halfwave_length(profile: np.ndarray, z: np.ndarray, share_pct: float, min_share_pct: float = 1.0) -> float:
@@ -1661,6 +2069,49 @@ def reliable_shares(res, eig: np.ndarray, st: Settings) -> np.ndarray:
     return out
 
 
+def _subspace_assessment(res, idx, Cm, assessment, st):
+    """Bounds over all vectors of a cluster, not only the solver's chosen basis.
+
+    The denominator is the sum of squared component norms, matching *_pct.
+    The small generalized eigenproblems distinguish a heterogeneous eigenspace
+    from a mode that genuinely contains several kinematic components.
+    """
+    blocks = {k: Cm.T @ res['H'][k][np.ix_(idx, idx)] @ Cm for k in CLASSES}
+    W = _cluster_basis(sum(blocks.values()))
+    normal = {k: W.T @ B @ W for k, B in blocks.items()}
+    fields = {}
+    for k, B in normal.items():
+        ev = np.linalg.eigvalsh((B+B.T)/2.)
+        fields['subspace_'+k+'_min_pct'] = float(np.clip(100*ev[0],0.,100.))
+        fields['subspace_'+k+'_max_pct'] = float(np.clip(100*ev[-1],0.,100.))
+    if len(idx) > 1:
+        dom = assessment['dominant']
+        unresolved = any(100*np.linalg.eigvalsh((normal[k]-normal[dom] +
+                              (normal[k]-normal[dom]).T)/2.)[-1] > st.conf_low_margin_pct
+                         for k in ('G','D','L','C') if k != dom)
+        if unresolved:
+            assessment['flags'].append('SUBSPACE_DOMINANCE_UNRESOLVED')
+            assessment['confidence'] = 'low'
+            assessment['dominant'] = 'UNRESOLVED'
+            assessment['margin'] = None
+            assessment['character'] = 'SUBSPACE_UNRESOLVED'
+            assessment['label'] = 'SUBSPACE('+assessment['label']+')'
+        elif any(fields['subspace_'+k+'_max_pct']-fields['subspace_'+k+'_min_pct'] > st.max_spread_pct
+                 for k in CLASSES):
+            assessment['flags'].append('SUBSPACE_VARIATION')
+            if assessment['confidence'] == 'high':
+                assessment['confidence'] = 'medium'
+    # A small mean/spread can still hide a vector outside the admissible wall
+    # kinematics. Apply the same O validity threshold to the entire subspace.
+    if fields['subspace_O_max_pct'] > st.max_other_pct:
+        if 'UNRELIABLE_OTHER' not in assessment['flags']:
+            assessment['flags'].append('UNRELIABLE_OTHER')
+        assessment['confidence'] = 'low'
+        if assessment['character'] != 'SUBSPACE_UNRESOLVED':
+            assessment['character'] = 'UNRESOLVED'
+    return fields
+
+
 def split_sensitivity(groups, mesh, U, st: Settings, eig: np.ndarray, t: float, inp) -> dict:
     """Re-run the decomposition with the other admissible measures of the fold-arc rotation
     (one side of the arc only, either side). A rounded fold is modelled as a rigid arc, but the
@@ -1685,13 +2136,14 @@ def split_sensitivity(groups, mesh, U, st: Settings, eig: np.ndarray, t: float, 
 def summarise(res, modes, eig, sigma_ref, groups, mesh, st: Settings, sens: dict | None = None):
     """Per-mode and per-cluster tables. Every mode row also carries the RELIABLE result:
     the cluster (basis-invariant) result when the mode is in a near-degenerate group, its own
-    result otherwise (rel_*_pct, reliable_label, reliable_dominant, confidence)."""
+    result otherwise (rel_*_pct, reliable_label, reliable_dominant, confidence).
+    Heterogeneous clusters retain aggregate shares but no unique member dominance."""
     E, Etot = res["E"], res["Etot"]
     cl = clusters_of(eig, st.cluster_rel_tol)
     cl_id = {i: ci for ci, c in enumerate(cl) for i in c}
     bolt_ring_C = _bolt_ring_check(res, groups, mesh)
     # --- clusters first (needed by the mode rows) ---
-    crow, cl_res = [], []
+    crow, cl_res, cl_bounds = [], [], []
     for ci, c in enumerate(cl):
         idx = np.array(c)
         Gm = res["Htot"][np.ix_(idx, idx)]
@@ -1703,6 +2155,8 @@ def summarise(res, modes, eig, sigma_ref, groups, mesh, st: Settings, sens: dict
         sg = {k: 100 * float(np.trace(Cm.T @ res["Hs"][k][np.ix_(idx, idx)] @ Cm)) / nb for k in CLASSES}
         ccross = 100 * (1 - s / nb)
         asx = _assess(sh, sg, st, ccross)
+        bounds = _subspace_assessment(res, idx, Cm, asx, st)
+        cl_bounds.append(bounds)
         cl_res.append((sh, sg, asx))
         crow.append(dict(cluster=ci + 1, modes=" ".join(str(modes[i]) for i in c), size=len(c),
                          eig_min=float(eig[idx].min()), eig_max=float(eig[idx].max()),
@@ -1711,7 +2165,8 @@ def summarise(res, modes, eig, sigma_ref, groups, mesh, st: Settings, sens: dict
                          C_signed_pct=sg["C"], O_signed_pct=sg["O"], cross_term_pct=ccross,
                          D_assembly_pct=sh["D"] + sh["C"],
                          dominant=asx["dominant"], dominance_margin_pct=asx["margin"],
-                         label=asx["label"], confidence=asx["confidence"], flags=";".join(asx["flags"])))
+                         label=asx["label"], reliable_character=asx['character'], **bounds,
+                         confidence=asx["confidence"], flags=";".join(asx["flags"])))
     # --- modes ---
     rows = []
     for i, m in enumerate(modes):
@@ -1734,6 +2189,7 @@ def summarise(res, modes, eig, sigma_ref, groups, mesh, st: Settings, sens: dict
                          C_signed_pct=sg["C"], O_signed_pct=sg["O"],
                          D_assembly_pct=sh["D"] + sh["C"],
                          dominant=asx["dominant"], dominance_margin_pct=asx["margin"], label=asx["label"],
+                         mode_character=asx['character'], reliable_character=rasx['character'], **cl_bounds[ci],
                          reliable_source="cluster" if size > 1 else "mode",
                          rel_G_pct=rsh["G"], rel_D_pct=rsh["D"], rel_L_pct=rsh["L"], rel_C_pct=rsh["C"],
                          rel_O_pct=rsh["O"], rel_D_assembly_pct=rsh["D"] + rsh["C"],
@@ -1776,6 +2232,289 @@ def summarise(res, modes, eig, sigma_ref, groups, mesh, st: Settings, sens: dict
             c["confidence"] = r0["confidence"]
             c["flags"] = ";".join(f for f in r0["flags"].split(";") if f and not f.startswith("CLUSTER_"))
     return rows, crow
+
+
+def component_fields(groups, mesh: Mesh, U: np.ndarray) -> np.ndarray:
+    """(5, N, 2, m) in-plane GDLC components (CLASSES order) of the modes U (m, N, 3), in the
+    (e1, e2) coordinates of the slices - for a member along a global axis these are the
+    global in-plane DOFs in increasing order."""
+    m, N = U.shape[0], U.shape[1]
+    out = np.zeros((len(CLASSES), N, 2, m))
+    E12 = np.c_[mesh.e1, mesh.e2]
+    for g in groups:
+        rows = g.node_rows                                            # (Rg, n)
+        Rg, n = rows.shape
+        X = np.einsum("mrnc,cd->ndrm", U[:, rows, :], E12, optimize=True).reshape(2 * n, Rg * m)
+        for k, cls in enumerate(CLASSES):
+            Y = (g.proj[cls] @ X).reshape(n, 2, Rg, m).transpose(2, 0, 1, 3)   # (Rg, n, 2, m)
+            out[k][rows] = Y
+    # Plates are localized transverse attachments, not prismatic G/D/L/C walls.
+    # Preserve their actual transverse mode field in the residual O energy block;
+    # kinematic percentages above use only the longitudinal wall groups.
+    plate = np.char.startswith(mesh.instance.astype(str), 'STEEL_PLATE_')
+    out[CLASSES.index('O'), plate] = np.einsum('mnc,cd->ndm', U[:, plate], E12)
+    return out
+
+
+def plate_motion_shares(mesh: Mesh, U: np.ndarray, clusters=None):
+    """(motion_pct, deformation_pct) per mode of the transverse steel plates, or None without
+    plates. The G/D/L/C/O shares see the column walls only, so a mode carried by the plates
+    themselves would pass unnoticed; these two numbers close that gap.
+      motion_pct      = 100 * sum_plates w |u|^2 / sum_all w |u|^2
+      deformation_pct = the same with u minus each plate's best rigid-body motion
+                        (weighted least squares of u = a + omega x (x - x_c), 6 DOF per plate)
+    With clusters given, also return the maximum deformation share attainable
+    in each cluster, using its residual/full-displacement Gram matrices. This
+    guard is invariant to eigenvector scaling and mixing; it is not the maximum
+    of sampled individual shares. Singletons use their individual share.
+    w = lumped nodal shell area (element area / 4 per node), u = the three translations.
+    A plate following the walls rigidly (bolts, closed contact) is plate motion, not plate
+    deformation; a plate-buckling or plate-mechanism mode shows a large deformation share."""
+    names = mesh.instance.astype(str)
+    plate = np.char.startswith(names, 'STEEL_PLATE_')
+    if not np.any(plate):
+        return None
+    P = mesh.xyz[mesh.elems[:, :4]]
+    area = 0.5 * np.linalg.norm(np.cross(P[:, 2] - P[:, 0], P[:, 3] - P[:, 1]), axis=1)
+    w = np.bincount(mesh.elems[:, :4].ravel(), np.repeat(area / 4.0, 4), minlength=len(names))
+    sq = np.einsum('mnc,mnc->mn', U, U)                                  # (modes, N)
+    total = sq @ w
+    motion = sq[:, plate] @ w[plate]
+    deform = np.zeros(U.shape[0])
+    cluster_blocks = {ci: np.zeros((len(c),len(c))) for ci,c in enumerate(clusters or [],1) if len(c)>1}
+    for name in np.unique(names[plate]):
+        rows = np.nonzero(names == name)[0]
+        x = mesh.xyz[rows] - np.average(mesh.xyz[rows], axis=0, weights=w[rows])
+        A = np.zeros((len(rows), 3, 6))
+        A[:, :, :3] = np.eye(3)
+        A[:, 0, 4], A[:, 0, 5] = x[:, 2], -x[:, 1]                       # omega x x, rows of -[x]x
+        A[:, 1, 3], A[:, 1, 5] = -x[:, 2], x[:, 0]
+        A[:, 2, 3], A[:, 2, 4] = x[:, 1], -x[:, 0]
+        sw = np.repeat(np.sqrt(w[rows]), 3)
+        Aw = A.reshape(-1, 6) * sw[:, None]
+        B = U[:, rows, :].reshape(U.shape[0], -1).T * sw[:, None]       # (3n, modes)
+        coef = np.linalg.lstsq(Aw, B, rcond=None)[0]
+        residual = B - Aw @ coef
+        deform += np.sum(residual ** 2, axis=0)
+        for ci, gram in cluster_blocks.items():
+            R = residual[:, clusters[ci-1]]
+            gram += R.T @ R
+    with np.errstate(invalid="ignore", divide="ignore"):
+        shares = (100.0 * motion / total, 100.0 * deform / total)
+    if clusters is None:
+        return shares
+    worst = {}
+    for ci, c in enumerate(clusters,1):
+        if len(c)==1:
+            worst[ci] = float(shares[1][c[0]])
+            continue
+        field = U[c]
+        full = np.einsum('mnc,knc,n->mk', field, field, w, optimize=True)
+        C = _cluster_basis(full)
+        gram = C.T @ cluster_blocks[ci] @ C
+        worst[ci] = float(100*np.linalg.eigvalsh((gram+gram.T)/2.)[-1])
+    return (*shares, worst)
+
+
+def add_plate_columns(rows, crow, shares, st: Settings) -> None:
+    """Plate columns of the mode/cluster tables; plate deformation above max_other_pct marks a
+    mode whose wall-only family shares do not describe it (flag PLATE_DEFORMATION, low
+    confidence). Near-degenerate groups use the largest attainable deformation
+    over their subspace when cluster Grams were supplied by plate_motion_shares."""
+    if shares is None:
+        return
+    motion, deform = shares[:2]
+    cluster_worst = shares[2] if len(shares)>2 else {}
+    by_cluster = {}
+    for r, mv, dv in zip(rows, motion, deform):
+        by_cluster.setdefault(r["cluster"], []).append((float(mv), float(dv)))
+    for r, mv, dv in zip(rows, motion, deform):
+        r["plate_motion_pct"], r["plate_deformation_pct"] = float(mv), float(dv)
+        worst = cluster_worst.get(r['cluster'], max(d for _, d in by_cluster[r["cluster"]]))
+        r['cluster_plate_deformation_max_pct'] = worst
+        if not worst <= st.max_other_pct:
+            r["flags"] = ";".join(["PLATE_DEFORMATION"] + [f for f in r["flags"].split(";") if f])
+            r["confidence"] = "low"
+    for c in crow:
+        members = by_cluster.get(c["cluster"], [])
+        if members:
+            c["plate_motion_pct"] = max(m for m, _ in members)
+            c["plate_deformation_pct"] = max(d for _, d in members)
+            c['cluster_plate_deformation_max_pct'] = cluster_worst.get(c['cluster'],c['plate_deformation_pct'])
+            if not c['cluster_plate_deformation_max_pct'] <= st.max_other_pct:
+                c["flags"] = ";".join(["PLATE_DEFORMATION"] + [f for f in c["flags"].split(";") if f])
+                c["confidence"] = "low"
+
+
+def energy_evaluation(run_dir: Path, groups, mesh: Mesh, inp, modes, eig, U, UR, res, st: Settings, kmeta=None) -> dict:
+    """Strain-energy evaluation of the GDLC split with the exported elastic stiffness
+    (gdlc_stiffness.py): every class component is completed to a full field by minimum strain
+    energy, E_fg = w_f^T S w_g. Per mode: E (5 x 5), U = v^T K v of the mode. Per eigenvalue
+    group (the RELIABLE result, as for the kinematic shares): Ecl (5 x 5) = trace over an
+    orthonormal basis of the group (basis-invariant). Validation numbers included."""
+    t0 = time.time()
+    _, inplane, _ = _axis_dofs(mesh)
+    if not (np.allclose(mesh.e1, np.eye(3)[inplane[0] - 1]) and np.allclose(mesh.e2, np.eye(3)[inplane[1] - 1])):
+        raise RuntimeError("slice axes are not the global in-plane axes")
+    if UR is None:
+        raise RuntimeError("the modal export has no rotations (UR); re-export with --export always")
+    if inp is None:
+        raise RuntimeError("no .inp (supports and MPCs are read from it)")
+    if kmeta is None:
+        _, export_meta = choose_export(run_dir, st.export_dir)
+        input_path = find_inp(run_dir, export_meta, st.inp)
+        kmeta = gst.stiffness_status(run_dir, file_sha256(input_path)) if input_path is not None else None
+    if kmeta is None:
+        raise RuntimeError('no verified stiffness export for the current input')
+    K = gst.load_stiffness(run_dir, mesh.instance, mesh.label, Path(kmeta['export_directory']))
+    key_row = {(str(i), int(l)): r for r, (i, l) in enumerate(zip(mesh.instance, mesh.label))}
+    model = gst.EnergyModel(K, mesh.xyz, key_row, inp.pairs, inp.boundaries, inplane, N_THREADS)
+    nm, N = U.shape[0], U.shape[1]
+    V = _mode_array((6 * N, nm))
+    block = min(nm, resources.batch_capacity(_available_ram(), 6*N*8*5, nm*nm*8*4))
+    cerr = np.empty(nm)
+    for start in range(0, nm, block):
+        stop = min(nm, start+block)
+        V[:, start:stop] = np.concatenate([U[start:stop], UR[start:stop]], axis=2).reshape(stop-start, 6*N).T
+        cerr[start:stop] = model.constraint_error(V[:, start:stop])
+    if not np.all(cerr <= 1e-4):
+        raise RuntimeError(f"the exported modes do not satisfy the MPCs/supports read from the .inp "
+                           f"(max relative error {cerr.max():.2e}): stiffness/constraint mapping inconsistent")
+    cl = clusters_of(eig, st.cluster_rel_tol)
+    korth = gst.k_orthogonality(model, V, cl, block)
+    if not np.isfinite(korth["max_normalised_offdiagonal"]) or korth["max_normalised_offdiagonal"] > 1e-2:
+        raise RuntimeError("elastic matrix and modes fail K-orthogonality acceptance; energy diagnostic refused")
+    nc = len(CLASSES)
+    Emode = np.zeros((nm, nc, nc))
+    Ecl = np.zeros((nm, nc, nc))                    # group matrix, stored for every member mode
+    Umode = np.zeros(nm)
+    bolt = np.zeros(nm)
+    lift_res = 0.0
+    # Account for component fields, prescribed/free RHS, solutions and temporary
+    # products, plus the dense (nc*m)^2 Gram matrix. No percentage is reserved.
+    per_mode = 8 * (nc * (4 * N + 3 * len(model.P) + 3 * len(model.F)) + 12 * N)
+    quad = 8 * nc * nc * 2
+    avail = _available_ram()
+    budget = min(nm, int(2 * avail / (per_mode + math.sqrt(per_mode**2 + 4 * quad * avail))))
+    if budget < 1 or any(len(c) > budget for c in cl):
+        raise MemoryError("available RAM cannot hold a complete energy eigenspace working set")
+    batches, cur = [], []
+    for c in cl:
+        if cur and sum(map(len, cur)) + len(c) > budget:
+            batches.append(cur)
+            cur = []
+        cur = cur + [c]
+    if cur:
+        batches.append(cur)
+    t1 = time.time()
+    for b in batches:
+        idx = np.array([i for c in b for i in c])
+        pos = {i: a for a, i in enumerate(idx)}
+        comps = component_fields(groups, mesh, U[idx])
+        r = gst.component_energies(model, comps, V[:, idx])
+        m = len(idx)
+        E = r["E"].reshape(nc, m, nc, m)
+        for a, i in enumerate(idx):
+            Emode[i] = E[:, a, :, a]
+        Umode[idx] = r["U"]
+        bolt[idx] = r["bolt_incompat"]
+        lift_res = max(lift_res, r["lift_residual"])
+        for c in b:
+            pc = [pos[i] for i in c]
+            Cm = _cluster_basis(res["Htot"][np.ix_(c, c)])
+            M = np.array([[float(np.trace(Cm.T @ E[f, :, g, :][np.ix_(pc, pc)] @ Cm)) for g in range(nc)]
+                          for f in range(nc)])
+            Ecl[c] = M
+    log(f"  energy evaluation: K_FF {len(model.F)} DOF (factor {model.fill/1e6:.1f} M nonzeros, set-up "
+        f"{model.setup_s:.1f} s), {nm} modes x {nc} classes lifted in {time.time()-t1:.1f} s on "
+        f"{N_THREADS} threads; mode constraint error {cerr.max():.1e}, max K-coupling of distinct "
+        f"modes {korth['max_normalised_offdiagonal']:.1e}")
+    acceptance = gst.validate_energy_result(Emode, Umode, lift_res, korth)
+    return dict(E=Emode, Ecl=Ecl, U=Umode, bolt=bolt, clusters=cl,
+                validation=dict(acceptance=acceptance, mode_constraint_error_max=float(cerr.max()), k_orthogonality=korth,
+                                lift_relative_residual_max=lift_res,
+                                zero_stiffness_dofs_dropped=model.n_zero_stiffness,
+                                n_P=int(len(model.P)), n_F=int(len(model.F)), factor_nnz=model.fill,
+                                setup_s=model.setup_s, elapsed_s=time.time() - t0, threads=N_THREADS))
+
+
+def _energy_shares(M: np.ndarray) -> tuple[dict, dict, float]:
+    """(normalised diagonal shares, additive signed shares, cross term) in % of a 5 x 5
+    class energy matrix."""
+    d = np.diag(M)
+    tot = float(M.sum())
+    sh = {k: float(100 * d[j] / max(d.sum(), 1e-300)) for j, k in enumerate(CLASSES)}
+    sg = {k: (float(100 * M[j].sum() / tot) if tot > 0 else float("nan")) for j, k in enumerate(CLASSES)}
+    cross = float(100 * (1 - d.sum() / tot)) if tot > 0 else float("nan")
+    return sh, sg, cross
+
+
+def add_energy_columns(rows, crow, en: dict, modes, st: Settings) -> None:
+    """Energy shares next to the kinematic ones (mode_participation / cluster_participation).
+    E_*_pct / E_*_signed_pct / E_cross_term_pct: the mode itself; E_rel_*: the RELIABLE (group)
+    result. The energy dominant class is resolved when the normalised and the signed energy
+    measures agree on it (otherwise flag ENERGY_AMBIGUOUS). A resolved energy dominant class
+    that differs from the kinematic reliable_dominant is flagged ENERGY_DISAGREES (confidence
+    at most medium: the label depends on the measure). |energy cross term| > max_cross_pct is
+    flagged ENERGY_CROSS_TERM (the class components store much more energy separately than
+    together; the normalised energy percentages are then mainly a ranking)."""
+    for i, row in enumerate(rows):
+        row["kinematic_confidence"] = row["confidence"]
+        row["energy_confidence"] = "high"
+        sh, sg, cross = _energy_shares(en["E"][i])
+        for k in CLASSES:
+            row[f"E_{k}_pct"] = sh[k]
+        for k in CLASSES:
+            row[f"E_{k}_signed_pct"] = sg[k]
+        row["E_cross_term_pct"] = cross
+        tot = float(en["E"][i].sum())
+        row["E_beyond_section_pct"] = float(100 * (1 - tot / en["U"][i])) if en["U"][i] > 0 else float("nan")
+        row["bolt_incompatibility_pct"] = float(100 * en["bolt"][i])
+        rsh, rsg, rcross = _energy_shares(en["Ecl"][i])
+        for k in CLASSES:
+            row[f"E_rel_{k}_pct"] = rsh[k]
+        for k in CLASSES:
+            row[f"E_rel_{k}_signed_pct"] = rsg[k]
+        row["E_rel_cross_term_pct"] = rcross
+        dom = max(MECH, key=lambda k: rsh[k])
+        resolved = bool(dom == max(MECH, key=lambda k: rsg[k]))
+        row["E_reliable_dominant"] = dom
+        row["E_reliable_label"] = label_of(rsh, st)
+        row["E_resolved"] = resolved
+        fl = [f for f in row["flags"].split(";") if f]
+        if np.isfinite(rcross) and abs(rcross) > st.max_cross_pct:
+            fl.append("ENERGY_CROSS_TERM")
+            row["energy_confidence"] = "medium"
+        if not resolved:
+            fl.append("ENERGY_AMBIGUOUS")
+            row["energy_confidence"] = "low"
+        elif dom != row["reliable_dominant"]:
+            fl.insert(0, "ENERGY_DISAGREES")
+            if row["confidence"] == "high":
+                row["confidence"] = "medium"
+            row["energy_confidence"] = "medium"
+        if row["E_beyond_section_pct"] > st.max_energy_beyond_pct:
+            fl.append("ENERGY_BEYOND_SECTION")
+            row["energy_confidence"] = "low"
+        if row["bolt_incompatibility_pct"] > st.max_bolt_incompat_pct:
+            fl.append("ENERGY_INCOMPATIBLE_COMPONENTS")
+            row["energy_confidence"] = "low"
+        # A combined high-confidence label must not conceal a weak energy diagnostic.
+        order = {"low": 0, "medium": 1, "high": 2}
+        row["confidence"] = min((row["confidence"], row["energy_confidence"]), key=order.get)
+        row["flags"] = ";".join(fl)
+    for c in crow:
+        members = [rows[list(modes).index(int(m))] for m in c['modes'].split()]
+        i = list(modes).index(int(c["modes"].split()[0]))
+        for k in CLASSES:
+            c[f"E_rel_{k}_pct"] = rows[i][f"E_rel_{k}_pct"]
+        c["E_rel_cross_term_pct"] = rows[i]["E_rel_cross_term_pct"]
+        c["E_reliable_dominant"] = rows[i]["E_reliable_dominant"]
+        c["E_resolved"] = rows[i]["E_resolved"]
+        for key in ('confidence', 'kinematic_confidence', 'energy_confidence'):
+            c[key] = min((row[key] for row in members), key=order.get)
+        c["flags"] = ";".join(sorted({f for row in members for f in row['flags'].split(';')
+                                     if f and not f.startswith('CLUSTER_')}))
 
 
 def _bolt_ring_check(res, groups, mesh):
@@ -2020,6 +2759,17 @@ def _reldom(r: dict) -> str:
     return r.get("reliable_dominant") or r["dominant"]
 
 
+def confidence_by_measure(rows) -> dict:
+    """Keep geometric classification confidence distinct from the auxiliary energy check."""
+    def counts(key, fallback=None):
+        return {c: sum(r.get(key, r.get(fallback)) == c for r in rows)
+                for c in ("high", "medium", "low")}
+    return dict(combined=counts("confidence"),
+                kinematic=counts("kinematic_confidence", "confidence"),
+                energy=counts("energy_confidence")
+                if any(r.get("energy_confidence") is not None for r in rows) else None)
+
+
 def dominance_stats(rows) -> dict:
     """Dominant mechanism of a set of modes = highest mean RELIABLE share (cluster result for
     near-degenerate modes); ties broken by the number of modes it dominates. Counts are also
@@ -2027,16 +2777,20 @@ def dominance_stats(rows) -> dict:
     mean = {k: float(np.mean([_rel(r, k) for r in rows])) for k in MECH}
     count = {k: int(sum(_reldom(r) == k for r in rows)) for k in MECH}
     count_hi = {k: int(sum(_reldom(r) == k and r.get("confidence") == "high" for r in rows)) for k in MECH}
-    conf = {c: int(sum(r.get("confidence") == c for r in rows)) for c in ("high", "medium", "low")}
+    conf = confidence_by_measure(rows)
     dom = max(MECH, key=lambda k: (mean[k], count[k]))
     return dict(mean_pct=mean, n_dominant=count, n_dominant_high_confidence=count_hi,
-                confidence_counts=conf, dominant_mechanism=dom, n_modes=len(rows))
+                confidence_counts=conf["combined"], confidence_by_measure=conf,
+                dominant_mechanism=dom, n_modes=len(rows))
 
 
 def select_top_modes(rows, mech: str, k: int) -> list[int]:
     """Indices of the k modes with the largest share of `mech`; symmetric twins
-    (identical eigenvalue and share) are shown once."""
-    order = sorted(range(len(rows)), key=lambda i: -_rel(rows[i], mech))
+    (identical eigenvalue and share) are shown once. Also retain the lowest-stress
+    G-dominant candidate, even if its share/confidence is lower: plotting must
+    not conceal it or upgrade its classification."""
+    order = sorted(range(len(rows)), key=lambda i: -(rows[i][mech+'_pct']
+                   if _reldom(rows[i]) == 'UNRESOLVED' else _rel(rows[i], mech)))
     sel = []
     for i in order:
         # members of one near-degenerate group share one (group) result: show the group once
@@ -2048,6 +2802,12 @@ def select_top_modes(rows, mech: str, k: int) -> list[int]:
             sel.append(i)
         if len(sel) >= k:
             break
+    if mech == 'G':
+        candidates = [i for i, row in enumerate(rows) if _reldom(row) == 'G']
+        if candidates:
+            first = min(candidates, key=lambda i: (rows[i]['eigenvalue'], rows[i]['mode']))
+            if first not in sel:
+                sel.append(first)
     return sel
 
 
@@ -2055,16 +2815,24 @@ def mechanism_critical(rows) -> list[dict]:
     """Per mechanism: lowest eigenvalue at which it governs with confidence high/medium
     (reliable = cluster-aware result), the lowest with high confidence only, and the lowest at
     which its reliable share first reaches 50 %. These are critical values of the MIXED
-    Abaqus modes, not pure-mode (constrained) values - use the REF_G / REF_L models for those."""
+    Abaqus modes, not pure-mode (constrained) values - use the REF_G / REF_L models for those.
+    Also report the lowest dominant candidate regardless of confidence, so an
+    earlier uncertain mode is visible rather than silently replaced by a later one."""
     out = []
     for k in MECH:
+        candidates = [r for r in rows if _reldom(r) == k]
+        candidate = min(candidates, key=lambda r: (r['eigenvalue'], r['mode'])) if candidates else None
         ok = [r for r in rows if _reldom(r) == k and r.get("confidence", "medium") != "low"]
         hi = [r for r in rows if _reldom(r) == k and r.get("confidence") == "high"]
-        h50 = [r for r in rows if _rel(r, k) >= 50.0]
+        h50 = [r for r in rows if _reldom(r) != 'UNRESOLVED'
+               and r.get('subspace_'+k+'_min_pct',_rel(r,k)) >= 50.0]
         f = min(ok, key=lambda r: r["eigenvalue"]) if ok else None
         fh = min(hi, key=lambda r: r["eigenvalue"]) if hi else None
         f50 = min(h50, key=lambda r: r["eigenvalue"]) if h50 else None
         out.append(dict(mechanism=k,
+                        first_candidate_mode=candidate['mode'] if candidate else None,
+                        first_candidate_eigenvalue=candidate['eigenvalue'] if candidate else None,
+                        first_candidate_confidence=candidate.get('confidence') if candidate else None,
                         first_dominant_mode=f["mode"] if f else None,
                         first_dominant_eigenvalue=f["eigenvalue"] if f else None,
                         first_dominant_sigma_cr_MPa=f["sigma_cr_MPa"] if f else None,
@@ -2188,7 +2956,8 @@ def make_mode_figures(out: Path, run_name: str, rows, modes, U, groups, mesh, re
     """Figures: top-k modes of the dominant mechanism, the top mode of every other mechanism
     (gallery) and mode 1. In-plane data of the top-k modes of EVERY mechanism are stored
     (figure_data.npz, float32) so the cross-run pass can redraw them without the shards.
-    Cost: a few small projections and <= k + 4 figures, drawn in parallel."""
+    The lowest-stress G candidate is retained alongside the share-ranked gallery,
+    without changing its confidence, mode number or eigenvalue."""
     g = max(groups, key=lambda gg: len(gg.rings))
     z_ring = mesh.ring_z[g.rings]
     bolt_z = sorted({round(z, 6) for s in g.seams for z in s["z"]})
@@ -2197,7 +2966,7 @@ def make_mode_figures(out: Path, run_name: str, rows, modes, U, groups, mesh, re
     for mech in MECH:
         top = select_top_modes(rows, mech, st.top_modes)
         store.update(top)
-        for i in (top if mech == dominant else top[:1]):
+        for i in (top if mech == dominant or mech == 'G' else top[:1]):
             plot.setdefault(i, []).append(mech)
     saved = {int(modes[i]): ring_inplane(U[i], g, mesh).astype(np.float32) for i in sorted(store)}
     jobs = []
@@ -2215,7 +2984,7 @@ def make_mode_figures(out: Path, run_name: str, rows, modes, U, groups, mesh, re
                              proj=proj32, row=rows[i], z=mesh.ring_z, prof=res["prof"][:-1, :, i],
                              z_ring=z_ring, bolt_z=bolt_z, title=f"{run_name}   [{lab}]"))
     if jobs and st.plots != "none":
-        with cf.ProcessPoolExecutor(max_workers=max(1, min(N_THREADS, len(jobs)))) as ex:
+        with _process_pool(len(jobs)) as ex:
             list(ex.map(_plot_mode_sections, jobs))
     ms = sorted(saved)
     np.savez_compressed(out / "figure_data.npz", p=g.p, edges=g.edges, z_ring=z_ring, z=mesh.ring_z,
@@ -2247,14 +3016,27 @@ def fold_detection_stability(groups, t: float, st: Settings) -> dict:
 # ----------------------------------------------------------------------------
 # 11. One run
 # ----------------------------------------------------------------------------
+def report_flag_counts(rows) -> dict:
+    """Number of modes carrying each exact diagnostic token, excluding group identifiers."""
+    counts = dict.fromkeys(("UNRELIABLE_OTHER", "AMBIGUOUS_DOMINANT", "CROSS_TERM", "LOW_MARGIN",
+                            "MIXED", "DEFINITION_SENSITIVE", "DOMINANT_UNSTABLE", "ENERGY_DISAGREES",
+                            "ENERGY_AMBIGUOUS", "ENERGY_CROSS_TERM", "ENERGY_BEYOND_SECTION",
+                            "ENERGY_INCOMPATIBLE_COMPONENTS"), 0)
+    for row in rows:
+        for flag in sorted(set(row.get("flags", "").split(";"))):
+            if flag and not flag.startswith("CLUSTER_"):
+                counts[flag] = counts.get(flag, 0) + 1
+    return counts
+
+
 def reliability_summary(rows) -> dict:
     """Run-level indicators of how far the reported shares can be trusted."""
     def q(key):
         v = np.array([r[key] for r in rows if r.get(key) is not None and np.isfinite(r[key])], float)
         return None if not v.size else dict(median=float(np.median(v)), p90=float(np.percentile(v, 90)),
                                              max=float(v.max()))
-    out = dict(n_modes=len(rows),
-               confidence={c: int(sum(r.get("confidence") == c for r in rows)) for c in ("high", "medium", "low")},
+    conf = confidence_by_measure(rows)
+    out = dict(n_modes=len(rows), confidence=conf["combined"], confidence_by_measure=conf,
                split_spread_pct=q("split_spread_pct"), abs_cross_term_pct=None, O_pct=q("O_pct"),
                fold_motion_ratio=q("fold_motion_ratio"))
     xt = np.array([abs(r["cross_term_pct"]) for r in rows if np.isfinite(r["cross_term_pct"])])
@@ -2263,7 +3045,9 @@ def reliability_summary(rows) -> dict:
                                          max=float(xt.max()))
     out["note"] = ("split_spread_pct = largest change of a reliable share when the fold-arc rotation is "
                    "measured on either side of the arc; abs_cross_term_pct = overlap of the class "
-                   "components (normalised and signed shares allot it differently)")
+                   "components (normalised and signed shares allot it differently). "
+                   "confidence is the combined grade; confidence_by_measure separates kinematic "
+                   "classification from auxiliary energy evaluation (null when unavailable).")
     return out
 
 
@@ -2296,10 +3080,15 @@ def process_run(run_dir: Path, st: Settings) -> dict:
         bjd = json.loads(bj.read_text(encoding="utf-8"))
         sigma_ref = bjd.get("reference_stress_MPa")
         load_case = bjd.get("load_case") or load_case
-    m_ref = load_case.get("reference_moment_mesh_Nmm_per_MPa") if load_case.get("type") == "bending" else None
-    if m_ref:
-        log(f"  load case: bending, neutral axis {load_case.get('neutral_axis_angle_deg')} deg; eigenvalue = "
-            f"extreme-fibre stress (MPa), M_cr = eigenvalue x {m_ref:.6g} N mm")
+    m_ref = (load_case.get("reference_moment_mesh_Nmm_per_MPa")
+             if load_case.get("type") in ("bending", "combined") else None)
+    p_ref = (load_case.get("reference_axial_force_mesh_N_per_MPa")
+             if load_case.get("type") == "combined" else None)
+    if m_ref is not None:
+        log(f"  load case: {load_case['type']}, neutral axis {load_case.get('neutral_axis_angle_deg')} deg"
+            + (f", P-M ray {load_case.get('pm_angle_deg')} deg" if p_ref is not None else "")
+            + f"; eigenvalue = extreme-fibre stress (MPa), M_cr = eigenvalue x {m_ref:.6g} N mm"
+            + (f", P_cr = eigenvalue x {p_ref:.6g} N" if p_ref is not None else ""))
 
     import importlib.util
     if st.plots != "none" and importlib.util.find_spec("matplotlib") is None:
@@ -2347,6 +3136,7 @@ def process_run(run_dir: Path, st: Settings) -> dict:
     report = dict(
         program="gdlc_mode_decomposition.py", version=VERSION, run_dir=str(run_dir),
         export_dir=str(exp_dir), inp=str(inp_path) if inp_path else None,
+        source_odb_sha256=meta.get("source_odb_sha256"), source_inp_sha256=meta.get("source_inp_sha256"),
         settings={k: v for k, v in st.__dict__.items()},
         thickness_mm=t, member_axis=mesh.axis.tolist(), rings=len(mesh.ring_z),
         load_case={k: v for k, v in load_case.items() if k not in ("section_symmetry",)},
@@ -2358,23 +3148,62 @@ def process_run(run_dir: Path, st: Settings) -> dict:
                                  | {"n_rings_linked": len(set(np.round(s['z'], 6)))} for s in g.seams],
                           near_threshold_nodes=g.ambiguous) for g in groups],
         self_test=tests,
+        geometry_coordinates=mesh.geometry,
         analytical_benchmarks=bench,
         fold_detection_stability=fold_stab,
         inp_notes=inp.notes if inp else ["no .inp found: seam diagnostics unavailable"],
-        methodological_scope="Project-specific in-plane kinematic split; uniform homogeneous stiffness; "
-                             "not a full cFSM/GBT or strain-energy decomposition. Fold-arc extent is heuristic; "
-                             "internal benchmarks and constrained references are not independent validation.",
+        methodological_scope="Project-specific in-plane kinematic split (classes); with stiffness_export the "
+                             "class components are also evaluated in strain energy with the real elastic K "
+                             "(minimum-energy completion; not an energy-orthogonal split). Fold-arc extent is "
+                             "heuristic; internal benchmarks and constrained references are not independent "
+                             "validation.",
         percentage_definition="share_M = sum_r dz_r ||phi_M,r||_W^2 / sum_N(...); in-plane translations; "
                               "share of cross-sectional deformation (not energy, not load)",
         resources=dict(threads=N_THREADS, logical_cpus=os.cpu_count(),
                        ram_GB=(psutil.virtual_memory().total / 1e9) if psutil else None),
     )
+    plate_mask = np.char.startswith(mesh.instance.astype(str), 'STEEL_PLATE_')
+    if np.any(plate_mask):
+        report['steel_plate_scope'] = dict(
+            instances=sorted(set(mesh.instance[plate_mask].tolist())),
+            kinematic_percentages='longitudinal column walls only; transverse plates excluded from ring families',
+            energy_O='actual transverse plate mode field assigned to O; full model K and U/UR retained; '
+                     'O energy includes plate response and is not a pure wall family',
+            reference_models='G/L equations constrain column walls; REF_G rigid rings also carry the plate bolt node '
+                             'and its offset-BEAM axial rotation; plates and bolt MPCs preserved')
+        report['methodological_scope'] += (' With transverse steel plates, kinematic shares concern the column walls; '
+            'the O energy block also carries the actual plate transverse motion. It is not a pure family.')
+    report['classification_interpretation'] = dict(
+        C='relative rigid motion of the separate member pieces, not generic coupling',
+        mixed='MIXED_KINEMATICS means several sectional families in one vector; nonlinear interaction is not inferred',
+        clusters='trace averages and subspace family-share ranges are separate from individual mode labels; '
+                 'heterogeneous subspaces have UNRESOLVED reliable dominance',
+        G='rigid sectional motion; inspect halfwave_G_mm before interpreting it as member-level global buckling',
+        plates='cluster deformation screening uses the maximum attainable residual/full displacement quotient')
     if st.selftest_only:
         (out / "basis_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         log(f"  self-test only: wrote {out/'basis_report.json'}")
         return report
 
-    modes, U = load_modes(exp_dir, meta, mesh, st)
+    # elastic stiffness for the energy evaluation (exported after the buckling run, see
+    # ensure_stiffness); it needs the rotations of the modes as well
+    kmeta, energy_note = None, None
+    if st.stiffness == "never":
+        energy_note = "disabled (--stiffness never)"
+    elif (run_dir / "gdlc_reference.json").is_file():
+        energy_note = "reference model: constraints (*Equation) not part of the energy evaluation"
+    elif inp_path is None or inp is None:
+        energy_note = "no .inp"
+    else:
+        kmeta = gst.stiffness_status(run_dir, file_sha256(inp_path))
+        if kmeta is None:
+            energy_note = (f"no {gst.STIFFNESS_DIR}/ for the current .inp (run with --stiffness auto, which "
+                           "writes and solves the matrix-generation job)")
+    if energy_note and st.stiffness == "required" and not (run_dir / "gdlc_reference.json").is_file():
+        raise RuntimeError(f"--stiffness required: {energy_note}")
+    loaded = load_modes(exp_dir, meta, mesh, st, rotations=kmeta is not None)
+    modes, U = loaded[0], loaded[1]
+    UR = loaded[2] if kmeta is not None else None
     eig_map = {m["mode"]: m["eigenvalue"] for m in meta["modes"]}
     eig = np.array([eig_map[m] for m in modes], dtype=float)
     if not np.all(np.isfinite(eig)):
@@ -2387,6 +3216,8 @@ def process_run(run_dir: Path, st: Settings) -> dict:
         report["excluded_nonpositive_modes"] = [int(m) for m, k in zip(modes, keep) if not k]
         modes = [m for m, k in zip(modes, keep) if k]
         U, eig = U[keep], eig[keep]
+        if UR is not None:
+            UR = UR[keep]
         if not modes:
             raise RuntimeError("no mode with a positive eigenvalue")
     t1 = time.time()
@@ -2405,9 +3236,57 @@ def process_run(run_dir: Path, st: Settings) -> dict:
         sens = split_sensitivity(groups, mesh, U, st, eig, t, inp)
         log(f"  split sensitivity (fold-arc rotation from either arc side): {time.time()-t1:.1f} s")
     rows, crow = summarise(res, modes, eig, sigma_ref, groups, mesh, st, sens)
-    if m_ref:
-        for r in rows:                                   # bending: critical moment of every mode
+    add_plate_columns(rows, crow, plate_motion_shares(mesh, U, clusters=clusters_of(eig,st.cluster_rel_tol)), st)
+    if kmeta is not None:
+        try:
+            en = energy_evaluation(run_dir, groups, mesh, inp, modes, eig, U, UR, res, st, kmeta)
+            add_energy_columns(rows, crow, en, modes, st)
+            np.savez_compressed(out / "mode_energy.npz", modes=np.array(modes), eigenvalue=eig,
+                                classes=np.array(CLASSES), E=en["E"], E_group=en["Ecl"], U=en["U"],
+                                bolt_incompatibility=en["bolt"],
+                                layout="E[i, f, g] = w_f^T S w_g of mode i (in-plane class components f, g, "
+                                       "minimum-energy completion; units of the exported mode scaling); "
+                                       "E_group[i] = the same traced over the eigenvalue group of mode i "
+                                       "(basis-invariant); U[i] = v^T K v of the full mode (U and UR); "
+                                       "factor 1/2 omitted everywhere")
+            emean = {k: float(np.mean([r[f"E_rel_{k}_pct"] for r in rows])) for k in CLASSES}
+            energy_flags = report_flag_counts(rows)
+            report["energy_evaluation"] = dict(
+                available=True, stiffness_export={k: kmeta.get(k) for k in (
+                    "job", "node_map", "rigid_body_residual", "matrix", "source_inp_sha256", "created_at")},
+                validation=en["validation"], mean_E_rel_pct=emean,
+                n_energy_dominant={k: sum(r["E_reliable_dominant"] == k for r in rows) for k in MECH},
+                n_energy_disagrees=energy_flags["ENERGY_DISAGREES"],
+                n_energy_ambiguous=energy_flags["ENERGY_AMBIGUOUS"],
+                n_energy_cross_term=energy_flags["ENERGY_CROSS_TERM"],
+                n_energy_beyond_section=energy_flags["ENERGY_BEYOND_SECTION"],
+                n_energy_incompatible_components=energy_flags["ENERGY_INCOMPATIBLE_COMPONENTS"],
+                median_E_beyond_section_pct=_median(rows, "E_beyond_section_pct"),
+                median_abs_E_cross_term_pct=_median(rows, "E_cross_term_pct", absolute=True),
+                median_bolt_incompatibility_pct=_median(rows, "bolt_incompatibility_pct"),
+                definition=gst.__doc__.split("Part 2")[1].strip())
+            log("  energy shares (reliable, mean %): " + " ".join(f"{k}{v:.1f}" for k, v in emean.items())
+                + f"; resolved energy dominant differs from the kinematic one in "
+                  f"{report['energy_evaluation']['n_energy_disagrees']} mode(s)")
+            if any(energy_flags[k] for k in ("ENERGY_AMBIGUOUS", "ENERGY_CROSS_TERM",
+                                             "ENERGY_BEYOND_SECTION", "ENERGY_INCOMPATIBLE_COMPONENTS")):
+                log(f"  WARNING: auxiliary energy split: {energy_flags['ENERGY_AMBIGUOUS']} ambiguous, "
+                    f"{energy_flags['ENERGY_CROSS_TERM']} large cross term, "
+                    f"{energy_flags['ENERGY_BEYOND_SECTION']} beyond-section energy, "
+                    f"{energy_flags['ENERGY_INCOMPATIBLE_COMPONENTS']} incompatible components; "
+                    "energy shares do not establish independent physical family fractions")
+        except Exception as e:
+            if st.stiffness == "required":
+                raise
+            energy_note = f"failed: {str(e).splitlines()[0][:300]}"
+            log(f"  WARNING: energy evaluation {energy_note}")
+    if energy_note:
+        report["energy_evaluation"] = dict(available=False, reason=energy_note)
+    if m_ref is not None:
+        for r in rows:                                   # bending / P-M: critical moment (and force)
             r["M_cr_kNm"] = r["eigenvalue"] * float(m_ref) / 1e6
+            if p_ref is not None:
+                r["P_cr_kN"] = r["eigenvalue"] * float(p_ref) / 1e3
     write_csv(out / "mode_participation.csv", rows)
     write_csv(out / "cluster_participation.csv", crow)
     np.savez_compressed(out / "longitudinal_profiles.npz", z=mesh.ring_z, dz=res["dz"], modes=np.array(modes),
@@ -2419,11 +3298,13 @@ def process_run(run_dir: Path, st: Settings) -> dict:
                                    "axial_slip: (n_seams, rings, modes) = u_axial(B)-u_axial(A)")
     stats = dominance_stats(rows)
     crit = mechanism_critical(rows)
-    if m_ref:
+    if m_ref is not None:
         for c in crit:
             for k in ("first_dominant", "first_high_confidence", "first_share50"):
                 e = c.get(f"{k}_eigenvalue")
                 c[f"{k}_M_cr_kNm"] = e * float(m_ref) / 1e6 if e is not None else None
+                if p_ref is not None:
+                    c[f"{k}_P_cr_kN"] = e * float(p_ref) / 1e3 if e is not None else None
     write_csv(out / "mechanism_critical_stresses.csv", crit)
     refc = reference_check(run_dir, rows)
     if refc:
@@ -2433,8 +3314,12 @@ def process_run(run_dir: Path, st: Settings) -> dict:
     report["mechanism_critical"] = crit
     log(f"  dominant mechanism: {stats['dominant_mechanism']}  mean reliable % "
         + " ".join(f"{k}{v:.1f}" for k, v in stats["mean_pct"].items())
-        + f"   confidence high/medium/low: {stats['confidence_counts']['high']}/"
+        + f"   combined confidence high/medium/low: {stats['confidence_counts']['high']}/"
           f"{stats['confidence_counts']['medium']}/{stats['confidence_counts']['low']}")
+    for measure in ("kinematic", "energy"):
+        c = stats["confidence_by_measure"][measure]
+        if c is not None:
+            log(f"  {measure} confidence high/medium/low: {c['high']}/{c['medium']}/{c['low']}")
     if st.plots != "none":
         t2 = time.time()
         plot_dominance(out / "dominance_summary.png", rows, stats, run_dir.name)
@@ -2444,9 +3329,7 @@ def process_run(run_dir: Path, st: Settings) -> dict:
         log(f"  {figinfo['n_figures']} cross-section figures in {time.time()-t2:.1f} s")
     report["n_modes"] = len(modes)
     report["n_clusters"] = len(crow)
-    report["flag_counts"] = {f: sum(f in r["flags"] for r in rows)
-                             for f in ("UNRELIABLE_OTHER", "AMBIGUOUS_DOMINANT", "CROSS_TERM", "LOW_MARGIN",
-                                       "MIXED", "DEFINITION_SENSITIVE", "DOMINANT_UNSTABLE")}
+    report["flag_counts"] = report_flag_counts(rows)
     report["reliability"] = reliability_summary(rows)
     report["elapsed_s"] = time.time() - t0
     (out / "basis_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
@@ -2457,7 +3340,7 @@ def process_run(run_dir: Path, st: Settings) -> dict:
         pdir.mkdir(exist_ok=True)
         jobs = [(str(pdir / f"mode_{m:04d}.png"), mesh.ring_z, res["prof"][:-1, :, i], m, eig[i], rows[i])
                 for i, m in enumerate(modes)]
-        with cf.ProcessPoolExecutor(max_workers=N_THREADS) as ex:
+        with _process_pool(len(jobs)) as ex:
             list(ex.map(_plot_mode, jobs, chunksize=max(1, len(jobs) // (4 * N_THREADS) or 1)))
     log(f"  done in {time.time()-t0:.1f} s -> {out}")
     return report
@@ -2519,6 +3402,7 @@ def cross_run_summary(runs: list[Path], st: Settings) -> None:
         if bjf:
             lc = json.loads(bjf.read_text(encoding="utf-8")).get("load_case") or {}
         per_run.append(dict(run=r.name, load_case=lc.get("type", "compression"),
+                            pm_angle_deg=lc.get("pm_angle_deg"),
                             bending_axis_deg=lc.get("neutral_axis_angle_deg"),
                             n_modes=len(rows), dominant=s["dominant_mechanism"],
                             **{f"mean_{k}_pct": s["mean_pct"][k] for k in MECH},
@@ -2529,9 +3413,16 @@ def cross_run_summary(runs: list[Path], st: Settings) -> None:
                             first_mode_label=first.get("reliable_label") or first["label"],
                             first_mode_confidence=first.get("confidence"),
                             **{f"first_{k}_dominant_eigenvalue": crit[k]["first_dominant_eigenvalue"] for k in MECH},
+                            **{f"first_{k}_candidate_mode": crit[k]["first_candidate_mode"] for k in MECH},
+                            **{f"first_{k}_candidate_eigenvalue": crit[k]["first_candidate_eigenvalue"] for k in MECH},
+                            **{f"first_{k}_candidate_confidence": crit[k]["first_candidate_confidence"] for k in MECH},
                             median_split_spread_pct=_median(rows, "split_spread_pct"),
                             median_abs_cross_term_pct=_median(rows, "cross_term_pct", absolute=True),
                             median_fold_motion_ratio=_median(rows, "fold_motion_ratio"),
+                            **{f"mean_E_rel_{k}_pct": (float(np.mean([x[f"E_rel_{k}_pct"] for x in rows]))
+                                                       if all(isinstance(x.get(f"E_rel_{k}_pct"), float) for x in rows)
+                                                       else None) for k in CLASSES},
+                            n_energy_disagrees=sum("ENERGY_DISAGREES" in str(x.get("flags", "")) for x in rows),
                             n_definition_sensitive=sum("DEFINITION_SENSITIVE" in str(x.get("flags", "")) for x in rows),
                             n_dominant_unstable=sum("DOMINANT_UNSTABLE" in str(x.get("flags", "")) for x in rows)))
     if not all_rows:
@@ -2548,10 +3439,13 @@ def cross_run_summary(runs: list[Path], st: Settings) -> None:
             check = refs.get(pr["run"], {}).get(kind)
             pr[f"constrained_{kind}_reference_eigenvalue"] = check["first_eigenvalue"] if check else None
             pr[f"{kind}_reference_check_passed"] = check["passed"] if check else None
+            if kind == 'G':
+                pr['G_reference_scope'] = check.get('global_scope') if check else None
             # Retain the legacy column for readers, but never advertise a failed
             # kinematic reference check as a pure-family critical value.
             pr[f"pure_{kind}_reference_eigenvalue"] = (
-                check["first_eigenvalue"] if check and check["passed"] else None)
+                check["first_eigenvalue"] if check and check["passed"]
+                and (kind != 'G' or check.get('governing_global_eligible', False)) else None)
     gstats = dominance_stats(all_rows)
     gmech = gstats["dominant_mechanism"]
     write_csv(sdir / "runs_summary.csv", per_run)
@@ -2582,7 +3476,7 @@ def cross_run_summary(runs: list[Path], st: Settings) -> None:
                              prof=d["prof"][j], z_ring=d["z_ring"], bolt_z=list(d["bolt_z"]),
                              title=f"{r.name}   [global dominant mechanism {gmech}]"))
     if jobs:
-        with cf.ProcessPoolExecutor(max_workers=max(1, min(N_THREADS, len(jobs)))) as ex:
+        with _process_pool(len(jobs)) as ex:
             list(ex.map(_plot_mode_sections, jobs))
     log(f"  cross-run summary -> {sdir}  ({len(jobs)} figures)")
 
@@ -2611,7 +3505,17 @@ def _nset_lines(name: str, nodes: list, inst_split=True) -> list[str]:
         labs = sorted(set(labs))
         out += [", ".join(str(x) for x in labs[i:i + 16]) for i in range(0, len(labs), 16)]
     out.append(f"*Nset, nset={name}")
-    out += [", ".join(parts[i:i + 8]) for i in range(0, len(parts), 8)]
+    # Abaqus truncates data lines beyond 256 characters. Eight long instance-set
+    # names can exceed that limit; wrap at token boundaries without losing nodes.
+    # Keep the old eight-name grouping whenever it fits, preserving valid inputs.
+    group = []
+    for part in parts:
+        if group and (len(group) == 8 or len(", ".join(group + [part])) > 256):
+            out.append(", ".join(group))
+            group = []
+        group.append(part)
+    if group:
+        out.append(", ".join(group))
     return out
 
 
@@ -2674,12 +3578,87 @@ def odb_status(odb: Path) -> str:
     return "ok"
 
 
+ARCHIVE_DIR = "superseded_attempts"      # preserved unusable reference attempts (never scanned as runs)
+
+
+def solver_artifacts(folder: Path, job: str) -> list[Path]:
+    """Everything an Abaqus run of <job> leaves next to its input (<job>.odb/.dat/.msg/.sta/
+    .prt/.com/.sim/.simdir/.stt/.mdl/.023/.lck/...); the input <job>.inp itself is excluded."""
+    prefix, own_input = job.lower() + ".", job.lower() + ".inp"
+    try:
+        return sorted(p for p in folder.iterdir()
+                      if p.name.lower().startswith(prefix) and p.name.lower() != own_input)
+    except FileNotFoundError:
+        return []
+
+
+def running_job_message(folder: Path, job: str) -> str:
+    return (f"{folder / (job + '.lck')} exists: Abaqus job {job} is running, or it was killed without "
+            f"clean-up. Wait for it, or stop it with 'abaqus terminate job={job}'; delete a stale .lck "
+            f"only when no Abaqus process of this job remains. Its files are never touched while locked.")
+
+
+def archive_attempt(folder: Path, job: str, reason: str, include_input: bool = False) -> Path | None:
+    """Move an unusable (failed, interrupted, stale or superseded) solver attempt of <job> to
+    <folder>/superseded_attempts/<time>_<reason>/ so the destination is free for a new solve.
+    Nothing is deleted or overwritten (same-volume rename). include_input also moves the
+    attempt's <job>.inp and copies gdlc_reference.json (as gdlc_reference_of_this_attempt.json,
+    so the archive is never taken for a reference folder), so the archive is self-contained.
+    Callers never use it for a running job or a successfully completed .odb."""
+    if (folder / f"{job}.lck").exists():
+        raise RuntimeError(running_job_message(folder, job))
+    items = solver_artifacts(folder, job)
+    own_input = folder / f"{job}.inp"
+    if include_input and own_input.is_file():
+        items.append(own_input)
+    if not items:
+        return None
+    root = folder / ARCHIVE_DIR
+    dest = root / f"{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{reason}"
+    k = 2
+    while dest.exists():
+        dest = root / f"{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{reason}_{k}"
+        k += 1
+    dest.mkdir(parents=True)
+    for p in items:
+        p.rename(dest / p.name)
+    if include_input and (folder / "gdlc_reference.json").is_file():
+        shutil.copy2(folder / "gdlc_reference.json", dest / "gdlc_reference_of_this_attempt.json")
+    log(f"  preserved {len(items)} file(s) of the previous {job} attempt ({reason}) in {dest}")
+    return dest
+
+
+def lanczos_refusal(folder: Path, job: str) -> str | None:
+    """Text of the first ***ERROR block in <job>.dat / <job>.msg that names the Lanczos
+    eigensolver (Abaqus refusing it for this model), else None."""
+    for ext in (".dat", ".msg"):
+        f = folder / f"{job}{ext}"
+        if not f.is_file():
+            continue
+        blocks, cur = [], None
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if s.upper().startswith("***ERROR"):
+                cur = [s]
+                blocks.append(cur)
+            elif cur is not None and s and not s.startswith("***"):
+                cur.append(s)
+            else:
+                cur = None
+        for b in blocks:
+            text = " ".join(b)
+            if "LANCZOS" in text.upper():
+                return text
+    return None
+
+
 def lanczos_restrictions(lines: list[str]) -> list[str]:
     """Model features for which Abaqus refuses the Lanczos eigensolver in *BUCKLE
     (Abaqus Analysis Guide, 'Eigenvalue buckling prediction'): contact pairs / contact
     elements, hybrid elements, connector elements, distributing couplings. General
-    contact (*Contact) is not in that list; if a solve is refused anyway,
-    solve_reference_model() falls back to subspace iteration automatically."""
+    contact (*Contact) is not in that list (A4784 reference models with general contact
+    solve with Lanczos); if a solve is refused anyway, solve_reference_model() preserves that
+    attempt and falls back to subspace iteration automatically."""
     found = set()
     for l in lines:
         u = l.strip().upper()
@@ -2722,9 +3701,9 @@ def buckle_min_eigenvalue(lines: list[str]):
 def set_buckle_solver(lines: list[str], n_modes: int, solver: str, min_eig=None) -> list[str]:
     """Rewrite the (first) *BUCKLE of the step for n_modes eigenvalues with the given
     eigensolver. Other *BUCKLE parameters are kept.
-      lanczos : data line 'n' (no eigenvalue range: the n eigenvalues closest to zero,
-                as with subspace iteration), default block size and block steps;
-                'n, min_eig' when the source run restricts the range (bending: min 0).
+      lanczos : data line 'n, min_eig' (reference models: min_eig = 0, the n lowest
+                eigenvalues >= 0 of the reference load), default block size and block
+                steps; 'n' (no range) only when min_eig is None.
       subspace: 'n, , q, 1250' with q = max(4n, n+16) vectors. Many near-equal
                 eigenvalues (local modes of a long member) make subspace iteration
                 converge as (lambda_n/lambda_{q+1})^k, so a small subspace (q = 2n) can need
@@ -2748,30 +3727,168 @@ def set_buckle_solver(lines: list[str], n_modes: int, solver: str, min_eig=None)
     raise RuntimeError("no *BUCKLE step in the source .inp")
 
 
+REF_G_FORMULATION = "rigid_ring_equations_v3"                    # includes offset BEAM rotations
+REF_G_FORMULATION_NO_TWIST = "rigid_ring_translation_equations_v2"
+
+
+def ref_g_twist_mode(run_dir: Path, setting: str, load_case=None) -> tuple[str, str]:
+    """Restore the requested flexural-only compression reference.
+
+    Bending/combined references retain twist for lateral-torsional buckling.
+    Explicit free/restrained requests override the automatic load-case policy.
+    """
+    if setting in ("restrained", "free"):
+        return setting, f"--ref-g-twist {setting}"
+    if load_case is None:
+        build_path = next(iter(sorted(run_dir.glob('*_build.json'))), None)
+        load_case = ((json.loads(build_path.read_text(encoding='utf-8')).get('load_case') or {})
+                     if build_path else {})
+    kind = load_case.get('type', 'compression')
+    if kind == 'compression':
+        return "restrained", "auto: compression run (global flexural buckling only)"
+    return "free", f"auto: {kind} run (lateral-torsional buckling needs the twist)"
+
+
+def rigid_ring_equations(ring, inplane, mpc_independent=(), bc_nodes=(), twist: bool = True,
+                         beam_rotation_nodes=()):
+    """*Equation lines making one cross-section ring rigid in its own plane.
+    twist=False: the ring may only TRANSLATE in its plane (u_i = u_a for every node,
+    2 rigid DOFs per ring): no rotation of the section about the member axis, so no
+    torsional or flexural-torsional buckling; flexure and warping stay free.
+
+    ring: [((instance, label), (p1, p2))] in-plane coordinates in the order of `inplane`.
+    Rigid motion: u_i = u_a + theta * k x (r_i - r_a). Masters: node a (a node with a BC,
+    e.g. the axial anchor, when present; otherwise far from the centroid) and the node b
+    farthest from a; theta = (u_bj - u_aj) / (L n_j), n = k x (r_b - r_a)/L, j = argmax|n_j|.
+    Dependent DOFs (first term of each equation, coefficient 1): b's other in-plane DOF and
+    both in-plane DOFs of every other node; masters are never MPC-independent bolt nodes and
+    no dependent DOF appears in another equation. Optional BEAM controls have their
+    axial rotation tied to the same ring twist, so their offset dependent nodes
+    also follow the rigid ring. With twist=False those rotations must instead be
+    held by *Boundary by the caller. Returns (lines, number of equations)."""
+    if len(ring) < (3 if twist else 2):
+        return [], 0
+    pts = np.array([p for unused, p in ring], float)
+    keys = [k_ for k_, unused in ring]
+    free = [i for i, k_ in enumerate(keys) if k_ not in mpc_independent] or list(range(len(ring)))
+    centre = pts.mean(0)
+    with_bc = [i for i in free if keys[i] in bc_nodes]
+    a = with_bc[0] if with_bc else max(free, key=lambda i: (np.linalg.norm(pts[i] - centre), -i))
+    if not twist:                                         # pure in-plane translation of the ring
+        lines = []
+        for i, key_i in enumerate(keys):
+            if i == a:
+                continue
+            for c_ in (0, 1):
+                lines += ["*Equation", "2",
+                          f"{key_i[0]}.{key_i[1]}, {inplane[c_]}, 1., {keys[a][0]}.{keys[a][1]}, {inplane[c_]}, -1."]
+        return lines, 2 * (len(keys) - 1)
+    b = max(free, key=lambda i: (np.linalg.norm(pts[i] - pts[a]), -i))
+    rab = pts[b] - pts[a]
+    length = float(np.linalg.norm(rab))
+    if length <= 1e-9 * max(1.0, float(np.abs(pts).max())):
+        raise RuntimeError("degenerate ring: master nodes coincide")
+    n = np.array([-rab[1], rab[0]]) / length
+    j = int(np.argmax(np.abs(n)))
+    k = 1 - j
+    lines, count = [], 0
+
+    rot_dof = 9 - sum(inplane)
+    dofs = list(inplane) + [rot_dof]
+    def emit(terms):
+        merged = {}
+        for node, comp, coef in terms:
+            merged[(node, comp)] = merged.get((node, comp), 0.0) + coef
+        out = [(nd, c_, v) for (nd, c_), v in merged.items() if abs(v) > 1e-12 or (nd, c_) == terms[0][:2]]
+        items = [f"{nd[0]}.{nd[1]}, {dofs[c_]}, {v:.15g}" for nd, c_, v in out]
+        return ["*Equation", str(len(out))] + [", ".join(items[i:i + 4]) for i in range(0, len(items), 4)]
+
+    ka, kb = keys[a], keys[b]
+    ratio = n[k] / n[j]
+    lines += emit([(kb, k, 1.0), (ka, k, -1.0), (kb, j, -ratio), (ka, j, ratio)])
+    count += 1
+    for i, key_i in enumerate(keys):
+        if i in (a, b):
+            continue
+        w = np.array([-(pts[i][1] - pts[a][1]), pts[i][0] - pts[a][0]])
+        for c_ in (0, 1):
+            f = w[c_] / (length * n[j])
+            lines += emit([(key_i, c_, 1.0), (ka, c_, -1.0), (kb, j, -f), (ka, j, f)])
+            count += 1
+    # The ordered in-plane axes are left handed about global Y: UR5 = -theta.
+    sign = float(np.cross(np.eye(3)[inplane[0]-1], np.eye(3)[inplane[1]-1])[rot_dof-4])
+    for ctl in sorted(set(beam_rotation_nodes)):
+        lines += emit([(ctl, 2, 1.0), (kb, j, -sign/(length*n[j])),
+                       (ka, j, sign/(length*n[j]))])
+        count += 1
+    return lines, count
+
+
 def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes: int = 20) -> list[Path]:
     """Writes <run>_REF_G/ and <run>_REF_L/ next to the run, each with a modified .inp
     (submit it with Abaqus, then export its modes as for any run):
-      REF_G: every cross-section ring is kept rigid IN ITS PLANE by a kinematic coupling
-             (in-plane DOFs) to a ring reference node; axial (warping) displacements and
-             seam slip stay free.  Its eigenmodes are pure G (flexural / torsional /
-             flexural-torsional, including partial composite action of the built-up member)
-             and its first eigenvalue is the pure-G critical stress.
+      REF_G: every cross-section ring is kept rigid IN ITS PLANE by linear *Equation rows
+             (no reference nodes); axial (warping) displacements and the existing axial
+             connection kinematics are retained. Offset BEAM control rotations follow
+             the ring twist so their eliminated wall nodes stay on the rigid ring.
+             st.ref_g_twist (auto = restrained for compression, free for bending/combined):
+             restrained -> each ring only translates in its plane (2 DOFs per ring): pure
+             global FLEXURAL modes (no torsional / flexural-torsional buckling);
+             free -> 3 rigid DOFs per ring: flexural, torsional, flexural-torsional or
+             lateral-torsional modes. Partial composite action of the built-up member is
+             kept in both; the first eigenvalue is the constrained-G critical stress.
       REF_L: the virtual sharp corner of every fold is held in the section plane along the
              whole member (fold rotation free), written as *Equation rows identical to the
-             classifier's fold-driver rows: no G or D motion is possible; seams stay as
-             built, so its first eigenvalue is the corner-restrained local reference
-             (L, possibly with C = non-composite motion of connected parts).
-    Both use the Lanczos eigensolver (much faster than subspace iteration for the dense,
-    near-equal local spectrum of a long member); a model Abaqus refuses for Lanczos falls
-    back to subspace iteration automatically (see solve_reference_model).
+             classifier's exact fold-driver rows, including short arcs (no shell-rotation
+             substitution). Seams and plate flexibility stay as built. This is a
+             corner-restrained local candidate; the solved modes must pass the wall
+             and attachment-deformation checks before being called predominantly L.
+    Eigensolver: Lanczos with the eigenvalue range [min, inf), min = the source's own
+    minimum when it sets one (bending: 0), else 0 - every reference load is a reference
+    stress pattern whose eigenvalue is a critical stress, and an eigenvalue < 0 belongs to
+    the REVERSED load, another load case (the classifier excludes it, and Step 4 selects
+    modes by number). Without that range Lanczos also has to certify the negative side and
+    can widen its negative trust interval again and again; subspace iteration converges
+    with (lambda_n/lambda_q)^k and stalls on the dense local spectra of long members (REF_L:
+    20 eigenvalues within 1 %, no eigenvalue converged after 60 iterations). Subspace
+    iteration is used only when model features forbid Lanczos or Abaqus refused it for this
+    formulation (see solve_reference_model, which falls back automatically).
+    An existing reference folder whose input differs from the regenerated one: a completed
+    .odb is never replaced (FileExistsError); a running job (.lck) is never touched; an
+    unfinished/failed attempt is moved to superseded_attempts/ (preserved) and the new
+    input is written.
     Nodes with in-plane boundary conditions or eliminated by an *MPC are not constrained again."""
-    exp_dir, meta = choose_export(run_dir, st.export_dir)
+    # Geometry source: the modal export (.odb node coordinates) as before, or the .inp itself
+    # for a built, not yet solved run. The source is kept for the life of the reference
+    # folders (recorded as "geometry" in gdlc_reference.json): the .odb coordinates differ
+    # from the .inp ones in the last digits, which changes the ring master nodes and the
+    # equation coefficients, so switching source would make a regenerated input differ
+    # from the one already solved (refused below) although the model is the same.
+    recorded = set()
+    for k_ in ("G", "L"):
+        f_ = run_dir.parent / f"{run_dir.name}_REF_{k_}" / "gdlc_reference.json"
+        try:
+            recorded.add(json.loads(f_.read_text(encoding="utf-8")).get("geometry", "modal_export"))
+        except (OSError, ValueError):
+            pass
+    exp_dir, meta = None, {}
+    if st.export_dir or "inp" not in recorded:
+        try:
+            exp_dir, meta = choose_export(run_dir, st.export_dir)
+        except FileNotFoundError:
+            if st.export_dir:
+                raise
     inp_path = find_inp(run_dir, meta, st.inp)
     if inp_path is None or not inp_path.is_file():
-        raise FileNotFoundError("no .inp in run folder")
+        raise FileNotFoundError("no unique <job>.inp in the run folder")
+    build_path = run_dir / (inp_path.stem + "_build.json")
+    source_build = json.loads(build_path.read_text(encoding="utf-8")) if build_path.is_file() else {}
+    load_case = source_build.get("load_case") or {"type":"compression"}
+    source_hash = file_sha256(inp_path)
     inp = read_inp(inp_path)
     t = st.thickness or (min(inp.thicknesses) if inp.thicknesses else None)
     mesh = load_mesh(exp_dir, meta, inp_path)
+    log(f"  geometry: {'modal export ' + exp_dir.name if exp_dir else inp_path.name + ' (no modal export yet)'}")
     groups = build_ring_groups(mesh)
     for g in groups:
         detect_reference_points(g, t, st)
@@ -2780,64 +3897,115 @@ def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes
     for nodes, dofs in inp.boundaries:
         if dofs & set(inplane):
             excl.update(nodes)
+    mpc_independent = set(a_ for unused, a_, unused_b in inp.pairs)
+    bc_nodes = set(n_ for nodes, unused in inp.boundaries for n_ in nodes)
+    rotation_bc = {n_ for nodes, dofs in inp.boundaries if rot_dof in dofs for n_ in nodes}
     key = [(str(i), int(l)) for i, l in zip(mesh.instance, mesh.label)]
     lines0 = inp_path.read_text(encoding="utf-8", errors="replace").splitlines()
     i_end_asm = next(i for i, l in enumerate(lines0) if l.strip().lower().startswith("*end assembly"))
-    rp0 = 900001
     written = []
     for kind in kinds:
-        add_asm, add_bc, info = [], [], dict(kind=kind, source_run=run_dir.name, source_inp=inp_path.name)
+        add_asm, add_bc, info = [], [], dict(kind=kind, source_run=run_dir.name, source_inp=inp_path.name,
+                                             source_inp_sha256=source_hash, load_case=load_case,
+                                             geometry="modal_export" if exp_dir else "inp")
         if kind == "G":
-            rp_ids, n_coupled = [], 0
-            add_asm.append("** GDLC REF_G: in-plane rigid cross-sections (kinematic coupling per ring)")
+            # In-plane rigid rings written as linear *Equation rows between ring nodes (no
+            # reference nodes, no *Coupling). The earlier kinematic coupling to a ring
+            # reference node made Abaqus/Standard report a numerical singularity in the
+            # base-state stiffness and refuse the Lanczos solve ("rigid body modes"); the
+            # equations impose exactly the same 3-DOF in-plane rigid motion per ring and
+            # leave every axial (warping) DOF and every BC untouched.
+            twist_mode, twist_reason = ref_g_twist_mode(run_dir, st.ref_g_twist, load_case)
+            twist = twist_mode == "free"
+            formulation = REF_G_FORMULATION if twist else REF_G_FORMULATION_NO_TWIST
+            eq_lines, n_eq, n_rings, n_constrained, n_controls = [], 0, 0, 0, 0
+            held_rotations, all_beam_rotations = set(), set()
+            # A ring node eliminated by a rigid *MPC (BEAM/TIE/PIN) follows its control node.
+            # When that control node is not itself a ring node - a bolt through a transverse
+            # attachment plate: both wall nodes of the seam follow the plate's bolt node - the
+            # control node, which lies in the ring's plane, joins the rigid ring (as the
+            # control node of a direct seam bolt always did); otherwise that bolt stack would
+            # move in the section plane relative to the rigid ring.
+            control_of = {dep: ctl for kind_, ctl, dep in inp.pairs if kind_ in ("BEAM", "TIE", "PIN")}
+            beam_dependents = {dep for kind_, ctl, dep in inp.pairs if kind_ == "BEAM"}
+            row_of = {k_: i for i, k_ in enumerate(key)}
+            tol_s = 1e-6 * mesh.size
             for g in groups:
                 for gr, r in enumerate(g.rings):
-                    rows = g.node_rows[gr]
-                    nodes = [key[i] for i in rows if key[i] not in excl]
-                    if len(nodes) < 3:
+                    rows = list(g.node_rows[gr])
+                    members = {key[i] for i in rows}
+                    extra, beam_rotations = [], set()
+                    for i in rows:
+                        c_ = control_of.get(key[i])
+                        j_ = row_of.get(c_)
+                        if key[i] in beam_dependents:
+                            if j_ is None or abs(mesh.s[j_] - mesh.ring_z[r]) > tol_s:
+                                raise RuntimeError("REF_G needs each BEAM control in its wall node's axial ring")
+                            if np.linalg.norm(mesh.p[i] - mesh.p[j_]) > tol_s:
+                                if c_ in excl:
+                                    raise RuntimeError("REF_G offset BEAM control is itself eliminated or supported in-plane")
+                                if c_ in rotation_bc:
+                                    if twist:
+                                        raise RuntimeError("REF_G twist-free BEAM control has a prescribed axial rotation; "
+                                                           "use --ref-g-twist restrained for this support")
+                                else:
+                                    beam_rotations.add(c_)
+                        if (j_ is not None and c_ not in members and c_ not in excl
+                                and abs(mesh.s[j_] - mesh.ring_z[r]) <= tol_s):
+                            members.add(c_)
+                            extra.append(j_)
+                    # global coordinates along the in-plane DOFs the equations act on
+                    ring = [(key[i], mesh.xyz[i, [d - 1 for d in inplane]]) for i in rows + extra
+                            if key[i] not in excl]
+                    lines_r, n_r = rigid_ring_equations(ring, inplane, mpc_independent, bc_nodes, twist,
+                                                      beam_rotation_nodes=beam_rotations if twist else ())
+                    if not n_r:
                         continue
-                    c = mesh.p[rows].mean(0)
-                    xyz = c[0] * mesh.e1 + c[1] * mesh.e2 + mesh.ring_z[r] * mesh.axis
-                    rp = rp0 + r
-                    rp_ids.append(rp)
-                    n_coupled += len(nodes)
-                    add_asm += ["*Node", f"{rp}, {xyz[0]:.6f}, {xyz[1]:.6f}, {xyz[2]:.6f}"]
-                    add_asm += _nset_lines(f"GREF_R{r:04d}", nodes)
-                    add_asm += [f"*Surface, type=NODE, name=GREF_R{r:04d}_S", f"GREF_R{r:04d}, 1.",
-                                f"*Coupling, constraint name=GREF_C{r:04d}, ref node={rp}, surface=GREF_R{r:04d}_S",
-                                "*Kinematic"] + [f"{d}, {d}" for d in inplane]
-            add_asm += ["*Nset, nset=GREF_RP_ALL"] + [", ".join(str(x) for x in rp_ids[i:i + 16])
-                                                    for i in range(0, len(rp_ids), 16)]
-            free = set(inplane) | {rot_dof}
-            for d in sorted({1, 2, 3, 4, 5, 6} - free):
-                add_bc.append(f"GREF_RP_ALL, {d}, {d}")
-            info.update(n_rings_coupled=len(rp_ids), n_nodes_coupled=n_coupled)
+                    eq_lines += lines_r
+                    n_eq += n_r
+                    n_rings += 1
+                    n_constrained += len(ring)
+                    n_controls += len(extra)
+                    all_beam_rotations.update(beam_rotations)
+                    if not twist:
+                        held_rotations.update(beam_rotations)
+            add_asm.append("** GDLC REF_G: in-plane rigid cross-sections (linear equations per ring), twist "
+                           + twist_mode)
+            add_asm += eq_lines
+            if held_rotations:
+                add_asm += _nset_lines("GREF_BEAM_ROTATION", sorted(held_rotations))
+                add_bc.append(f"GREF_BEAM_ROTATION, {rot_dof}, {rot_dof}")
+            info.update(n_rings_rigid=n_rings, n_nodes_rigid=n_constrained, n_equations=n_eq,
+                        n_mpc_control_nodes_rigid=n_controls,
+                        n_mpc_axial_rotations_constrained=len(all_beam_rotations),
+                        twist=twist_mode, twist_reason=twist_reason,
+                        constraint=("u_i = u_a + theta k x (r_i - r_a) per ring; theta from master node b; "
+                                    if twist else
+                                    "u_i = u_a per ring (in-plane translation only, no rotation about the "
+                                    "member axis: no torsional / flexural-torsional modes); ")
+                                   + "offset BEAM control axial rotations follow ring twist; "
+                                     "other rotations and axial warping remain free; no reference nodes or couplings",
+                        formulation=formulation)
+            log(f"  REF_G twist {twist_mode} ({twist_reason})")
         elif kind == "L":
             # The classifier's L criterion is: translation of every fold's VIRTUAL SHARP
             # CORNER c = 0, with the fold free to rotate (cFSM). For a rounded fold c is not
             # a node, so the classifier's own kinematic statement is imposed with one
             # *Equation per in-plane direction on the fold reference node r:
             #     u_r + theta x (c - p_r) = 0,
-            # theta = mean chord rotation ((u_b - u_a).n/h) of the arc edges that do not
-            # touch r - the SAME row the classifier uses for the fold driver, written in
-            # translations only. (Holding r itself lets c move by theta*|c - p_r|; using the
-            # shell rotation UR instead of the chord rotation leaves a few % D, because the
-            # FE arc is not exactly rigid.) The dependent DOFs are r's in-plane translations,
-            # which appear in no other equation. Arcs whose every internal edge touches r
-            # (<= 3 nodes) use the shell rotation about the axis; sharp folds (c = p_r) are
-            # simply held in-plane.
-            sgn = float(np.sign(np.dot(np.cross(mesh.e1, mesh.e2), mesh.axis))) or 1.0
-            held, eq_lines, n_eq, n_rot = [], [], 0, 0
+            # theta = mean chord rotation ((u_b - u_a).n/h), preferring edges away from r
+            # and using all internal edges when none are away. Eliminate the reference
+            # translations from these exact Qf rows for every load case; shell UR is an
+            # independent DOF and cannot substitute for chord rotation. Holding r itself would
+            # let c move by theta*|c - p_r|; sharp folds (c = p_r) are held in-plane.
+            held, held_dof, eq_lines, n_eq = [], {}, [], 0
             for g in groups:
                 build_operators(g)                         # fills each fold's virtual_corner
-                Rm, _, _ = _edge_rotation_rows(g)
-                for f in g.folds:
+                exact_rows = local_corner_translation_rows(g)
+                for fi, f in enumerate(g.folds):
                     r = f["ref"]
                     off = np.asarray(f.get("virtual_corner", g.p[r])) - g.p[r]
                     sharp = float(np.linalg.norm(off)) <= 1e-9 * mesh.size or len(f["nodes"]) < 2
-                    ks = [] if sharp else fold_rotation_edges(g, f)
-                    chord = bool(ks) and all(f["ref"] not in (int(g.edges[k][0]), int(g.edges[k][1])) for k in ks)
-                    th = Rm[ks].mean(0) if chord else None
                     for gr in range(len(g.rings)):
                         kk = key[g.node_rows[gr][r]]
                         if kk in excl:
@@ -2845,58 +4013,92 @@ def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes
                         if sharp:
                             held.append(kk)
                             continue
-                        nodes_t = None
-                        if chord:
-                            nz = np.nonzero(np.abs(th) > 1e-14 * np.abs(th).max())[0]
-                            nodes_t = [(key[g.node_rows[gr][j // 2]], inplane[j % 2], th[j]) for j in nz]
-                            if any(n_ in excl and n_ != kk for n_, _, _ in nodes_t):
-                                nodes_t = None                       # eliminated/BC node: use UR
-                        for c, lever in ((0, -off[1]), (1, off[0])):
+                        for c in (0, 1):
                             terms = [(kk, inplane[c], 1.0)]
-                            if nodes_t is not None:
-                                terms += [(n_, d_, lever * v) for n_, d_, v in nodes_t]
-                            else:
-                                terms.append((kk, rot_dof, sgn * lever))
-                            terms = [t_ for t_ in terms if abs(t_[2]) > 1e-12]
+                            row = exact_rows[2*fi+c]
+                            nz = np.flatnonzero(np.abs(row) > 1e-12)
+                            terms += [(key[g.node_rows[gr][j//2]], inplane[j % 2], float(row[j]))
+                                      for j in nz if j != 2*r+c]
+                            blocked = [n_ for n_, _, _ in terms[1:] if n_ in excl]
+                            if blocked:
+                                raise ValueError(f'REF_L exact fold row references constrained/MPC-dependent '
+                                                 f'node {blocked[0]}; cannot safely substitute shell UR')
+                            terms = terms[:1] + [t_ for t_ in terms[1:] if abs(t_[2]) > 1e-12]
+                            if len(terms) == 1:
+                                # Abaqus rejects one-term *Equation rows ("use *BOUNDARY"):
+                                # the constraint is u_r,c = 0, written as a boundary condition
+                                held_dof.setdefault(inplane[c], []).append(kk)
+                                continue
                             eq_lines += ["*Equation", str(len(terms))]
                             items = [f"{n_[0]}.{n_[1]}, {d_}, {v:.12g}" for n_, d_, v in terms]
                             eq_lines += [", ".join(items[i:i + 4]) for i in range(0, len(items), 4)]
                             n_eq += 1
-                            n_rot += nodes_t is None
             add_asm.append("** GDLC REF_L: fold virtual corners held in the section plane (fold rotation free)")
             add_asm += eq_lines
             if held:
                 add_asm += _nset_lines("LREF_FOLDS", held)
                 add_bc += [f"LREF_FOLDS, {d}, {d}" for d in inplane]
+            for d, nodes_d in sorted(held_dof.items()):
+                add_asm += _nset_lines(f"LREF_FOLDS_U{d}", nodes_d)
+                add_bc.append(f"LREF_FOLDS_U{d}, {d}, {d}")
             info.update(n_fold_lines=sum(len(g.folds) for g in groups), n_equations=n_eq,
-                        n_equations_shell_rotation=n_rot, n_nodes_held=len(held),
+                        n_equations_shell_rotation=0, n_nodes_held=len(held),
+                        n_dofs_held={str(d): len(v) for d, v in sorted(held_dof.items())},
                         constraint="u_ref + theta_chord x (virtual_corner - p_ref) = 0 per fold and ring "
-                                   "(theta_chord = classifier's arc rotation row)")
+                                   "(exact classifier Qf rows; reference translations eliminated together)",
+                        formulation='virtual_corner_exact_chord_v1')
         lines = lines0[:i_end_asm] + add_asm + lines0[i_end_asm:]
         if add_bc:
             lines = _insert_step_bcs(lines, add_bc)
-        # fewer modes are needed in a reference model; Lanczos when Abaqus allows it
+        # fewer modes are needed in a reference model; bounded Lanczos when Abaqus allows it
         out_dir = run_dir.parent / f"{run_dir.name}_REF_{kind}"
         prev = out_dir / "gdlc_reference.json"
-        refused = prev.is_file() and json.loads(prev.read_text(encoding="utf-8")).get("lanczos_refused", False)
-        solver = "lanczos" if not (lanczos_restrictions(lines) or refused) else "subspace"
-        min_eig = buckle_min_eigenvalue(lines0)          # bending source: eigenvalues >= 0 only
-        lines = set_buckle_solver(lines, n_modes, solver, min_eig)
-        info.update(eigensolver=solver, lanczos_restrictions=lanczos_restrictions(lines),
-                    lanczos_refused=bool(refused), min_eigenvalue=min_eig)
+        prev_info = json.loads(prev.read_text(encoding="utf-8")) if prev.is_file() else {}
+        # a refusal recorded for an earlier REF_G formulation (kinematic coupling) does not apply
+        refused = bool(prev_info.get("lanczos_refused", False)) and (
+            kind != "G" or prev_info.get("formulation") == info.get("formulation"))
+        source_min = buckle_min_eigenvalue(lines0)       # bending source: eigenvalues >= 0 only
+        # Lanczos with a lower bound (see the docstring): the source's own minimum, else 0.
+        lanczos_min = source_min if source_min is not None else 0.0
+        restrictions = lanczos_restrictions(lines)
+        solver = "subspace" if (restrictions or refused) else "lanczos"
+        lines = set_buckle_solver(lines, n_modes, solver, lanczos_min if solver == "lanczos" else source_min)
+        info.update(eigensolver=solver, lanczos_restrictions=restrictions, lanczos_refused=bool(refused),
+                    min_eigenvalue=lanczos_min if solver == "lanczos" else source_min,
+                    source_min_eigenvalue=source_min)
         out_dir.mkdir(exist_ok=True)
         job = f"{inp_path.stem}_REF_{kind}"
         new_txt = "\n".join(lines) + "\n"
         inp_out = out_dir / f"{job}.inp"
+        if (out_dir / f"{job}.lck").exists():
+            raise FileExistsError(running_job_message(out_dir, job))
+        status = odb_status(out_dir / f"{job}.odb")
+        foreign = [p.name for p in out_dir.glob("*.odb") if p.stem.lower() != job.lower()]
+        if foreign:
+            raise FileExistsError(f"{out_dir} holds results of another job ({foreign}); they are never "
+                                  f"overwritten: move that folder and run again")
+        same_input = inp_out.is_file() and inp_out.read_text(encoding="utf-8", errors="replace") == new_txt
+        if not same_input and solver_artifacts(out_dir, job):
+            if status == "ok":
+                raise FileExistsError(f"reference input already exists with different content and completed "
+                                      f"results: {inp_out}. Completed results are never overwritten: rename or "
+                                      f"move {out_dir.name} (e.g. to {out_dir.name}_previous) and run again")
+            archive_attempt(out_dir, job, f"superseded_input_{status}", include_input=True)
+        if same_input and solver_artifacts(out_dir, job):
+            log(f"  reference {kind}: matching existing input and solver files preserved "
+                f"(odb {status}): {out_dir}")
+            written.append(out_dir)
+            continue
         if not inp_out.is_file() or inp_out.read_text(encoding="utf-8", errors="replace") != new_txt:
             inp_out.write_text(new_txt, encoding="utf-8")   # a changed model makes an old .odb 'stale'
         env = run_dir / "abaqus_v6.env"
         if env.is_file():                                   # same solver settings as the source run
             (out_dir / "abaqus_v6.env").write_text(env.read_text(encoding="utf-8", errors="replace"),
                                                    encoding="utf-8")
-        for bj in run_dir.glob("*_build.json"):
-            (out_dir / f"{job}_build.json").write_text(bj.read_text(encoding="utf-8"), encoding="utf-8")
+        if build_path.is_file():
+            (out_dir / f"{job}_build.json").write_text(build_path.read_text(encoding="utf-8"),encoding="utf-8")
         info.update(job=job, n_modes=n_modes, inplane_dofs=inplane,
+                    input_sha256=file_sha256(inp_out),
                     note="submit with Abaqus (datacheck first), then export the modes to "
                          "portable_modal_export*/ as for any run; the classifier then checks it")
         (out_dir / "gdlc_reference.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
@@ -2914,28 +4116,104 @@ def reference_check(run_dir: Path, rows) -> dict | None:
     kind = ref.get("kind")
     if kind == "G":
         v = [r["G_pct"] for r in rows]
+        lower = [r.get('subspace_G_min_pct', r['G_pct']) for r in rows]
         res = dict(kind="G", min_G_pct=min(v), mean_G_pct=float(np.mean(v)),
-                   passed=bool(min(v) >= 95.0))
+                   min_subspace_G_pct=min(lower), passed=bool(min(lower) >= 95.0))
+        res.update(global_scope=('all_global' if ref.get('twist') == 'free' else
+                                 'flexural_only' if ref.get('twist') == 'restrained' else 'unverified'),
+                   governing_global_eligible=ref.get('twist') == 'free')
     elif kind == "L":
         v = [r["G_pct"] + r["D_pct"] + r["C_pct"] for r in rows]
         c = [r["C_pct"] for r in rows]
         local = [r["L_pct"] for r in rows]
+        lower = [r.get('subspace_L_min_pct', r['L_pct']) for r in rows]
         ldom = [r["eigenvalue"] for r in rows if r.get("reliable_dominant", r.get("dominant")) == "L"]
         # Folds held => no G, D or C (every one of them moves folds): G+D+C must vanish.
         res = dict(kind="L", max_G_plus_D_plus_C_pct=max(v), mean_G_plus_D_plus_C_pct=float(np.mean(v)),
                    max_C_pct=max(c), mean_C_pct=float(np.mean(c)),
-                   min_L_pct=min(local),
+                   min_L_pct=min(local), min_subspace_L_pct=min(lower),
                    first_L_dominant_eigenvalue=min(ldom) if ldom else None,
-                   passed=bool(max(v) <= 5.0 and min(local) >= 95.0))
+                   passed=bool(max(v) <= 5.0 and min(lower) >= 95.0))
     else:
         return None
+    if any("plate_deformation_pct" in r for r in rows):
+        # the shares above see the column walls only: the imposed mechanism is recovered only
+        # if no mode is carried by deformation of the transverse plates themselves
+        pdef = [r.get("plate_deformation_pct", 0.0) for r in rows]
+        cluster_pdef = [r.get('cluster_plate_deformation_max_pct',r.get('plate_deformation_pct',0.))
+                        for r in rows]
+        res.update(max_plate_deformation_pct=max(pdef),
+                   max_cluster_plate_deformation_pct=max(cluster_pdef),
+                   max_plate_motion_pct=max(r.get("plate_motion_pct", 0.0) for r in rows),
+                   passed=bool(res["passed"] and max(cluster_pdef) <= 5.0))
     res.update(source_run=ref.get("source_run"), first_eigenvalue=min(r["eigenvalue"] for r in rows))
     return res
 
 # ----------------------------------------------------------------------------
 # 12. CLI
 # ----------------------------------------------------------------------------
+def verified_input_coordinates(inst, lab, xyz, inp_path: Path):
+    """Recover INP geometry only after matching every exported node and its precision.
+
+    Converting ODB FP32 coordinates to FP64 cannot recover lost geometric relations.
+    Accept an exported value only if it matches the input to FP64 arithmetic error,
+    or is exactly the input's FP32 rounding. No geometric tolerance or smoothing is
+    used; real coordinate differences and incomplete/duplicate node maps fail.
+    """
+    if not len(lab) or xyz.shape != (len(lab), 3) or len(inst) != len(lab) or not np.all(np.isfinite(xyz)):
+        raise ValueError('Invalid/nonfinite exported node coordinates')
+    keys = [(str(i), int(n)) for i, n in zip(inst, lab)]
+    if len(set(keys)) != len(keys):
+        raise ValueError('Duplicate exported node instance/label pairs')
+    source_inst, source_lab, source_xyz = inp_assembly_nodes(inp_path)
+    source_keys = [(str(i), int(n)) for i, n in zip(source_inst, source_lab)]
+    if len(set(source_keys)) != len(source_keys) or set(keys) != set(source_keys):
+        raise ValueError('Export/INP node identities differ; cannot substitute input geometry')
+    positions = {key: j for j, key in enumerate(source_keys)}
+    expected = source_xyz[[positions[key] for key in keys]]
+    if not np.all(np.isfinite(expected)):
+        raise ValueError('Nonfinite INP node coordinates')
+    # Bound arithmetic roundoff in assembly transformations, not mesh/model error.
+    scale = np.maximum(np.max(np.abs(expected), axis=1, keepdims=True),
+                       np.max(np.ptp(expected, axis=0)))
+    double_match = np.abs(xyz-expected) <= 32*np.finfo(float).eps*scale
+    with np.errstate(over='ignore', invalid='ignore'):
+        single_match = xyz == expected.astype(np.float32).astype(np.float64)
+    bad = ~(double_match | single_match)
+    if np.any(bad):
+        row, component = np.argwhere(bad)[0]
+        raise ValueError('Export/INP coordinates differ beyond FP64 roundoff or exact FP32 rounding '
+                         f'at {keys[row]}, component {component+1}: '
+                         f'export={xyz[row,component]:.17g}, INP={expected[row,component]:.17g}')
+    return expected, dict(source='inp_verified_against_export',
+                          verification='FP64_ROUNDOFF_OR_EXACT_FP32_ROUNDING',
+                          fp32_rounded_coordinate_count=int(np.count_nonzero(~double_match & single_match)),
+                          max_export_coordinate_difference=float(np.max(np.abs(xyz-expected))))
+
+
+def local_corner_translation_rows(g: RingGeom) -> np.ndarray:
+    """Qf u = 0 with each fold-reference translation as a unique dependent DOF.
+
+    On short arcs the chord-rotation row contains the reference node itself. Solve
+    for those translations together instead of substituting the independent shell
+    rotation. Removing all other dependent columns also respects Standard's rule
+    that an eliminated *Equation DOF cannot occur in a subsequent constraint.
+    """
+    _, _, Qf, _ = build_operators(g)
+    if not g.folds:
+        return Qf
+    pivots = np.array([2*f['ref']+c for f in g.folds for c in (0, 1)])
+    block = Qf[:, pivots]
+    if len(set(pivots)) != len(pivots) or np.linalg.cond(block) > 1e10:
+        raise ValueError('REF_L fold translations cannot be eliminated reliably; '
+                         'check fold geometry/mesh instead of substituting shell UR')
+    rows = np.linalg.solve(block, Qf)
+    rows[:, pivots] = np.eye(len(pivots))
+    return rows
+
+
 def main(argv=None):
+    global N_THREADS
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="+", help="run folder(s) or a root folder to scan")
@@ -2953,6 +4231,8 @@ def main(argv=None):
                     help="skip the split-sensitivity pass (2 extra projections)")
     ap.add_argument("--max-cross-pct", type=float, default=Settings.max_cross_pct,
                     help="|cross term| (%%) above which a mode is flagged CROSS_TERM (confidence at most medium)")
+    ap.add_argument("--max-energy-beyond-pct", type=float, default=Settings.max_energy_beyond_pct)
+    ap.add_argument("--max-bolt-incompat-pct", type=float, default=Settings.max_bolt_incompat_pct)
     ap.add_argument("--conf-low-margin", type=float, default=Settings.conf_low_margin_pct)
     ap.add_argument("--conf-high-margin", type=float, default=Settings.conf_high_margin_pct)
     ap.add_argument("--mixed-label-pct", type=float, default=Settings.mixed_label_pct)
@@ -2966,6 +4246,11 @@ def main(argv=None):
     ap.add_argument("--make-reference-models", action="store_true",
                     help="write <run>_REF_G and <run>_REF_L Abaqus inputs (pure-G, corner-restrained L) and exit")
     ap.add_argument("--reference-modes", type=int, default=20, help="eigenvalues requested in reference models")
+    ap.add_argument("--reference-kinds", default="G,L",
+                    help="with --make-reference-models: which references to write, 'G,L' (default), 'G' or 'L'")
+    ap.add_argument("--ref-g-twist", choices=("auto", "restrained", "free"), default=Settings.ref_g_twist,
+                    help="REF_G: auto (default) restrains twist for compression (flexural-only reference), "
+                         "and leaves twist free for bending/combined; explicit free/restrained overrides auto")
     ap.add_argument("--top-modes", type=int, default=Settings.top_modes,
                     help="cross-section figures for the k modes with the largest share of the dominant mechanism")
     ap.add_argument("--benchmarks", action="store_true",
@@ -2976,11 +4261,34 @@ def main(argv=None):
     ap.add_argument("--abaqus-cmd", default=Settings.abaqus_cmd, help="Abaqus launcher (default: abaqus)")
     ap.add_argument("--exporter", default=None, help="path of abaqus_mfsm_export.py (default: next to this script)")
     ap.add_argument("--export-compression", choices=("store", "zlib"), default=Settings.export_compression)
+    ap.add_argument("--stiffness", choices=("auto", "always", "required", "never"), default=Settings.stiffness,
+                    help="elastic stiffness export + strain-energy evaluation of the split: auto = run the "
+                         "Abaqus matrix-generation job once per run (.inp sha256) and continue without the "
+                         "energy columns if it fails; always = regenerate; required = stop on failure; never")
     ap.add_argument("--solve-reference-models", action="store_true",
-                    help="solve <run>_REF_G / <run>_REF_L folders that have no .odb yet (Abaqus, all CPUs)")
+                    help="solve <run>_REF_G / <run>_REF_L folders that have no .odb yet (Abaqus, --cpus)")
+    ap.add_argument("--solve-only", action="store_true",
+                    help="with --solve-reference-models: solve/reuse references only; no export, stiffness or classification")
+    ap.add_argument("--cpus", type=resources.cpu_request, default=None,
+                    help="CPUs of the Abaqus solves of --solve-reference-models, written '--cpus 4' "
+                         "(default: all physical cores; a larger request is reduced to them)")
     if argv is None and "--benchmarks" in sys.argv:
         sys.argv.append("_")
     a = ap.parse_args(argv)
+    if a.solve_only and (not a.solve_reference_models or a.make_reference_models or a.selftest_only):
+        ap.error('--solve-only requires --solve-reference-models and cannot generate/classify reference models')
+    if a.threads < 1:
+        ap.error('--threads must be positive')
+    if a.reference_modes < 1:
+        ap.error('--reference-modes must be positive')
+    ref_kinds = tuple(k.strip().upper() for k in a.reference_kinds.split(",") if k.strip())
+    if not ref_kinds or set(ref_kinds) - {"G", "L"} or len(set(ref_kinds)) != len(ref_kinds):
+        ap.error("--reference-kinds must list G and/or L once each, e.g. 'G,L'")
+    N_THREADS = a.threads
+    resources.initialise_worker(N_THREADS)
+    if pq is not None:
+        pa.set_cpu_count(N_THREADS)
+        pa.set_io_thread_count(N_THREADS)
     st = Settings(fold_radius_factor=a.fold_radius_factor, min_fold_angle_deg=a.min_fold_angle,
                   cluster_rel_tol=a.cluster_tol, max_other_pct=a.max_other_pct, max_cross_pct=a.max_cross_pct,
                   max_spread_pct=a.max_split_spread, sensitivity=not a.no_sensitivity,
@@ -2988,7 +4296,9 @@ def main(argv=None):
                   mixed_label_pct=a.mixed_label_pct, thickness=a.thickness, export_dir=a.export_dir, inp=a.inp,
                   out_name=a.out_name, gpu=a.gpu, plots=a.plots, selftest_only=a.selftest_only,
                   max_modes=a.max_modes, threads=a.threads, top_modes=a.top_modes,
-                  export=a.export, abaqus_cmd=a.abaqus_cmd, exporter=a.exporter,
+                  export=a.export, abaqus_cmd=a.abaqus_cmd, exporter=a.exporter, abaqus_cpus=a.cpus,
+                  stiffness=a.stiffness, ref_g_twist=a.ref_g_twist,
+                  max_energy_beyond_pct=a.max_energy_beyond_pct, max_bolt_incompat_pct=a.max_bolt_incompat_pct,
                   export_compression=a.export_compression)
     if a.benchmarks:
         log(f"gdlc_mode_decomposition.py v{VERSION}")
@@ -3000,19 +4310,45 @@ def main(argv=None):
                 f"found {r['D_found']}  {extra}")
         sys.exit(0 if all(r["passed"] for r in res) else 1)
     log(f"gdlc_mode_decomposition.py v{VERSION}  ({Path(__file__).resolve()})")
+    missing = [p for p in a.paths if not Path(p).is_dir()]
+    if missing:                                          # a mistyped run folder is not "no runs"
+        sys.exit("folder(s) not found: " + "; ".join(missing))
     runs = find_runs(a.paths)
     if not runs:
-        sys.exit("no run folders found (need a modal export, or <job>.odb + <job>.inp with a *Buckle step "
+        sys.exit("no run folders found (need a modal export, or one <job>.inp with a *Buckle step "
                  "and <job>_build.json / gdlc_reference.json)")
     log(f"{len(runs)} run(s); threads={N_THREADS}; cpus={os.cpu_count()}; export={st.export}")
 
+    if a.solve_only:
+        failures = []
+        for r in runs:
+            try:
+                meta = json.loads((r / 'gdlc_reference.json').read_text(encoding='utf-8-sig'))
+                job = meta['job']
+                previous_status = odb_status(r / (job+'.odb'))
+                if not solve_reference_model(r, st) and previous_status != 'ok':
+                    raise RuntimeError('Reference solve failed (see its .msg/.dat files)')
+                if not (r / (job+'.inp')).is_file() or odb_status(r / (job+'.odb')) != 'ok':
+                    raise RuntimeError('Reference analysis did not finish successfully or ODB is missing/locked')
+                log(f'  reference ready for Step 4 (not classified): {r}')
+            except Exception as error:
+                log(f'  FAILED {r}: {error!r}')
+                failures.append(r)
+        return 1 if failures else 0
+
     def _prepare(r: Path) -> bool:
         """solve (reference models, on request) and export; False = nothing to classify yet."""
+        if st.selftest_only:
+            return bool(list_exports(r) or st.export_dir)
         if a.solve_reference_models:
             solve_reference_model(r, st)
         if st.export != "never" and not st.export_dir:
             ensure_export(r, st)
+        if (list_exports(r) or st.export_dir) and not a.make_reference_models:
+            ensure_stiffness(r, st)                    # elastic K of the run (energy evaluation)
         if not list_exports(r) and not st.export_dir:
+            if a.make_reference_models and run_sources(r)[1] is not None:
+                return True                            # reference inputs need only the .inp geometry
             log(f"skip {r.name}: no modal export and no solved .odb yet")
             return False
         return True
@@ -3025,7 +4361,7 @@ def main(argv=None):
             try:
                 if not _prepare(r):
                     continue
-                make_reference_models(r, st, n_modes=a.reference_modes)
+                make_reference_models(r, st, kinds=ref_kinds, n_modes=a.reference_modes)
             except Exception as e:
                 log(f"  FAILED reference models for {r}: {e!r}")
                 bad += 1

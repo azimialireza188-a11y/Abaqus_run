@@ -11,6 +11,66 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import tempfile
+
+
+class _WorkingModelDatabase:
+    """Delegate CAE operations while owning the temporary source opened by the kernel."""
+    def __init__(self, database, directory):
+        self._database, self._directory = database, directory
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._database, name)
+
+    def _cleanup(self):
+        if self._directory is not None:
+            shutil.rmtree(self._directory)
+            self._directory = None
+
+    def saveAs(self, **kwargs):
+        result = self._database.saveAs(**kwargs)
+        self._cleanup()  # saveAs has released the old source and opened the output CAE.
+        return result
+
+    def close(self):
+        if self._closed:
+            self._cleanup()
+            return
+        try:
+            self._database.close()
+        finally:
+            self._closed = True
+            self._cleanup()
+
+
+def open_working_mdb(source_cae, scratch_dir=None):
+    """Open a disposable CAE working file; openMdb itself uses update access.
+
+    Reading the original with shutil keeps its bytes/timestamp unchanged. This is
+    temporary kernel workspace, removed after saveAs/close, never a delivered backup.
+    Default workspace is alongside the scripts, not in an existing result directory.
+    """
+    from abaqus import openMdb
+    source_cae = os.path.abspath(source_cae)
+    locks = (os.path.splitext(source_cae)[0]+'.lck', source_cae+'.lck')
+    if any(os.path.exists(path) for path in locks):
+        raise ValueError('Source CAE is locked; close its active kernel before conversion: '+source_cae)
+    before = os.stat(source_cae)
+    scratch_dir = scratch_dir or os.path.dirname(os.path.abspath(__file__))
+    directory = tempfile.mkdtemp(prefix='cfs_cae_work_', dir=scratch_dir)
+    try:
+        working = os.path.join(directory, os.path.basename(source_cae))
+        shutil.copyfile(source_cae, working)
+        after = os.stat(source_cae)
+        if ((before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
+                or any(os.path.exists(path) for path in locks)):
+            raise ValueError('Source CAE changed or became locked while staging: '+source_cae)
+        return _WorkingModelDatabase(openMdb(pathName=working), directory)
+    except BaseException:
+        shutil.rmtree(directory)
+        raise
 
 STATUS_FILE = 'pipeline_status.json'
 REFERENCE_ELEMENT_TYPE = 'S4R'
@@ -21,6 +81,64 @@ REFERENCE_INSTANCES = ('P1', 'P2', 'P3', 'P4')
 REFERENCE_BOUNDARY_CONDITIONS = 9
 REFERENCE_LOADS = 8          # compression: one uniform edge load per piece end
 LOAD_CASES = ('compression', 'bending')
+# Shared by Step5 and P-M: the supplied working reference's end loading/supports.
+# A distinct policy tag prevents reuse of the failed rigid-end-plate inputs/results.
+STEP5_END_CONDITION_ID = 'reference_nodal_ends_v1'
+STEP5_END_TAG = 'REF1'
+STEP5_END_CONDITION = dict(
+    id=STEP5_END_CONDITION_ID,
+    model='reference end nodes without added reference points or rigid end-plate couplings',
+    supports=('inherited end-node U1 = U2 = UR3 = 0; U3, UR1, UR2 free; free end warping; '
+              'mid-length AXIAL_ANCHOR (U3) unchanged'),
+    loads=('compression: fixed-direction resultant shell-edge loads per original edge length; '
+           'bending and P-M: consistent nodal CF3 of the reference stress field, scaled by LPF'),
+    response='area-weighted end U3 difference and work-conjugate nodal F/M_ref-weighted end U3')
+
+
+def plate_instance_names(reference):
+    """Additional localized shells, kept separate from P1..P4 section members."""
+    plate = reference.get('steel_plates')
+    if not plate:
+        return []
+    names = plate.get('instances') or []
+    expected = ['STEEL_PLATE_%03d' % j for j in range(1, len(names)+1)]
+    if not names or names != expected:
+        raise ValueError('Invalid steel plate instance provenance')
+    if plate.get('element_type') != 'S4R':
+        raise ValueError('Steel plates must use S4R shells')
+    for key in ('height_mm', 'thickness_mm'):
+        if _require_number(plate, key) <= 0:
+            raise ValueError('Invalid steel plate '+key)
+    groups = plate.get('groups')
+    if groups:
+        if [g.get('direction') for g in groups] != ['X', 'Y']:
+            raise ValueError('Invalid perpendicular steel plate directions')
+        connected = plate.get('assembly_type') == 'CONNECTED_CROSS'
+        grouped_names = (groups[0].get('instances', []) if connected else
+                         [name for g in groups for name in g.get('instances', [])])
+        if grouped_names != names:
+            raise ValueError('Invalid grouped steel plate instance provenance')
+        if connected and (plate.get('edge_gap_mm') != 0. or
+                groups[1].get('instances') != names or
+                groups[1].get('bolt_positions_mm') != groups[0].get('bolt_positions_mm') or
+                groups[1].get('screw_positions_mm') != groups[0].get('screw_positions_mm') or
+                groups[1].get('height_mm') != groups[0].get('height_mm') or
+                plate.get('height_mm') != plate.get('height_2_mm') or
+                plate.get('height_mm') != groups[0].get('height_mm')):
+            raise ValueError('Invalid connected cross plate provenance')
+        for group in groups:
+            positions = group.get('bolt_positions_mm', [])
+            intervals = group.get('z_intervals_mm', [])
+            height = _require_number(group, 'height_mm')
+            if height <= 0 or not positions or len(positions) != len(group['instances']) or len(intervals) != len(positions):
+                raise ValueError('Invalid grouped steel plate positions')
+            for z, interval in zip(positions, intervals):
+                if (not isinstance(z, (int, float)) or not math.isfinite(z) or
+                        len(interval) != 2 or any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in interval) or
+                        not math.isclose(interval[0], z-height/2., abs_tol=1e-7) or
+                        not math.isclose(interval[1], z+height/2., abs_tol=1e-7)):
+                    raise ValueError('Invalid grouped steel plate intervals')
+    return list(names)
 
 
 def file_sha256(path):
@@ -105,10 +223,33 @@ def validate_reference_state(state):
     instances = tuple(sorted((source.get('section_segments') or {}).keys()))
     if instances != REFERENCE_INSTANCES:
         raise ValueError('Reference source does not contain exactly P1..P4')
+    plate_names = plate_instance_names(source)
+    if plate_names:
+        plate = source['steel_plates']
+        first = (plate.get('groups') or [plate])[0]
+        if len(first.get('screw_positions_mm', first['instances'])) != int(source.get('bolts_per_seam', -1)):
+            raise ValueError('Steel plate screw-row count differs from source bolt row count')
+        if not math.isclose(float(source['steel_plates']['thickness_mm']),
+                            float(source['clear_gap_mm']), rel_tol=0., abs_tol=1e-8):
+            raise ValueError('Steel plate thickness differs from the clear gap')
     expected_links = int(source.get('expected_links', -1))
     rigid_links = int(build.get('rigid_links', -2))
     if expected_links <= 0 or rigid_links != expected_links:
         raise ValueError('Reference rigid-link count differs from source_inputs')
+    bolt_layout = source.get('bolt_layout')
+    if bolt_layout is not None:
+        if not bolt_layout or len(bolt_layout) != source.get('physical_bolts'):
+            raise ValueError('Reference physical bolt count differs from bolt layout')
+        if any(row.get('plate_instance') is not None and row['plate_instance'] not in plate_names for row in bolt_layout):
+            raise ValueError('Reference bolt references an unknown steel plate')
+        if sum(2 if row.get('plate_instance') else 1 for row in bolt_layout) != expected_links:
+            raise ValueError('Reference bolt layout differs from rigid-link count')
+        seam_rows = {str(row['seam_id']): [] for row in bolt_layout}
+        for row in bolt_layout:
+            seam_rows[str(row['seam_id'])].append(row['z_mm'])
+        if (seam_rows != source.get('bolt_positions_by_seam_mm') or
+                {key: len(rows) for key, rows in seam_rows.items()} != source.get('physical_bolts_per_seam')):
+            raise ValueError('Reference per-seam bolt provenance differs from bolt layout')
     if int(build.get('boundary_conditions', -1)) != REFERENCE_BOUNDARY_CONDITIONS:
         raise ValueError('Reference boundary-condition count differs from the production model')
     _validate_load_case(build)
@@ -123,15 +264,22 @@ def validate_reference_state(state):
     return dict(build=build, source_inputs=source, job_name=job_name)
 
 
-def load_reference_run(run_dir, require_completed=True):
-    """Load one exact run of abaqus_complete_model_m20.py."""
+def load_reference_run(run_dir, require_completed=True, allow_built=False):
+    """Load one exact run of abaqus_complete_model_m20.py.
+
+    allow_built: also accept a run that was built but not solved (status BUILT, from
+    --build-only): its CAE/INP/build record are complete, only the .odb is missing
+    (paths['odb'] is still the recorded name, 'solved' is False). A caller must then take
+    every mode shape from another solved model (e.g. the GDLC REF_G / REF_L folders)."""
     run_dir = os.path.abspath(os.path.expanduser(run_dir))
     status_path = os.path.join(run_dir, STATUS_FILE)
     if not os.path.isfile(status_path):
         raise ValueError('Reference pipeline status not found: ' + status_path)
     state = _load_json(status_path)
     validated = validate_reference_state(state)
-    if require_completed and str(state.get('status', '')).upper() != 'COMPLETED':
+    status = str(state.get('status', '')).upper()
+    built_only = bool(allow_built) and status == 'BUILT'
+    if require_completed and status != 'COMPLETED' and not built_only:
         raise ValueError('Reference run is not COMPLETED: %s' % state.get('status'))
 
     job_name = validated['job_name']
@@ -145,10 +293,10 @@ def load_reference_run(run_dir, require_completed=True):
     recorded_odb = validated['build'].get('odb')
     if recorded_odb and os.path.basename(str(recorded_odb)).lower() != os.path.basename(paths['odb']).lower():
         raise ValueError('Recorded ODB basename is inconsistent with job_name')
-    for key in ('cae', 'odb'):
+    for key in ('cae',) if built_only else ('cae', 'odb'):
         if not os.path.isfile(paths[key]):
             raise ValueError('Reference %s file not found: %s' % (key.upper(), paths[key]))
-    if os.path.exists(os.path.splitext(paths['odb'])[0] + '.lck'):
+    if not built_only and os.path.exists(os.path.splitext(paths['odb'])[0] + '.lck'):
         raise ValueError('Reference ODB is locked; wait for the solver/writer to finish')
 
     return dict(
@@ -160,6 +308,7 @@ def load_reference_run(run_dir, require_completed=True):
         job_name=job_name,
         instances=list(REFERENCE_INSTANCES),
         paths=paths,
+        solved=not built_only,
     )
 
 
@@ -211,12 +360,19 @@ def reference_snapshot(contract, include_hashes=True):
         expected_links=int(source['expected_links']),
         thickness_mm=float(source['thickness_mm']),
         source_directory=source.get('source_directory'),
+        steel_plates=source.get('steel_plates'),
         load_case=load_case_snapshot(build),
     )
+    for key in ('physical_bolts', 'physical_bolts_per_seam', 'bolt_positions_by_seam_mm', 'bolt_layout'):
+        if key in source:
+            snapshot[key] = source[key]
     if include_hashes:
         snapshot['pipeline_status_sha256'] = file_sha256(contract['paths']['pipeline_status'])
         snapshot['source_cae_sha256'] = file_sha256(contract['paths']['cae'])
-        snapshot['source_odb_sha256'] = file_sha256(contract['paths']['odb'])
+        # a BUILT (unsolved) reference has no .odb: recorded as None, never hashed
+        snapshot['source_odb_sha256'] = (file_sha256(contract['paths']['odb'])
+                                         if contract.get('solved', True) else None)
+        snapshot['reference_solved'] = bool(contract.get('solved', True))
         if os.path.isfile(contract['paths']['inp']):
             snapshot['source_inp_sha256'] = file_sha256(contract['paths']['inp'])
     return snapshot
@@ -226,12 +382,17 @@ LOAD_CASE_SNAPSHOT_KEYS = (
     'type', 'tag', 'reference_stress_MPa', 'area_mm2', 'neutral_axis_angle_deg', 'neutral_axis_direction',
     'compression_normal', 'centroid_mm', 'c_extreme_mm', 'I_nn_mm4', 'reference_moment_Nmm_per_MPa',
     'reference_moment_mesh_Nmm_per_MPa', 'section_modulus_mm3', 'section_modulus_outer_fibre_mm3',
-    'plastic_modulus_mm3', 'n_loads', 'symmetry_class_axis_deg', 'stress_definition', 'eigenvalue_meaning')
+    'plastic_modulus_mm3', 'n_loads', 'symmetry_class_axis_deg', 'stress_definition', 'eigenvalue_meaning',
+    'section_symmetry', 'bending_axes_for_PM')
 
 
-def load_case_snapshot(build):
+def load_case_snapshot(build, expected_type=None):
     """Compact load-case record carried by Step 4/5 provenance (compression when absent)."""
     load_case = reference_load_case(build)
+    if expected_type is not None and load_case['type'] != expected_type:
+        raise ValueError('--load-case %s differs from the recorded reference load case %s; '
+                         'Step4 preserves the source loading and cannot convert it' %
+                         (expected_type, load_case['type']))
     return dict((key, load_case[key]) for key in LOAD_CASE_SNAPSHOT_KEYS if key in load_case)
 
 
@@ -270,6 +431,7 @@ def validate_step4_payload(payload):
         raise ValueError('STEP4 source element type is not S4R')
     if tuple(reference.get('instances') or ()) != REFERENCE_INSTANCES:
         raise ValueError('STEP4 source instances are not exactly P1..P4')
+    plate_instance_names(reference)
     if int(reference.get('rigid_links', -1)) != int(reference.get('expected_links', -2)):
         raise ValueError('STEP4 reference bolt count is inconsistent')
     if not isinstance(payload.get('current_case'), dict):

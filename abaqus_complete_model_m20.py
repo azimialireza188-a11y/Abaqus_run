@@ -57,12 +57,19 @@ import datetime
 import tempfile
 import threading
 import time
+import builtins as python_builtins
+
+STEEL_PLATE_LENGTH = 0.0  # optional height along the member; 0 keeps the original model
+STEEL_PLATE_LENGTH_2 = 0.0
+STEEL_PLATE_GAP_MM = 0.0
+STEEL_PLATE_SKIP_COUNT = 0
 
 # CAE noGUI executes scripts without defining __file__.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(
     globals().get('__file__', sys._getframe().f_code.co_filename)))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)  # shared modules stay importable after chdir to the run folder
+import runtime_resources  # stdlib-only: CPU/GPU policy and the --cpus/--gpus value types
 
 
 BUILTUP_DIR = r'C:\Users\810200014.HAMI.000\Documents\CUFSM-Single\cfs_abaqus\A4784_t2_qm1_0_0_0_R8_lipR20t_lipLen60_M200_L3600_gap10_nb19_end25-25_row15'
@@ -139,6 +146,16 @@ def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--builtup-dir', default=BUILTUP_DIR, help='Source CUFSM CSV directory')
     parser.add_argument('--mesh-mm', type=float, default=MESH_MM)
+    parser.add_argument('--steel-plate-length', type=float, default=0.,
+        help='Height along Z of one transverse X-directed plate at each bolt row (mm); '
+             '0 disables plates. Thickness is the source clear gap; yield is set in Step5.')
+    parser.add_argument('--steel-plate-length-2', type=float, default=0.,
+        help='Common height of connected XZ/YZ cross plates when gap=0; with positive gap, '
+             'height of staggered YZ plates. Requires positive --steel-plate-length.')
+    parser.add_argument('--steel-plate-skip-count', type=int, default=0,
+        help='Keep one plate then skip N screw positions, inward from both end plates; screws stay unchanged')
+    parser.add_argument('--steel-plate-gap-mm', type=float, default=0.,
+        help='0: connected cross at source bolt rows; positive: legacy longitudinal edge gap between staggered plates.')
     parser.add_argument('--longitudinal-lines', type=int, default=LONGITUDINAL_LINES,
         help='0: original simplification; 2..99: internal lines per curved region; '
              '100: retain all source lines (essential and bolt lines always remain)')
@@ -156,8 +173,9 @@ def parse_arguments(argv=None):
     parser.add_argument('--n-modes', type=int, default=N_MODES)
     parser.add_argument('--n-vectors', type=int, default=None)
     parser.add_argument('--max-iterations', type=int, default=MAX_ITERATIONS)
-    parser.add_argument('--cpus', type=int, default=None, help='Default: all physical cores available to the solver')
-    parser.add_argument('--gpus', default='auto')
+    parser.add_argument('--cpus', type=runtime_resources.cpu_request, default='auto',
+                        help="Abaqus CPUs: 'auto' (all physical cores, default) or a positive integer, written '--cpus 4'")
+    parser.add_argument('--gpus', type=runtime_resources.gpu_request, default='auto')
     parser.add_argument('--buckle-output', choices=('standard', 'detailed'), default='standard',
                         help='Legacy compatibility option. Automatic buckling now always stores classification-only nodal mode shapes; detailed no longer adds S/E/SF/SE.')
     parser.add_argument('--nodal-precision', choices=('full', 'single'), default='full',
@@ -182,7 +200,20 @@ def parse_arguments(argv=None):
     parser.add_argument('--resume-post', metavar='RUN_DIR',
                         help='Verify completed run and postprocess its ODB; never build or submit')
     args = parser.parse_args(argv)
-    import runtime_resources
+    if not math.isfinite(args.steel_plate_length) or args.steel_plate_length < 0:
+        parser.error('--steel-plate-length must be finite and nonnegative')
+    for option in ('steel_plate_length_2', 'steel_plate_gap_mm'):
+        value = getattr(args, option)
+        if not math.isfinite(value) or value < 0:
+            parser.error('--'+option.replace('_', '-')+' must be finite and nonnegative')
+    if args.steel_plate_length_2 and not args.steel_plate_length:
+        parser.error('--steel-plate-length-2 requires positive --steel-plate-length')
+    if args.steel_plate_gap_mm and not args.steel_plate_length_2:
+        parser.error('--steel-plate-gap-mm requires positive --steel-plate-length-2')
+    if args.steel_plate_skip_count < 0:
+        parser.error('--steel-plate-skip-count must be a nonnegative integer')
+    if args.steel_plate_skip_count and not args.steel_plate_length:
+        parser.error('--steel-plate-skip-count requires positive --steel-plate-length')
     try:
         policy = runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
     except ValueError as error:
@@ -231,6 +262,13 @@ def prepare_output_directory(args):
         if getattr(args, 'load_case', 'compression') != 'compression':
             import abaqus_load_case
             input_name += abaqus_load_case.load_case_tag(args.load_case, args.bending_axis_deg)
+        if getattr(args, 'steel_plate_length', 0.):
+            input_name += '_PL'+('%g' % args.steel_plate_length).replace('.', 'p')
+        if getattr(args, 'steel_plate_length_2', 0.):
+            input_name += '_PL2'+('%g' % args.steel_plate_length_2).replace('.', 'p')
+            input_name += '_PG'+('%g' % args.steel_plate_gap_mm).replace('.', 'p')
+        if getattr(args, 'steel_plate_skip_count', 0):
+            input_name += '_PS%d' % args.steel_plate_skip_count
         os.makedirs(args.output_root, exist_ok=True)
         number = 1
         while True:
@@ -257,21 +295,48 @@ def postprocess_arguments(report):
             '--sigma-ref', str(report['reference_stress_MPa'])]
 
 
+def analysis_failure_details(odb_path):
+    """Small read-only diagnostic from the job's own files, including prelaunch errors."""
+    if not odb_path:
+        return ''
+    base = os.path.splitext(os.path.abspath(odb_path))[0]
+    details = []
+    for suffix in ('.msg', '.log', '.dat', '.sta'):
+        try:
+            with open(base+suffix, 'rb') as stream:
+                stream.seek(max(0, os.path.getsize(base+suffix)-32768))
+                lines = stream.read().decode('utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines):
+            if any(word in line.upper() for word in ('ERROR', 'ABORTED', 'TERMINATED', 'EXCEEDS')):
+                message = ' '.join(lines[i:i+2]).strip()[:600]
+                details.append(suffix+': '+message)
+                if len(details) >= 4:
+                    break
+        if len(details) >= 4:
+            break
+    return '\nSolver diagnostics: '+' | '.join(details) if details else ''
+
+
 def require_completed(job, odb_path=None):
     """Use file evidence only when the CAE job status is unavailable.
 
     Some noGUI sessions return None after waitForCompletion. Never override an
     explicit running/aborted status, or accept a locked/incomplete output.
     """
+    def fail(message):
+        raise RuntimeError(message+analysis_failure_details(odb_path))
+
     status = str(getattr(job, 'status', None)).upper()
-    if status == 'COMPLETED':
+    if status == 'COMPLETED' and not odb_path:
         return 'CAE job.status=COMPLETED'
-    if status not in ('NONE', 'UNKNOWN', '') or not odb_path:
-        raise RuntimeError('Analysis status: %s; postprocessing cancelled. Check .msg/.dat/.sta.' % status)
+    if status not in ('COMPLETED', 'NONE', 'UNKNOWN', '') or not odb_path:
+        fail('Analysis status: %s; postprocessing cancelled. Check .msg/.dat/.sta.' % status)
     base = os.path.splitext(os.path.abspath(odb_path))[0]
     if (not os.path.isfile(odb_path) or os.path.getsize(odb_path) == 0 or
             os.path.exists(base+'.lck')):
-        raise RuntimeError('Analysis status: %s; ODB missing, empty or locked: %s' % (status, odb_path))
+        fail('Analysis status: %s; ODB missing, empty or locked: %s' % (status, odb_path))
     texts = {}
     for suffix in ('.sta', '.log'):
         try:
@@ -282,14 +347,16 @@ def require_completed(job, odb_path=None):
     combined = '\n'.join(texts.values())
     if any(word in combined for word in ('ABORTED', 'TERMINATED', 'EXITED WITH ERRORS',
                                          'HAS NOT BEEN COMPLETED', 'HAS NOT COMPLETED')):
-        raise RuntimeError('Analysis output reports failure; postprocessing cancelled: '+base)
+        fail('Analysis output reports failure; postprocessing cancelled: '+base)
+    if status == 'COMPLETED':
+        return 'CAE job.status=COMPLETED; ODB present and unlocked'
     evidence = []
     if 'THE ANALYSIS HAS COMPLETED SUCCESSFULLY' in texts['.sta']:
         evidence.append('.sta')
     if ('ABAQUS JOB %s COMPLETED' % os.path.basename(base).upper()) in texts['.log']:
         evidence.append('.log')
     if not evidence:
-        raise RuntimeError('Analysis status: %s; no successful completion marker for %s' % (status, base))
+        fail('Analysis status: %s; no successful completion marker for %s' % (status, base))
     return 'Successful completion in '+', '.join(evidence)+'; ODB present and unlocked'
 
 
@@ -769,10 +836,295 @@ def read_model_inputs(folder):
     return pieces, thickness, young, poisson, seams, bolts, member
 
 
-def input_summary(data):
+def apply_plate_skip_pattern(layout, skip_count, length):
+    """Filter plates after geometry generation; retain every physical screw row."""
+    if not skip_count:
+        return layout                 # exact legacy layout/provenance when disabled
+    groups = layout.get('groups') or [layout]
+    next_instance = 1
+    for group in groups:
+        positions = list(group['bolt_positions_mm'])
+        midpoint, tol = length/2., 1e-7
+        selected = {0, len(positions)-1}  # outermost existing plates are mandatory
+        for from_start, inward in ((True, range(len(positions))),
+                                   (False, range(len(positions)-1, -1, -1))):
+            side = [j for j in inward if (positions[j] <= midpoint+tol if from_start
+                                         else positions[j] >= midpoint-tol)]
+            selected.update(j for rank, j in enumerate(side) if rank % (skip_count+1) == 0)
+        selected = sorted(selected)
+        group['skip_count'] = skip_count
+        group['screw_positions_mm'] = positions
+        group['skipped_plate_positions_mm'] = [z for j, z in enumerate(positions) if j not in selected]
+        group['edge_plate_positions_mm'] = sorted({positions[0], positions[-1]})
+        group['bolt_positions_mm'] = [positions[j] for j in selected]
+        group['z_intervals_mm'] = [group['z_intervals_mm'][j] for j in selected]
+        if 'placement_sides' in group:
+            group['placement_sides'] = [group['placement_sides'][j] for j in selected]
+        group['instances'] = ['STEEL_PLATE_%03d' % j
+            for j in range(next_instance, next_instance+len(selected))]
+        next_instance += len(selected)
+    if layout.get('groups'):
+        for key in ('skip_count', 'screw_positions_mm', 'skipped_plate_positions_mm',
+                    'edge_plate_positions_mm', 'bolt_positions_mm', 'z_intervals_mm'):
+            layout[key] = groups[0][key]
+        layout['instances'] = [name for group in groups for name in group['instances']]
+        if layout.get('assembly_type') == 'CONNECTED_CROSS':
+            # Both bolt directions belong to the SAME physical meshed part.
+            groups[1]['instances'] = list(groups[0]['instances'])
+            layout['instances'] = list(groups[0]['instances'])
+    return layout
+
+
+def steel_plate_layout(data, height, height_2=0., edge_gap=0., skip_count=0):
+    """Source-row connected crosses at gap=0; retain legacy staggered positive gaps."""
+    height = float(height)
+    if isinstance(skip_count, bool) or not isinstance(skip_count, int) or skip_count < 0:
+        raise ValueError('Steel plate skip count must be a nonnegative integer')
+    if skip_count and not height:
+        raise ValueError('Steel plate skip count requires a positive plate height')
+    height_2, edge_gap = float(height_2), float(edge_gap)
+    if not math.isfinite(height_2) or height_2 < 0 or not math.isfinite(edge_gap) or edge_gap < 0:
+        raise ValueError('Second steel plate height and edge gap must be finite and nonnegative')
+    if height_2 and not height:
+        raise ValueError('Second steel plates require a positive first plate height')
+    if not math.isfinite(height) or height < 0:
+        raise ValueError('Steel plate height must be finite and nonnegative')
+    if height == 0:
+        return None
+    pieces, thickness, young, poisson, seams, bolts, member = data
+    gap, length = float(member['gap_mm']), float(member['L_mm'])
+    if gap <= 0:
+        raise ValueError('Steel plates require a positive clear gap')
+    connected_cross = bool(height_2 and edge_gap == 0.)
+    if connected_cross:
+        height = height_2       # one common height, controlled by the second parameter
+    intervals = [[z-height/2., z+height/2.] for z in bolts]
+    if any(a < 0 or b > length for a, b in intervals):
+        raise ValueError('Steel plate height extends beyond a member end')
+    if not connected_cross and any(b >= c-1e-7 for (a, b), (c, d) in zip(intervals, intervals[1:])):
+        raise ValueError('Steel plates at consecutive bolt rows overlap or touch')
+    selected = [r for r in seams if abs(r[3]-r[5]) < 1e-6
+                and abs(r[4]+r[6]) < 1e-6
+                and abs(abs(r[4])-(gap+thickness)/2.) < 1e-6]
+    if len(selected) != 2 or selected[0][3]*selected[1][3] >= 0:
+        raise ValueError('Steel plates require two opposite bolt seams across y=0')
+    xs = [x for segments in pieces.values() for s in segments for x in (s[0], s[2])]
+    first = dict(direction='X', midplane_y_mm=0., height_mm=height,
+        x_limits_mm=[min(xs), max(xs)], thickness_mm=gap, E_MPa=young, nu=poisson,
+        bolt_positions_mm=list(bolts), z_intervals_mm=intervals,
+        bolt_seam_ids=[int(r[0]) for r in selected], bolt_x_mm=sorted(r[3] for r in selected),
+        instances=['STEEL_PLATE_%03d' % j for j in range(1, len(bolts)+1)],
+        material='SteelPlate', section='SteelPlateSection', element_type='S4R',
+        section_points=9, connection='existing ideal bolts split at plate midsurface; BEAM_MPC',
+        contact='GENERAL_STANDARD_HARD_FRICTIONLESS; separation allowed',
+        yield_definition='separate elastic-perfectly-plastic --steel-plate-fy in Step5')
+    if not height_2:
+        return apply_plate_skip_pattern(first, skip_count, length)
+    vertical = [r for r in seams if abs(r[4]-r[6]) < 1e-6
+                and abs(r[3]+r[5]) < 1e-6
+                and abs(abs(r[3])-(gap+thickness)/2.) < 1e-6]
+    if len(vertical) != 2 or vertical[0][4]*vertical[1][4] >= 0:
+        raise ValueError('Perpendicular plates require two opposite bolt seams across x=0')
+    if connected_cross:
+        ys = [y for segments in pieces.values() for s in segments for y in (s[1], s[3])]
+        second = dict(first, direction='Y', midplane_x_mm=0.,
+            y_limits_mm=[min(ys), max(ys)], bolt_seam_ids=[int(r[0]) for r in vertical],
+            bolt_y_mm=sorted(r[4] for r in vertical))
+        for key in ('x_limits_mm', 'midplane_y_mm', 'bolt_x_mm'):
+            second.pop(key, None)
+        layout = dict(first, direction='X_AND_Y', assembly_type='CONNECTED_CROSS',
+            height_2_mm=height_2, edge_gap_mm=0., groups=[first, second],
+            central_connection='single native shell part; shared nodes along full intersection',
+            placement_definition='exact source bolt rows in both directions; symmetric end-first skip pattern')
+        layout = apply_plate_skip_pattern(layout, skip_count, length)
+        kept = layout['z_intervals_mm']
+        if any(b >= c-1e-7 for (a,b),(c,d) in zip(kept,kept[1:])):
+            raise ValueError('Cross plates at selected bolt rows overlap or touch')
+        return layout
+    if len(bolts) < 2:
+        raise ValueError('Perpendicular plates require separate start and finish bolt rows')
+    tol, midpoint = 1e-7, length/2.
+    shift = (height+height_2)/2.+edge_gap
+    candidates, omitted = [], []
+    for side, sign in (('start', 1.), ('finish', -1.)):
+        for source_z in (bolts if side == 'start' else reversed(bolts)):
+            z = source_z+sign*shift
+            if (side == 'start' and z > midpoint+tol) or (side == 'finish' and z < midpoint-tol):
+                continue
+            a, b = z-height_2/2., z+height_2/2.
+            reason = None
+            if a < -tol or b > length+tol:
+                reason = 'outside member'
+            elif any(min(b, d+edge_gap)-max(a, c-edge_gap) > tol for c, d in intervals):
+                reason = 'overlaps first-direction plate or violates edge gap'
+            if reason:
+                omitted.append(dict(z_mm=z, side=side, reason=reason))
+                continue
+            existing = next((item for item in candidates if abs(item['z_mm']-z) <= tol), None)
+            if existing is not None:
+                existing['side'] = 'both'
+            else:
+                candidates.append(dict(z_mm=z, side=side, interval=[a, b]))
+    candidates.sort(key=lambda item: item['z_mm'])
+    colliding = set()
+    for j, a in enumerate(candidates):
+        for k in range(j+1, len(candidates)):
+            b = candidates[k]
+            if b['interval'][0] >= a['interval'][1]-tol:
+                break
+            colliding.update((j, k))
+    for j in sorted(colliding):
+        omitted.append(dict(z_mm=candidates[j]['z_mm'], side=candidates[j]['side'],
+                            reason='overlaps opposite-end second-direction plate'))
+    candidates = [item for j, item in enumerate(candidates) if j not in colliding]
+    if not candidates:
+        raise ValueError('No complete non-overlapping perpendicular plates fit; reduce heights or edge gap')
+    ys = [y for segments in pieces.values() for s in segments for y in (s[1], s[3])]
+    second = dict(first, direction='Y', midplane_x_mm=0., height_mm=height_2,
+        y_limits_mm=[min(ys), max(ys)], bolt_seam_ids=[int(r[0]) for r in vertical],
+        bolt_y_mm=sorted(r[4] for r in vertical),
+        bolt_positions_mm=[item['z_mm'] for item in candidates],
+        z_intervals_mm=[item['interval'] for item in candidates],
+        placement_sides=[item['side'] for item in candidates], omitted_candidates=omitted,
+        end_bolts_without_plate_mm=[bolts[0], bolts[-1]], edge_gap_mm=edge_gap,
+        instances=['STEEL_PLATE_%03d' % j for j in range(len(bolts)+1, len(bolts)+len(candidates)+1)])
+    for key in ('x_limits_mm', 'midplane_y_mm', 'bolt_x_mm'):
+        second.pop(key, None)
+    layout = dict(first, direction='X_AND_Y', height_2_mm=height_2, edge_gap_mm=edge_gap,
+                instances=first['instances']+second['instances'], groups=[first, second],
+                placement_definition='first family unchanged; second family from both ends inward; original end bolts retained')
+    return apply_plate_skip_pattern(layout, skip_count, length)
+
+
+def bolt_layout(data, plate_layout):
+    """Explicit physical bolt rows; plate bolts consist of two ideal link segments."""
+    groups = (plate_layout.get('groups') or [plate_layout]) if plate_layout else []
+    result = []
+    for row in data[4]:
+        sid, pa, pb, xa, ya, xb, yb = row
+        group = next((g for g in groups if int(sid) in g['bolt_seam_ids']), None)
+        rows = list(group.get('screw_positions_mm', group['bolt_positions_mm'])) if group else list(data[5])
+        if group:
+            rows.extend(group.get('end_bolts_without_plate_mm', []))
+        for j, z in enumerate(sorted(set(rows)), 1):
+            instance = None
+            if group:
+                match = next((k for k, p in enumerate(group['bolt_positions_mm']) if abs(z-p) < 1e-7), None)
+                if match is not None:
+                    instance = group['instances'][match]
+            result.append(dict(seam_id=int(sid), row=j, z_mm=z, pa=int(pa), pb=int(pb),
+                a_xy=[xa, ya], b_xy=[xb, yb], plate_instance=instance,
+                plate_direction=group['direction'] if instance else None))
+    return result
+
+
+def validate_cross_plate_mesh(part, height):
+    """Every intersection node must be shared by all four shell arms, not duplicated."""
+    tol=1e-7
+    joint={n.label:n for n in part.nodes if abs(n.coordinates[0])<tol and abs(n.coordinates[1])<tol}
+    if not joint:
+        raise RuntimeError('Cross plate has no shared intersection nodes')
+    zs=sorted(n.coordinates[2] for n in joint.values())
+    if (any(b-a<tol for a,b in zip(zs,zs[1:])) or
+            abs(zs[0]+height/2.)>tol or abs(zs[-1]-height/2.)>tol or
+            not any(abs(z)<tol for z in zs)):
+        raise RuntimeError('Cross plate intersection is duplicated or incomplete')
+    arms={label:set() for label in joint}
+    for element in part.elements:
+        nodes=element.getNodes()
+        incident=[n.label for n in nodes if n.label in joint]
+        for axis,key in ((0,'X'),(1,'Y')):
+            for sign in (-1,1):
+                if any(sign*n.coordinates[axis]>tol for n in nodes):
+                    for label in incident:
+                        arms[label].add((key,sign))
+    if any(len(directions)!=4 for directions in arms.values()):
+        raise RuntimeError('Cross plate arms do not share the full intersection mesh')
+
+
+def build_steel_plates(model, assembly, layout):
+    """Native shells; zero-gap crosses have one conforming mesh and shared joint DOFs."""
+    if layout is None:
+        return {}
+    from abaqusConstants import (THREE_D, DEFORMABLE_BODY, MIDDLE_SURFACE, FROM_SECTION,
+        XZPLANE, YZPLANE, QUAD, STRUCTURED, S4R, STANDARD, FIXED, ON, DELETE, GEOMETRY)
+    import mesh
+    import regionToolset
+    model.Material(name=layout['material'])
+    model.materials[layout['material']].Elastic(table=((layout['E_MPa'], layout['nu']),))
+    model.HomogeneousShellSection(name=layout['section'], material=layout['material'],
+        thickness=layout['thickness_mm'], numIntPts=layout['section_points'])
+    result, prototypes = {}, []
+    connected = layout.get('assembly_type') == 'CONNECTED_CROSS'
+
+    def mesh_plate(plate, height):
+        plate.SectionAssignment(region=regionToolset.Region(faces=plate.faces[:]),
+            sectionName=layout['section'], offset=0., offsetType=MIDDLE_SURFACE, thicknessAssignment=FROM_SECTION)
+        plate.setMeshControls(regions=plate.faces[:], elemShape=QUAD, technique=STRUCTURED)
+        plate.setElementType(regions=(plate.faces[:],), elemTypes=(mesh.ElemType(elemCode=S4R, elemLibrary=STANDARD),))
+        size = min(MESH_MM, height/4.)
+        plate.seedPart(size=size, deviationFactor=.1, minSizeFactor=.1)
+        for edge in plate.edges:
+            count = max(1, int(math.ceil(edge.getSize(printResults=False)/size-1e-6)))
+            plate.seedEdgeByNumber(edges=(edge,), number=count, constraint=FIXED)
+        plate.generateMesh()
+        if not len(plate.elements) or plate.getUnmeshedRegions() is not None:
+            raise RuntimeError('Steel plate mesh is incomplete')
+
+    for group in layout.get('groups') or [layout]:
+        suffix = '' if group['direction'] == 'X' else '2'
+        transverse = 'x' if group['direction'] == 'X' else 'y'
+        xmin, xmax = group[transverse+'_limits_mm']
+        half = group['height_mm']/2.
+        sketch = model.ConstrainedSketch(name='SteelPlateSketch'+suffix, sheetSize=2.*max(xmax-xmin, 2.*half))
+        sketch.rectangle(point1=(xmin, -half), point2=(xmax, half))
+        plate = model.Part(name='SteelPlatePart'+suffix, dimensionality=THREE_D, type=DEFORMABLE_BODY)
+        plate.BaseShell(sketch=sketch)
+        for x in sorted(set(group['bolt_'+transverse+'_mm']+([0.] if connected else []))):
+            plane = plate.DatumPlaneByPrincipalPlane(principalPlane=YZPLANE, offset=x)
+            plate.PartitionFaceByDatumPlane(datumPlane=plate.datums[plane.id], faces=plate.faces[:])
+        plane = plate.DatumPlaneByPrincipalPlane(principalPlane=XZPLANE, offset=0.)
+        plate.PartitionFaceByDatumPlane(datumPlane=plate.datums[plane.id], faces=plate.faces[:])
+        if connected:
+            name='CrossPrototype'+group['direction']
+            prototype=assembly.Instance(name=name,part=plate,dependent=ON)
+            assembly.rotate(instanceList=(name,),axisPoint=(0.,0.,0.),axisDirection=(1.,0.,0.),angle=90.)
+            if group['direction']=='Y':
+                assembly.rotate(instanceList=(name,),axisPoint=(0.,0.,0.),axisDirection=(0.,0.,1.),angle=90.)
+            prototypes.append(prototype)
+            continue
+        mesh_plate(plate,group['height_mm'])
+        for name, z in zip(group['instances'], group['bolt_positions_mm']):
+            result[name] = assembly.Instance(name=name, part=plate, dependent=ON)
+            assembly.rotate(instanceList=(name,), axisPoint=(0., 0., 0.), axisDirection=(1., 0., 0.), angle=90.)
+            if group['direction'] == 'Y':
+                assembly.rotate(instanceList=(name,), axisPoint=(0., 0., 0.), axisDirection=(0., 0., 1.), angle=90.)
+            assembly.translate(instanceList=(name,), vector=(0., 0., z))
+    if connected:
+        # Merge GEOMETRY before meshing: a common topological edge produces a
+        # single set of translational/rotational shell DOFs along the whole joint.
+        prototype=assembly.InstanceFromBooleanMerge(name='SteelCrossPlate',instances=tuple(prototypes),
+            keepIntersections=ON,originalInstances=DELETE,domain=GEOMETRY)
+        plate=model.parts[prototype.partName]
+        del assembly.features[prototype.name]
+        mesh_plate(plate,layout['height_mm'])
+        validate_cross_plate_mesh(plate,layout['height_mm'])
+        for name,z in zip(layout['instances'],layout['bolt_positions_mm']):
+            result[name]=assembly.Instance(name=name,part=plate,dependent=ON)
+            assembly.translate(instanceList=(name,),vector=(0.,0.,z))
+    assembly.regenerate()
+    return result
+
+
+def input_summary(data, plate_settings=None):
     pieces, thickness, young, poisson, seams, bolts, member = data
     section_segments = {'P%d' % int(k): [[float(v) for v in seg] for seg in pieces[k]]
                         for k in sorted(pieces)}
+    settings = plate_settings if plate_settings is not None else dict(height=STEEL_PLATE_LENGTH,
+        height_2=STEEL_PLATE_LENGTH_2, edge_gap=STEEL_PLATE_GAP_MM, skip_count=STEEL_PLATE_SKIP_COUNT)
+    plates = steel_plate_layout(data, **settings)
+    connections = bolt_layout(data, plates)
+    seam_rows = {str(int(row[0])): [c['z_mm'] for c in connections if c['seam_id'] == int(row[0])] for row in seams}
     return dict(source_directory=os.path.abspath(BUILTUP_DIR),
         section_segments=section_segments,
         section_geometry_definition='original builtup_segments.csv in global section coordinates',
@@ -781,7 +1133,11 @@ def input_summary(data):
         bolt_row_mm=float(member['bolt_row_mm']), bolts_per_seam=len(bolts),
         start_end_mm=bolts[0], finish_end_mm=float(member['L_mm'])-bolts[-1],
         pitch_mm=[b-a for a, b in zip(bolts, bolts[1:])], bolt_positions_mm=bolts,
-        expected_links=len(seams)*len(bolts), connection_model='BEAM_MPC',
+        physical_bolts=len(connections), bolt_positions_by_seam_mm=seam_rows,
+        physical_bolts_per_seam={key: len(value) for key, value in seam_rows.items()},
+        bolt_layout=connections,
+        expected_links=python_builtins.sum(2 if c['plate_instance'] else 1 for c in connections), connection_model='BEAM_MPC',
+        steel_plates=plates,
         bolt_solids_holes_contact_pretension=False,
         shell_contact='GENERAL_STANDARD_HARD_FRICTIONLESS')
 
@@ -798,6 +1154,20 @@ def load_case_definition(inputs, load_case=None, bending_axis_deg=None):
     else:
         definition = abaqus_load_case.compression_reference(pieces, thickness)
     symmetry = abaqus_load_case.section_symmetry(pieces)
+    if STEEL_PLATE_LENGTH and STEEL_PLATE_LENGTH_2 and STEEL_PLATE_GAP_MM == 0.:
+        # Equal-height connected crosses and identical source screw rows in all
+        # four seams preserve the verified C4 geometry's rotational symmetry.
+        symmetry['scope'] = 'full model including connected equal-height cross plates at source bolt rows'
+    elif STEEL_PLATE_LENGTH:
+        # X plates (y=0) alone, or X plates with perpendicular Y plates (x=0) at other
+        # stations along the member, break the 90-degree rotation and the diagonal mirrors
+        # of the bare section; the 180-degree rotation and the x/y mirror lines map
+        # each plate family (and its bolt rows) onto itself.
+        symmetry['rotations_deg'] = [r for r in symmetry['rotations_deg'] if r in (0, 180)]
+        symmetry['mirror_lines_deg'] = [a for a in symmetry['mirror_lines_deg']
+            if min(abs(a), abs(a-90.), abs(a-180.)) < 1e-4]
+        symmetry['scope'] = ('full model including X-directed and perpendicular Y-directed transverse steel plates'
+                             if STEEL_PLATE_LENGTH_2 else 'full model including X-directed transverse steel plates')
     definition['section_properties'] = abaqus_load_case.section_properties(pieces, thickness)
     definition['section_symmetry'] = symmetry
     definition['bending_axes_for_PM'] = abaqus_load_case.required_bending_axes(symmetry)
@@ -807,13 +1177,23 @@ def load_case_definition(inputs, load_case=None, bending_axis_deg=None):
     return definition
 
 
-def add_general_contact(model):
+PLATE_FIT_TOLERANCE_T = 1e-4   # initial gaps below this fraction of t are closed (plate models)
+
+
+def add_general_contact(model, opening_tolerance=None):
     """Define shell contact in Initial, inherited by subsequent steps.
 
     Keep section thickness/offset defaults. In linear Buckle, the contact
     status remains fixed at the base state, even if plotted modes overlap.
+    opening_tolerance (steel-plate models): a transverse plate is exactly as thick as the
+    clear gap, so its faces touch the walls at zero nominal clearance, and the mesh
+    coordinates scatter that clearance by about +-1e-6 mm. Abaqus would then close the
+    overclosed points (strain-free adjustment) and leave the others open, so the base-state
+    contact - which the linear Buckle keeps fixed - would follow rounding noise. Initial
+    openings below opening_tolerance are therefore also closed strain-free (snug fit of the
+    bolt-clamped stack); real gaps stay open.
     """
-    from abaqusConstants import ON, HARD, DEFAULT, FRICTIONLESS, GLOBAL, SELF
+    from abaqusConstants import ON, HARD, DEFAULT, FRICTIONLESS, GLOBAL, SELF, ADJUST
     import interaction
     prop = model.ContactProperty('Hard_Frictionless')
     prop.NormalBehavior(pressureOverclosure=HARD, allowSeparation=ON,
@@ -823,6 +1203,11 @@ def add_general_contact(model):
     contact.includedPairs.setValuesInStep(stepName='Initial', useAllstar=ON)
     contact.contactPropertyAssignments.appendInStep(stepName='Initial',
         assignments=((GLOBAL, SELF, 'Hard_Frictionless'),))
+    if opening_tolerance:
+        model.StdInitialization(name='SnugFit', overclosureType=ADJUST,
+                                openingTolerance=float(opening_tolerance))
+        contact.initializationAssignments.appendInStep(stepName='Initial',
+            assignments=((GLOBAL, SELF, 'SnugFit'),))
 
 
 def apply_bending_end_forces(model, assembly, end_sets, thickness, definition):
@@ -893,6 +1278,12 @@ def apply_bending_end_forces(model, assembly, end_sets, thickness, definition):
                 critical_moment_formula='M_cr = eigenvalue * reference_moment_mesh_Nmm_per_MPa (applied by the FE model)')
 
 
+def assembly_mesh_counts(assembly):
+    # CAE injects an Abaqus function named sum into noGUI script globals.
+    return (python_builtins.sum(len(i.nodes) for i in assembly.instances.values()),
+            python_builtins.sum(len(i.elements) for i in assembly.instances.values()))
+
+
 def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='full', gpus='auto'):
     import runtime_resources
     policy = runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(), cpus, gpus)
@@ -901,9 +1292,18 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
     if inputs is None:
         inputs = read_model_inputs(BUILTUP_DIR)
     pieces, thickness, young, poisson, seams, bolts, member = inputs
+    plate_layout = steel_plate_layout(inputs, STEEL_PLATE_LENGTH, STEEL_PLATE_LENGTH_2, STEEL_PLATE_GAP_MM, STEEL_PLATE_SKIP_COUNT)
+    connections = bolt_layout(inputs, plate_layout)
     LENGTH_MM = float(member['L_mm'])
     load_definition = load_case_definition(inputs)
     MODEL_NAME = ('BU_BOLT_L%g_M%g' % (LENGTH_MM, MESH_MM)).replace('.', 'p') + load_definition['tag']
+    if plate_layout:
+        MODEL_NAME += '_PL'+('%g' % STEEL_PLATE_LENGTH).replace('.', 'p')
+    if STEEL_PLATE_LENGTH_2:
+        MODEL_NAME += '_PL2'+('%g' % STEEL_PLATE_LENGTH_2).replace('.', 'p')
+        MODEL_NAME += '_PG'+('%g' % STEEL_PLATE_GAP_MM).replace('.', 'p')
+    if STEEL_PLATE_SKIP_COUNT:
+        MODEL_NAME += '_PS%d' % STEEL_PLATE_SKIP_COUNT
     solver = effective_eigensolver(LOAD_CASE, EIGENSOLVER)
     print('Source inputs: '+json.dumps(input_summary(inputs), sort_keys=True))
     import caeModules  # initialize all CAE repositories for noGUI execution
@@ -997,7 +1397,7 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
             part.PartitionFaceByDatumPlane(datumPlane=part.datums[plane.id], faces=face)
             native_lines.add(xykey((x, y)))
 
-    cuts = sorted(set(round(z, 7) for z in bolts + [LENGTH_MM / 2]))
+    cuts = sorted(set(round(z, 7) for z in bolts + [c['z_mm'] for c in connections] + [LENGTH_MM / 2]))
     for z in cuts:
         plane = part.DatumPlaneByPrincipalPlane(principalPlane=XYPLANE, offset=z)
         part.PartitionFaceByDatumPlane(datumPlane=part.datums[plane.id], faces=part.faces[:])
@@ -1058,7 +1458,8 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
             assembly.rotate(instanceList=(name,), axisPoint=(0., 0., 0.),
                             axisDirection=(0., 0., 1.), angle=90.0 * (k-1))
     assembly.regenerate()
-    add_general_contact(model)
+    plate_instances = build_steel_plates(model, assembly, plate_layout)
+    add_general_contact(model, PLATE_FIT_TOLERANCE_T*thickness if plate_layout else None)
     if solver == 'subspace':
         model.BuckleStep(name='Buckle', previous='Initial', numEigen=N_MODES,
                         eigensolver=SUBSPACE, maxEigen=None, vectors=N_VECTORS,
@@ -1101,16 +1502,27 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
     assembly.Set(name='AXIAL_ANCHOR', nodes=axial_nodes)
     model.DisplacementBC(name='AXIAL_FIX', createStepName='Initial',
                          region=assembly.sets['AXIAL_ANCHOR'], u3=SET)
-    for seam, pa, pb, xa, ya, xb, yb in seams:
-        for j, z in enumerate(bolts, 1):
-            name = 'BOLT_S%d_%02d' % (int(seam), j)
-            assembly.Set(name=name+'_A', nodes=exact_node(instances[int(pa)], (xa, ya, z)))
-            assembly.Set(name=name+'_B', nodes=exact_node(instances[int(pb)], (xb, yb, z)))
-            model.MultipointConstraint(name=name, controlPoint=assembly.sets[name+'_A'],
-                surface=assembly.sets[name+'_B'], mpcType=BEAM_MPC,
+    for connection in connections:
+        z = connection['z_mm']
+        name = 'BOLT_S%d_%02d' % (connection['seam_id'], connection['row'])
+        xa, ya = connection['a_xy']
+        xb, yb = connection['b_xy']
+        a = exact_node(instances[connection['pa']], (xa, ya, z))
+        b = exact_node(instances[connection['pb']], (xb, yb, z))
+        if connection['plate_instance']:
+            centre_xy = (xa, 0.) if connection['plate_direction'] == 'X' else (0., ya)
+            centre = exact_node(plate_instances[connection['plate_instance']], centre_xy+(z,))
+            links = [(name, centre, b), (name+'_PLATE', centre, a)]
+        else:
+            links = [(name, a, b)]
+        for link_name, control, dependent in links:
+            assembly.Set(name=link_name+'_A', nodes=control)
+            assembly.Set(name=link_name+'_B', nodes=dependent)
+            model.MultipointConstraint(name=link_name, controlPoint=assembly.sets[link_name+'_A'],
+                surface=assembly.sets[link_name+'_B'], mpcType=BEAM_MPC,
                 userMode=DOF_MODE_MPC, userType=0, csys=None)
     expected_loads = 8 if LOAD_CASE == 'compression' else load_definition['n_loads']
-    assert len(model.constraints) == len(seams)*len(bolts) and len(model.loads) == expected_loads
+    assert len(model.constraints) == input_summary(inputs)['expected_links'] and len(model.loads) == expected_loads
     assert len(model.boundaryConditions) == 9
     for name in list(model.fieldOutputRequests.keys()):
         del model.fieldOutputRequests[name]
@@ -1127,6 +1539,7 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
         viewport.setValues(displayedObject=assembly)
         viewport.view.fitView()
     mdb.saveAs(pathName=os.path.join(os.getcwd(), MODEL_NAME+'.cae'))
+    node_count, element_count = assembly_mesh_counts(assembly)
     report = dict(length_mm=LENGTH_MM, target_mesh_mm=MESH_MM, modes=N_MODES,
         longitudinal_lines=LONGITUDINAL_LINES,
         longitudinal_line_min_spacing_mm=LONGITUDINAL_LINE_MIN_SPACING_MM,
@@ -1134,7 +1547,7 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
         retained_section_lines=len(keep),
         vectors=N_VECTORS, max_iterations=MAX_ITERATIONS, cpus=cpus,
         job_name=MODEL_NAME, odb=os.path.abspath(MODEL_NAME+'.odb'),
-        nodes=4*len(part.nodes), elements=4*len(part.elements), element_type='S4R',
+        nodes=node_count, elements=element_count, element_type='S4R',
         bolts_per_seam=len(bolts), rigid_links=len(model.constraints),
         boundary_conditions=len(model.boundaryConditions), loads=len(model.loads),
         reference_stress_MPa=1.0, submitted=False)
@@ -1146,8 +1559,11 @@ def build(inputs=None, cpus=None, buckle_output='standard', nodal_precision='ful
     report['contact'] = dict(type='General contact (Standard)', step='Initial',
         domain='All exterior surfaces, including self-contact', normal='HARD',
         tangential='FRICTIONLESS', allow_separation=True,
-        buckle_limitation='Contact status fixed at the base state')
+        buckle_limitation='Contact status fixed at the base state',
+        initial_openings_closed_below_mm=PLATE_FIT_TOLERANCE_T*thickness if plate_layout else None)
     report['source_inputs'] = input_summary(inputs)
+    for key in ('physical_bolts', 'physical_bolts_per_seam', 'bolt_positions_by_seam_mm'):
+        report[key] = report['source_inputs'][key]
     report['modal_output'] = dict(
         profile='classification_only', requested_legacy_profile=buckle_output,
         nodal_precision=nodal_precision, fields=['U', 'UR'],
@@ -1165,6 +1581,8 @@ def main(argv=None):
     global BUILTUP_DIR, MESH_MM, N_MODES, N_VECTORS, MAX_ITERATIONS
     global LONGITUDINAL_LINES, LONGITUDINAL_LINE_MIN_SPACING_MM
     global LOAD_CASE, BENDING_AXIS_DEG, EIGENSOLVER
+    global STEEL_PLATE_LENGTH
+    global STEEL_PLATE_LENGTH_2, STEEL_PLATE_GAP_MM, STEEL_PLATE_SKIP_COUNT
     args = parse_arguments(argv)
     parquet_backend = None
     if (args.portable_export in ('parquet', 'both') and
@@ -1182,6 +1600,9 @@ def main(argv=None):
     LONGITUDINAL_LINE_MIN_SPACING_MM = args.longitudinal_line_min_spacing_mm
     N_MODES, N_VECTORS, MAX_ITERATIONS = args.n_modes, args.n_vectors, args.max_iterations
     LOAD_CASE, BENDING_AXIS_DEG, EIGENSOLVER = args.load_case, args.bending_axis_deg, args.eigensolver
+    STEEL_PLATE_LENGTH = args.steel_plate_length
+    STEEL_PLATE_LENGTH_2, STEEL_PLATE_GAP_MM = args.steel_plate_length_2, args.steel_plate_gap_mm
+    STEEL_PLATE_SKIP_COUNT = args.steel_plate_skip_count
     validate_settings()
     inputs = read_model_inputs(BUILTUP_DIR)
     settings = vars(args).copy()

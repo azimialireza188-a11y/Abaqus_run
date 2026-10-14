@@ -14,6 +14,11 @@ Build after YOU confirm mode IDs and amplitudes:
   abaqus cae noGUI=abaqus_step4_imperfections.py -- --run-dir "completed run"
     --local-mode INTEGER --dist-mode INTEGER --local-high-t FACTOR
     --dist-mm MILLIMETRES --output-cae "new output.cae"
+Every option is written '--name value' with a space: the Abaqus launcher rejects
+'--name=value' before this script starts.
+--cpus N|auto (default auto): CPU threads of this stage. Step 4 launches no solver;
+the value sets the NumPy/BLAS threads of the build and is the default worker count
+of --suggest (--suggest-cpus overrides it there).
 
 local-high-t and dist-mm have NO assumed defaults. The low local level defaults
 to 0.34*t (the research plan). With --local-metric normal, its scale is the max
@@ -35,6 +40,11 @@ Selectable mode sources (all optional; defaults reproduce the earlier behaviour)
       (equal eigenvalues, e.g. the two flexural modes of a square section, whose
       direction inside the pair is arbitrary in Abaqus) into the eigenmode whose
       bow points along --global-angle-deg, so the direction is reproducible.
+      A single --global-mode with an explicit --global-angle-deg: when that mode has
+      exactly one equal-eigenvalue partner in its ODB, the pair is used (the requested
+      direction is otherwise not reproducible); without a partner the single mode is
+      kept and the angle only fixes its sign (bow towards the angle), with a warning
+      when the mode does not bow along that direction.
   Every source ODB must carry exactly the reference mesh (same instances, node
   labels, coordinates and connectivity - verified node by node) and a completed
   analysis. Only the components used by the selected cases are required.
@@ -52,7 +62,9 @@ optional LD_mp and LD_mm; --cases all for all nine; --cases none for only --comb
 User-defined cases (repeatable; any L/D/G combination and amplitude):
   --combo NAME=aL,aD,aG    each amplitude: mm (3.6), thickness multiple (0.34t),
                            length fraction (L/1000), signed (-0.34t); 0 = absent.
-  e.g. --combo LDG_pp=0.34t,3.6,L/1000 --combo LDG_pm=0.34t,-3.6,L/1000
+  e.g. --combo LDG_pp=0.34t,3.6,L/1000 --combo LG_mp=-0.34t,0,L/1000 --combo L_mp=-0.34t,0,0
+  (any number, any order; names differ case-insensitively from each other and from
+  the selected --cases)
   With --combo and no explicit --cases, only the --combo cases are built.
 Global bow = sin(pi*(z-z0)/L) in the --global-angle-deg direction (default global
 X for a Z-axis column), with analytical peaks L/1000 and L/3000. This is not an
@@ -91,18 +103,59 @@ import math
 import os
 import re
 import sys
-# Configure before NumPy loads: use CPU workers across modes without nesting
-# all-core BLAS teams. The total worker count still uses all available CPUs.
-if '--suggest' in sys.argv and not (
-        '--suggest-source=csv' in sys.argv or
-        any(a == '--suggest-source' and i+1 < len(sys.argv) and sys.argv[i+1] == 'csv'
-            for i,a in enumerate(sys.argv))):
-    from runtime_resources import configure_threads
+
+
+BENDING_MIN_TRANSLATION_RATIO = .5
+
+BENDING_MAX_BOW_DEVIATION_DEG = 10.
+
+def _early_option(argv, name):
+    """Value of '--name value' (or '--name=value') before argparse runs; None when absent."""
+    for i, item in enumerate(argv):
+        if item == name and i+1 < len(argv):
+            return argv[i+1]
+        if item.startswith(name+'='):
+            return item[len(name)+1:]
+    return None
+
+
+# Configure before NumPy loads. --suggest: CPU workers across modes without nesting
+# all-core BLAS teams (the worker count still uses all available CPUs). Build: --cpus N
+# sets the BLAS threads; auto leaves the library default (all cores).
+from runtime_resources import configure_threads, cpu_request
+if '--suggest' in sys.argv and _early_option(sys.argv, '--suggest-source') != 'csv':
     configure_threads(1)
+else:
+    try:
+        _cpus = cpu_request(_early_option(sys.argv, '--cpus') or 'auto')
+    except Exception:
+        _cpus = 'auto'                      # argparse reports the invalid value later
+    if _cpus != 'auto':
+        configure_threads(_cpus)
 import numpy as np
 import abaqus_pipeline_contract as pipeline_contract
 
 DEFAULT_CASES = ('L_low', 'L_high', 'D', 'LD_pp', 'LD_pm', 'G1000', 'G3000')
+
+
+class Step4ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        # CAE can route argparse's stderr only to abaqus.rpy, leaving the console with
+        # a misleading "Exit code: 0". Keep the actual error visible before exiting.
+        print('STEP4 INPUT ERROR: '+message)
+        if 'mode' in message.lower():
+            print('Use positive mode numbers (GLOBAL_MODES may be comma-separated). '
+                  'Assign Windows variables with set "LOCAL_MODE=number", '
+                  'set "DIST_MODE=number", set "GLOBAL_MODES=number,number". '
+                  'Do not paste the next command into a set /p prompt.')
+        sys.stdout.flush()
+        try:
+            super().error(message)
+        except SystemExit as error:
+            # CAE may hide both console streams and show only the final exception.
+            # Carry the actual diagnostic through without changing argparse's exit code.
+            error.step4_argument_error = message
+            raise
 
 
 def parse_arguments(argv=None):
@@ -120,17 +173,22 @@ def parse_arguments(argv=None):
                 clean.append(argv[i])
                 i += 1
         argv = clean
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = Step4ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--run-dir', required=True)
     p.add_argument('--suggest', action='store_true', help='Screen actual ODB shapes; never select a mode automatically')
     p.add_argument('--suggest-source', choices=('odb','csv'), default='odb')
-    p.add_argument('--suggest-cpus', default='auto', help='Use all available logical CPUs by default')
+    p.add_argument('--cpus', type=cpu_request, default='auto',
+                   help="CPU threads of this stage: 'auto' (all) or a positive integer. Step 4 runs no "
+                        "solver; it sets the NumPy threads and the default --suggest-cpus")
+    p.add_argument('--suggest-cpus', default=None, help='Default: --cpus (all available logical CPUs)')
     p.add_argument('--suggest-gpus', default='auto', help='Benchmark compatible GPUs against parallel CPU')
     p.add_argument('--suggest-refresh', action='store_true', help='Ignore cached geometric screening')
     p.add_argument('--source-cae', help='Optional explicit reference CAE path; must equal the artifact resolved from --run-dir')
     p.add_argument('--odb', help='Optional explicit reference ODB path; must equal the artifact resolved from --run-dir')
     p.add_argument('--model', help='Optional explicit model name; must equal pipeline_status build.job_name')
     p.add_argument('--step', default='Buckle')
+    p.add_argument('--load-case', choices=pipeline_contract.LOAD_CASES, default=None,
+                   help='Optional assertion of the source load case; loading is inherited, never converted')
     p.add_argument('--instances', nargs=4, help='Optional explicit instances; must be exactly P1 P2 P3 P4')
     p.add_argument('--local-mode', type=int)
     p.add_argument('--dist-mode', type=int)
@@ -140,7 +198,7 @@ def parse_arguments(argv=None):
                    help="'analytical' (half-sine bow, default) or a folder/.odb whose --global-mode is used")
     p.add_argument('--global-mode',
                    help='Eigenmode of --global-source (required unless analytical): one mode, e.g. 1, '
-                        'or a degenerate pair, e.g. 1,2, aligned with --global-angle-deg')
+                        'or a complete degenerate group, e.g. 1,2, aligned with --global-angle-deg')
     p.add_argument('--local-low-t', type=float, default=.34)
     p.add_argument('--local-high-t', type=float)
     p.add_argument('--dist-mm', type=float)
@@ -158,19 +216,31 @@ def parse_arguments(argv=None):
                    help='User-defined case u0=aL*phiL+aD*phiD+aG*phiG; amplitudes in mm, t multiples '
                         '(0.34t) or length fractions (L/1000); repeatable')
     p.add_argument('--output-cae')
+    p.add_argument('--skip-mode-quality-checks', action='store_true',
+                   help='Use explicitly selected reference vectors without GDLC classification/purity checks; '
+                        'file, mesh, load-case and nonzero-field requirements still apply')
     args = p.parse_args(argv)
+    for name in ('run_dir', 'source_cae', 'odb', 'local_source', 'dist_source', 'global_source', 'output_cae'):
+        value = getattr(args, name)
+        unresolved = re.search(r'%([A-Za-z_][A-Za-z0-9_]*)%', value or '')
+        if unresolved:
+            p.error('--%s contains unexpanded Windows variable %s. Define it in the same CMD window '
+                    'with set "%s=full-path", or enter a full literal path.' %
+                    (name.replace('_', '-'), unresolved.group(0), unresolved.group(1)))
     args.global_modes = None
     if args.global_mode is not None:
         try:
             args.global_modes = tuple(int(v) for v in str(args.global_mode).replace(' ', '').split(','))
         except ValueError:
-            p.error('--global-mode must be a mode number or a pair such as 1,2')
-        if not 1 <= len(args.global_modes) <= 2 or len(set(args.global_modes)) != len(args.global_modes):
-            p.error('--global-mode must be one mode or two distinct modes (a degenerate pair)')
+            p.error('--global-mode must contain comma-separated mode numbers; received %r' % args.global_mode)
+        if not args.global_modes or len(set(args.global_modes)) != len(args.global_modes):
+            p.error('--global-mode must contain distinct modes of one complete degenerate group')
     try:
         args.combos = parse_combos(args.combo)
     except ValueError as error:
         p.error(str(error))
+    if args.suggest_cpus is None:
+        args.suggest_cpus = str(args.cpus)
     for name, minimum in (('suggest_cpus',1),('suggest_gpus',0)):
         value=getattr(args,name)
         if value != 'auto':
@@ -201,6 +271,10 @@ def parse_arguments(argv=None):
                 p.error('Invalid/duplicate --cases. Available: '+','.join(CASE_COMPONENTS)+' (or all/none)')
         if not selected and not args.combos:
             p.error('No case selected: give --cases and/or at least one --combo')
+        clash = sorted(name for name in args.combos if name.upper() in {s.upper() for s in selected})
+        if clash:                    # Windows file names (INP/ODB) are case-insensitive
+            p.error('--combo name(s) %s repeat a selected --cases case; rename the combo or drop that case'
+                    % ','.join(clash))
         args.selected_cases = selected+list(args.combos)
         need = set(c for name in selected for c in CASE_COMPONENTS[name])
         for specs in args.combos.values():
@@ -228,10 +302,6 @@ def parse_arguments(argv=None):
             p.error('--global-mode must contain positive mode numbers')
         if args.global_mode is not None and args.global_source == 'analytical':
             p.error('--global-mode needs --global-source <folder or .odb>')
-        if (args.global_source != 'analytical' and args.global_modes is not None
-                and len(args.global_modes) == 1 and args.global_angle_deg is not None):
-            p.error('--global-angle-deg cannot rotate a single eigenmode; give a degenerate pair, '
-                    'e.g. --global-mode 1,2, to choose the bow direction')
         mode_sets = [(c, getattr(args, c+'_source') or args.run_dir,
                       set(args.global_modes or ()) if c == 'global' else {getattr(args, c+'_mode')})
                      for c in ('local', 'dist', 'global') if c in need
@@ -319,8 +389,12 @@ def amplitude_mm(spec, thickness, length):
 
 
 def parse_combos(texts):
-    """--combo NAME=aL,aD,aG entries -> ordered {NAME: (specL, specD, specG)}."""
-    combos, folded = {}, {name.upper() for name in CASE_COMPONENTS}
+    """--combo NAME=aL,aD,aG entries -> ordered {NAME: (specL, specD, specG)}.
+    Any mix of the three families: a 0 amplitude leaves that family out (L, D, G, LD, LG,
+    DG or LDG). Names must differ case-insensitively among the combos; a clash with a
+    built-in case name matters only when that built-in case is selected too (checked by
+    parse_arguments), so e.g. --cases none --combo LD_mp=... is allowed."""
+    combos, folded = {}, set()
     for text in texts or ():
         if '=' not in text:
             raise ValueError('--combo must be NAME=aL,aD,aG, got %r' % text)
@@ -329,7 +403,7 @@ def parse_combos(texts):
         if not COMBO_NAME.match(name):
             raise ValueError('--combo name %r: 1-20 letters/digits/underscores, starting with a letter' % name)
         if name.upper() in folded:   # Windows file names (INP/ODB) are case-insensitive
-            raise ValueError('--combo name %r repeats a case name (names are compared case-insensitively)' % name)
+            raise ValueError('--combo name %r is given twice (names are compared case-insensitively)' % name)
         parts = values.split(',')
         if len(parts) != 3:
             raise ValueError('--combo %s needs exactly three amplitudes aL,aD,aG' % name)
@@ -391,10 +465,12 @@ def global_bow(coordinates, axis, angle_degrees):
     return result
 
 
-def global_eigen_shape(fields, axis, angle_degrees=None):
+def global_eigen_shape(fields, axis, angle_degrees=None, check_direction=True):
     """Unit-peak global imperfection from one eigenmode, or from a degenerate pair.
 
-    One mode: transverse U normalized to unit peak (same sign rule as normalize_mode).
+    One mode: transverse U normalized to unit peak (same sign rule as normalize_mode);
+    with angle_degrees the sign is chosen instead so that the bow (mean transverse
+    displacement) points towards that direction - a single mode cannot be rotated.
     Two modes (equal eigenvalues): any combination is again an eigenmode; the one whose
     mean transverse displacement (the bow of the member) points along angle_degrees is
     taken, then normalized to unit peak, so the bow direction no longer depends on the
@@ -411,16 +487,37 @@ def global_eigen_shape(fields, axis, angle_degrees=None):
         shapes.append(u)
     if len(shapes) == 1:
         u, coefficients = shapes[0], [1.]
-    elif len(shapes) == 2:
+    elif len(shapes) >= 2:
         angle = math.radians(0. if angle_degrees is None else angle_degrees)
         target = np.array([math.cos(angle), math.sin(angle)])
-        means = np.column_stack([s[:, transverse].mean(axis=0) for s in shapes])
-        scale = float(np.prod(np.linalg.norm(means, axis=0)))
-        if scale <= np.finfo(float).tiny or abs(np.linalg.det(means)) < 1e-3*scale:
-            raise ValueError('The two global modes do not bow in two independent directions '
-                             '(not a flexural degenerate pair); use a single --global-mode')
-        coefficients = [float(c) for c in np.linalg.solve(means, target)]
-        u = coefficients[0]*shapes[0]+coefficients[1]*shapes[1]
+        shape_norms = np.array([np.linalg.norm(s) for s in shapes])
+        if np.any(shape_norms <= np.finfo(float).tiny):
+            raise ValueError('Global eigenspace contains a zero transverse vector')
+        basis = np.column_stack([s.ravel()/norm for s, norm in zip(shapes, shape_norms)])
+        q, singular, right = np.linalg.svd(basis, full_matrices=False)
+        if singular[-1] <= 1e-10*singular[0]:
+            raise ValueError('Global eigenvectors are linearly dependent')
+        means = np.column_stack([q[:, j].reshape(shapes[0].shape)[:, transverse].mean(axis=0)
+                                 for j in range(q.shape[1])])
+        bow_singular = np.linalg.svd(means, compute_uv=False)
+        if check_direction and (bow_singular[-1] <= 1e-6*bow_singular[0] or bow_singular[0] <= 1e-12):
+            raise ValueError('Global eigenspace does not span two independent bow directions')
+        # Minimum physical displacement norm, not minimum coefficients in an arbitrary basis.
+        weights = np.linalg.lstsq(means, target, rcond=1e-10)[0]
+        if not check_direction and (bow_singular[0] <= 1e-12 or np.linalg.norm(means @ weights) <= 1e-12):
+            # No usable mean bow in the requested direction. The user explicitly
+            # selected these vectors without quality screening: retain their equal
+            # unit-L2 superposition, rather than invent a pure/global aligned shape.
+            coefficients = (1./shape_norms).tolist()
+            u = python_builtins.sum((s/norm for s, norm in zip(shapes, shape_norms)), np.zeros_like(shapes[0]))
+            print('WARNING: selected reference vectors cannot supply the requested mean-bow direction; '
+                  'using their equal unit-L2 superposition without a direction/purity claim')
+        else:
+            coefficients = ((right.T @ (weights/singular))/shape_norms).tolist()
+            u = (q @ weights).reshape(shapes[0].shape)
+            if not check_direction and np.linalg.norm(means @ weights-target) > 1e-6:
+                print('WARNING: requested mean-bow direction is outside the selected reference space; '
+                      'using its projection onto that space without a direction/purity claim')
     else:
         raise ValueError('Global shape needs one mode or one degenerate pair')
     norms = np.linalg.norm(u, axis=1)
@@ -429,17 +526,44 @@ def global_eigen_shape(fields, axis, angle_degrees=None):
         raise ValueError('Selected global mode has no transverse displacement')
     sign = 1.
     if len(shapes) == 1:
-        flat = u.ravel()
-        sign = 1. if flat[int(np.argmax(np.abs(flat)))] >= 0 else -1.
+        bow = u[:, transverse].mean(axis=0)
+        if angle_degrees is not None and np.linalg.norm(bow) > 1e-6*peak:
+            angle = math.radians(angle_degrees)
+            target = np.array([math.cos(angle), math.sin(angle)])
+            alignment = float(np.dot(bow, target))/float(np.linalg.norm(bow))
+            if check_direction and abs(alignment) < 1.-1e-6:
+                raise ValueError('Requested global bow direction is outside this single-mode space; '
+                                 'use its complete degenerate group or omit --global-angle-deg')
+            sign = 1. if alignment >= 0 else -1.
+        elif angle_degrees is not None and check_direction:
+            raise ValueError('Selected global mode has no mean bow; a bow angle cannot orient torsion')
+        else:
+            flat = u.ravel()
+            sign = 1. if flat[int(np.argmax(np.abs(flat)))] >= 0 else -1.
     u = u*sign/peak
     mean = u[:, transverse].mean(axis=0)
     mean_abs = float(np.mean(np.linalg.norm(u, axis=1)))
     return u, dict(metric='transverse', modes_combined=len(shapes), raw_denominator=peak,
                    eigenvector_sign_multiplier=sign, combination_coefficients=coefficients,
-                   requested_bow_angle_deg=angle_degrees if len(shapes) == 2 else None,
+                   requested_bow_angle_deg=angle_degrees,
                    bow_angle_deg=float(math.degrees(math.atan2(mean[1], mean[0]))),
                    translation_ratio=float(np.linalg.norm(mean)/mean_abs) if mean_abs else 0.,
                    gauge_node_count=len(u))
+
+
+def member_global_eigen_shape(fields, axis, angle, member_rows, load_case=None, check_direction=True):
+    """Normalize/orient on column walls; carry identical coefficients to plate nodes."""
+    member_fields=[f[member_rows] for f in fields]
+    if check_direction and (load_case or {}).get('type')=='bending':
+        unused,meta=bending_global_eigen_shape(member_fields,axis,load_case,angle)
+    else:
+        unused,meta=global_eigen_shape(member_fields,axis,angle,check_direction=check_direction)
+    combined = np.zeros_like(fields[0], dtype=float)
+    for weight, field in zip(meta['combination_coefficients'], fields):
+        combined += weight*field
+    combined[:, axis] = 0.
+    combined *= meta['eigenvector_sign_multiplier']/meta['raw_denominator']
+    return combined, meta
 
 
 def default_global_angle(load_case):
@@ -464,19 +588,21 @@ def frame_eigenvalue(frame):
 
 
 def degenerate_partners(eigenvalues, mode, tolerance=1e-3):
-    """Other modes whose eigenvalue equals that of `mode` within the relative tolerance."""
-    value = eigenvalues.get(mode)
-    if value is None:
-        return []
-    return sorted(m for m, v in eigenvalues.items() if m != mode and v is not None
-                  and abs(v-value) <= tolerance*max(abs(value), np.finfo(float).tiny))
+    """Span-based groups, consistent with GDLC; no transitive chaining of close pairs."""
+    ordered = sorted((v, m) for m, v in eigenvalues.items() if v is not None and math.isfinite(v))
+    groups = []
+    for value, member in ordered:
+        if not groups or abs(value-groups[-1][0][0]) > tolerance*max(abs(groups[-1][0][0]), 1e-300):
+            groups.append([])
+        groups[-1].append((value, member))
+    return next((sorted(m for _, m in g if m != mode) for g in groups if any(m == mode for _, m in g)), [])
 
 
 GDLC_EXPECTED = {'local': 'L', 'dist': 'D', 'global': 'G'}
 GDLC_PURITY_PCT = 80.
 
 
-def gdlc_mode_shares(folder, mode, eigenvalue):
+def gdlc_mode_shares(folder, mode, eigenvalue, odb_sha256=None):
     """G/D/L/C/O shares of `mode` from <folder>/mode_decomposition_GDLC/mode_participation.csv.
 
     Used only when that classification exists and its eigenvalue matches the ODB frame
@@ -498,12 +624,37 @@ def gdlc_mode_shares(folder, mode, eigenvalue):
             result['status'] = 'stale_eigenvalue_mismatch'
             result['odb_eigenvalue'] = eigenvalue
             return result
-        prefix = 'rel_' if 'rel_G_pct' in row else ''
-        result['shares_pct'] = {k: float(row[prefix+k+'_pct']) for k in 'GDLCO' if row.get(prefix+k+'_pct') not in (None, '')}
+        result['group_shares_pct'] = {k: float(row['rel_'+k+'_pct']) for k in 'GDLCO'
+                                      if row.get('rel_'+k+'_pct') not in (None, '')}
+        result['shares_pct'] = {k: float(row[k+'_pct']) for k in 'GDLCO' if row.get(k+'_pct') not in (None, '')}
+        for key in ('plate_deformation_pct','cluster_plate_deformation_max_pct'):
+            if row.get(key) not in (None, ''):
+                result[key] = float(row[key])
+        # Legacy files with only reliable shares cannot establish individual-mode purity.
+        result['individual_shares_available'] = bool(result['shares_pct'])
+        if not result['shares_pct'] and row.get('reliable_source', 'mode') == 'mode':
+            result['shares_pct'] = dict(result['group_shares_pct'])
     except (KeyError, ValueError) as error:
         return dict(status='unreadable', csv=path, error=str(error))
-    result['dominant'] = row.get('reliable_dominant') or row.get('dominant')
-    result['label'] = row.get('reliable_label') or row.get('label')
+    result['dominant'] = row.get('dominant') or (max(result['shares_pct'], key=result['shares_pct'].get) if result['shares_pct'] else None)
+    result['label'] = row.get('label')
+    result['reliable_source'] = row.get('reliable_source')
+    result['cluster'] = row.get('cluster')
+    report_path = os.path.join(os.path.dirname(path), 'basis_report.json')
+    source_sha = None
+    if os.path.isfile(report_path):
+        try:
+            with open(report_path, encoding='utf-8') as stream:
+                report = json.load(stream)
+            source_sha = report.get('source_odb_sha256')
+            # REF_G / REF_L: did the classifier recover the imposed mechanism in every mode?
+            result['reference_check'] = report.get('reference_check')
+            result['plate_metrics_required'] = bool(report.get('steel_plate_scope'))
+        except (OSError, ValueError):
+            pass
+    result['odb_source_verified'] = bool(source_sha and odb_sha256 and source_sha == odb_sha256)
+    if odb_sha256 is not None and not result['odb_source_verified']:
+        result['status'] = 'stale_odb_mismatch' if source_sha else 'unverified_odb_source'
     result['confidence'] = row.get('confidence')
     return result
 
@@ -532,19 +683,21 @@ def interpiece_candidates(keys, xyz, cutoff):
 
 
 def clearance_screen(xyz, offsets, pairs, thickness):
-    """Midsurface clearance of inter-piece node pairs before/after the imperfection.
+    """Indicative inter-piece node distances before/after the imperfection.
 
-    Two shell midsurfaces closer than one thickness overlap; general contact would remove
-    that overclosure by moving nodes strain-free, i.e. it would change the imperfection.
-    Node-to-node distances are a screen (exact for matching meshes, else indicative)."""
+    Distances below one thickness flag possible overclosure. Contact adjustment
+    could change the imposed imperfection by moving nodes strain-free.
+    Node-to-node distances are always indicative: tangential slip and face interiors
+    can hide penetration, even with matching initial meshes. Zero flags is not clearance proof."""
     i, j = pairs
     if not len(i):
-        return dict(candidate_pairs=0, perfect_min_mm=None, imperfect_min_mm=None, new_overclosure_pairs=0)
+        return dict(candidate_pairs=0, perfect_min_mm=None, imperfect_min_mm=None, new_overclosure_pairs=0,
+                    indicative_only=True)
     perfect = np.linalg.norm(xyz[j]-xyz[i], axis=1)
     moved = xyz+offsets
     imperfect = np.linalg.norm(moved[j]-moved[i], axis=1)
     bad = (imperfect < thickness*(1.-1e-3)) & (imperfect < perfect-1e-9)
-    result = dict(candidate_pairs=int(len(i)), perfect_min_mm=float(perfect.min()),
+    result = dict(indicative_only=True, candidate_pairs=int(len(i)), perfect_min_mm=float(perfect.min()),
                   imperfect_min_mm=float(imperfect.min()), new_overclosure_pairs=int(bad.sum()))
     if bad.any():
         k = int(np.argmin(np.where(bad, imperfect, np.inf)))
@@ -572,7 +725,7 @@ def gauge_indices(text, keys):
     return sorted(set(result))
 
 
-def read_modes_and_mesh(model, odb, names, args, modes=None):
+def read_modes_and_mesh(model, odb, names, args, modes=None, require_positive=False):
     """Mesh (from the CAE, verified node-by-node against this ODB), the transverse U of
     the requested modes and the eigenvalue of every mode frame in the step.
     modes defaults to (local_mode, dist_mode)."""
@@ -618,23 +771,16 @@ def read_modes_and_mesh(model, odb, names, args, modes=None):
             normals.append(sums[label]/norm if norm else np.zeros(3))
     xyz, normals = np.asarray(xyz), np.asarray(normals)
     lookup = {key: i for i, key in enumerate(keys)}
-    frames = {}
-    if args.step not in odb.steps:
-        raise ValueError('Buckling step not found: '+args.step)
-    for frame in odb.steps[args.step].frames:
-        mode = int(getattr(frame, 'mode', 0) or 0)
-        if mode <= 0:
-            match = re.search(r'\bMode\s*[:=]?\s*(\d+)', str(frame.description), re.I)
-            mode = int(match.group(1)) if match else 0
-        if mode > 0:
-            if mode in frames:
-                raise ValueError('Duplicate mode IDs in selected step')
-            frames[mode] = frame
+    frames = mode_frames(odb, args.step)
     eigenvalues = {mode: frame_eigenvalue(frame) for mode, frame in frames.items()}
     fields, descriptions = {}, {}
     for mode in modes:
         if mode not in frames:
             raise ValueError('Requested mode %d absent from ODB %s' % (mode, getattr(odb, 'path', '')))
+        value = eigenvalues[mode]
+        if require_positive and (value is None or not math.isfinite(value) or value <= 0.):
+            raise ValueError('Bending imperfection requires a finite positive eigenvalue; '
+                             'mode %d is not a buckling mode for the applied moment direction' % mode)
         frame = frames[mode]
         if 'U' not in frame.fieldOutputs:
             raise ValueError('Mode has no nodal U field: %d' % mode)
@@ -665,6 +811,40 @@ def read_modes_and_mesh(model, odb, names, args, modes=None):
     return keys, xyz, normals, fields, descriptions, element_topology, eigenvalues
 
 
+def mode_frames(odb, step):
+    """{mode number: frame} of the buckling step (frame 0 = base state is skipped)."""
+    if step not in odb.steps:
+        raise ValueError('Buckling step not found: '+step)
+    frames = {}
+    for frame in odb.steps[step].frames:
+        mode = int(getattr(frame, 'mode', 0) or 0)
+        if mode <= 0:
+            match = re.search(r'\bMode\s*[:=]?\s*(\d+)', str(frame.description), re.I)
+            mode = int(match.group(1)) if match else 0
+        if mode > 0:
+            if mode in frames:
+                raise ValueError('Duplicate mode IDs in selected step')
+            frames[mode] = frame
+    return frames
+
+
+def global_modes_for_angle(modes, eigenvalues, angle_requested):
+    """Effective global modes. A single mode with an explicitly requested bow angle cannot be
+    rotated; when it has exactly one equal-eigenvalue partner (a degenerate flexural pair, whose
+    basis Abaqus returns arbitrarily) the pair is used so that the requested direction is met.
+    Returns (modes, note)."""
+    modes = tuple(modes)
+    partners = degenerate_partners(eigenvalues, modes[0])
+    complete = (modes[0],) + tuple(partners)
+    if len(modes) > 1:
+        if set(modes) != set(complete):
+            raise ValueError('--global-mode must select one complete eigenvalue group (relative span 0.001): %s'
+                             % ','.join(map(str, complete)))
+    elif angle_requested and partners:
+        return complete, 'complete equal-eigenvalue group %s used for the requested bow direction' % ','.join(map(str, complete))
+    return modes, None
+
+
 def _analysis_completed(odb_path):
     """True when the job that wrote this ODB finished successfully (.sta/.log)."""
     stem = os.path.splitext(odb_path)[0]
@@ -680,13 +860,20 @@ def _analysis_completed(odb_path):
     return False
 
 
-def resolve_mode_source(spec, reference_odb, reference_run_dir):
+def resolve_mode_source(spec, reference_odb, reference_run_dir, reference=None, component=None):
     """Resolve a --*-source argument to one completed buckling ODB.
     None (or the --run-dir folder) -> the reference ODB. A folder with
     pipeline_status.json -> the ODB recorded there. Any other folder -> its single
     completed <job>.odb with a matching <job>.inp (e.g. GDLC REF_G / REF_L models).
     A path to a .odb is used directly."""
+    bending = reference is not None and pipeline_contract.reference_load_case(reference['build'])['type']=='bending'
     if not spec or os.path.normcase(os.path.abspath(spec)) == os.path.normcase(os.path.abspath(reference_run_dir)):
+        if reference_odb is None:
+            raise ValueError('The --run-dir reference run is only BUILT (no verified solved .odb), so it cannot '
+                             'supply mode shapes: give every needed component its own solved source '
+                             '(--local-source <run>_REF_L, --global-source <run>_REF_G; a distortional mode has '
+                             'no GDLC reference model, so --dist-source must name another solved model), or solve '
+                             'the reference run and record it with abaqus_complete_model_m20.py --resume-post')
         return reference_odb, dict(kind='reference_run', folder=reference_run_dir)
     path = os.path.abspath(spec)
     info = dict(kind='odb', folder=os.path.dirname(path))
@@ -696,6 +883,8 @@ def resolve_mode_source(spec, reference_odb, reference_run_dir):
             other = pipeline_contract.load_reference_run(path, require_completed=True)
             path = pipeline_contract.resolve_reference_artifact(other, None, 'odb')
             info['kind'] = 'pipeline_run'
+            if bending:
+                info['source_build'] = dict(other['build'], source_inputs=other['source_inputs'])
         else:
             candidates = [os.path.join(path, f) for f in sorted(os.listdir(path)) if f.lower().endswith('.odb')
                           and os.path.isfile(os.path.join(path, f[:-4]+'.inp'))
@@ -705,22 +894,40 @@ def resolve_mode_source(spec, reference_odb, reference_run_dir):
                                  '<job>.inp; found %d in %s' % (len(candidates), path))
             path = candidates[0]
             info['kind'] = 'buckling_model'
-            marker = os.path.join(info['folder'], 'gdlc_reference.json')
-            if os.path.isfile(marker):
-                with open(marker, encoding='utf-8') as stream:
-                    info['gdlc_reference'] = json.load(stream)
-                info['kind'] = 'gdlc_reference_'+str(info['gdlc_reference'].get('kind', '?'))
-                src = str(info['gdlc_reference'].get('source_run', ''))
-                if src and src != os.path.basename(os.path.abspath(reference_run_dir)):
-                    print('WARNING: %s was built from run %s, not from %s; the node-by-node mesh '
-                          'check still decides compatibility' %
-                          (info['folder'], src, os.path.basename(reference_run_dir)))
     if not os.path.isfile(path) or not path.lower().endswith('.odb'):
         raise ValueError('Mode source is not an ODB file or a folder with one: '+str(spec))
     if os.path.exists(os.path.splitext(path)[0]+'.lck'):
         raise ValueError('Mode source ODB is locked (analysis running?): '+path)
     if info['kind'] != 'pipeline_run' and not _analysis_completed(path):
         raise ValueError('Mode source analysis did not complete successfully (.sta/.log): '+path)
+    # Also inspect metadata for a direct .odb argument; it must not bypass the folder checks.
+    marker_path = os.path.join(info['folder'], 'gdlc_reference.json')
+    if os.path.isfile(marker_path):
+        with open(marker_path, encoding='utf-8') as stream:
+            marker = json.load(stream)
+        info.update(gdlc_reference=marker, kind='gdlc_reference_'+str(marker.get('kind', '?')))
+        if bending:
+            if marker.get('job') != os.path.splitext(os.path.basename(path))[0]:
+                raise ValueError('Bending reference metadata belongs to another ODB: '+path)
+            if marker.get('input_sha256'):
+                inp = os.path.splitext(path)[0]+'.inp'
+                if not os.path.isfile(inp) or marker['input_sha256'] != pipeline_contract.file_sha256(inp):
+                    raise ValueError('Bending reference INP changed after generation: '+inp)
+        src = str(marker.get('source_run', ''))
+        if src and src != os.path.basename(os.path.abspath(reference_run_dir)) and not bending:
+            print('WARNING: %s was built from run %s, not from %s; the node-by-node mesh '
+                  'check still decides compatibility' % (info['folder'], src, os.path.basename(reference_run_dir)))
+    if bending:
+        info['source_job'] = os.path.splitext(os.path.basename(path))[0]
+        inp = os.path.splitext(path)[0]+'.inp'
+        if not os.path.isfile(inp):
+            raise ValueError('Bending mode source INP is missing: '+inp)
+        build_path = os.path.splitext(path)[0]+'_build.json'
+        if 'source_build' not in info and os.path.isfile(build_path):
+            with open(build_path, encoding='utf-8') as stream:
+                info['source_build'] = json.load(stream)
+        validate_bending_mode_source(info, reference, component)
+        info.pop('source_build', None)  # Validate once; avoid embedding the entire mesh record per component.
     return path, info
 
 
@@ -750,261 +957,450 @@ def apply_offsets(model, names, keys, reference_coordinates, offsets, topology):
 
 def build(args):
     import caeModules
-    from abaqus import openMdb, session
+    from abaqus import session
     from abaqusConstants import ON, BEAM_MPC
     from odbAccess import openOdb
 
-    reference = pipeline_contract.load_reference_run(args.run_dir, require_completed=True)
-    load_case = pipeline_contract.load_case_snapshot(reference['build'])
+    # A BUILT (unsolved) reference run is accepted: the perfect model is its CAE, and every mode
+    # shape then comes from an explicitly given solved source of the same mesh (checked below).
+    reference = pipeline_contract.load_reference_run(args.run_dir, require_completed=True, allow_built=True)
+    load_case = pipeline_contract.load_case_snapshot(reference['build'],getattr(args,'load_case',None))
     source_cae = pipeline_contract.resolve_reference_artifact(reference, args.source_cae, 'cae')
-    odb_path = pipeline_contract.resolve_reference_artifact(reference, args.odb, 'odb')
+    if reference['solved']:
+        odb_path = pipeline_contract.resolve_reference_artifact(reference, args.odb, 'odb')
+    elif args.odb:
+        raise ValueError('--odb given, but the reference run is only BUILT (no solved .odb)')
+    else:
+        odb_path = None
+        print('NOTE: reference run %s is BUILT, not solved: its CAE is the perfect model; mode shapes come '
+              'only from the explicit component sources' % reference['job_name']); sys.stdout.flush()
     if os.path.exists(args.output_cae):
         raise ValueError('Output CAE already exists; select a new filename: '+args.output_cae)
 
-    database = openMdb(pathName=source_cae)
-    model_name = args.model or reference['job_name']
-    if model_name != reference['job_name']:
-        raise ValueError('STEP4 must use the reference pipeline model %s, not %s' %
-                         (reference['job_name'], model_name))
-    if model_name not in database.models:
-        raise ValueError('Reference model is missing from source CAE: '+model_name)
-    source = database.models[model_name]
-    names = list(args.instances or reference['instances'])
-    if tuple(names) != tuple(reference['instances']):
-        raise ValueError('STEP4 instances must be exactly '+','.join(reference['instances']))
-    if shell_instances(source) != sorted(reference['instances']):
-        raise ValueError('Source CAE shell instances differ from the reference pipeline')
+    database = pipeline_contract.open_working_mdb(source_cae)
+    try:
+        model_name = args.model or reference['job_name']
+        if model_name != reference['job_name']:
+            raise ValueError('STEP4 must use the reference pipeline model %s, not %s' %
+                             (reference['job_name'], model_name))
+        if model_name not in database.models:
+            raise ValueError('Reference model is missing from source CAE: '+model_name)
+        source = database.models[model_name]
+        names = list(args.instances or reference['instances'])
+        member_names = list(names)
+        plate_names = pipeline_contract.plate_instance_names(reference['source_inputs'])
+        if tuple(names) != tuple(reference['instances']):
+            raise ValueError('STEP4 instances must be exactly '+','.join(reference['instances']))
+        if shell_instances(source) != sorted(member_names+plate_names):
+            raise ValueError('Source CAE shell instances differ from the reference pipeline')
+        if set(source.rootAssembly.instances.keys()) != set(member_names+plate_names):
+            raise ValueError('Unexpected additional non-shell instances in the source CAE')
 
-    # Enforce the exact upstream production contract before perturbing any node.
-    if len(source.boundaryConditions) != int(reference['build']['boundary_conditions']):
-        raise ValueError('Source CAE boundary conditions differ from pipeline_status.json')
-    if len(source.loads) != int(reference['build']['loads']):
-        raise ValueError('Source CAE loads differ from pipeline_status.json')
-    if len(source.constraints) != int(reference['build']['rigid_links']):
-        raise ValueError('Source CAE bolt constraint count differs from pipeline_status.json')
-    bolt_names = sorted(name for name in source.constraints.keys() if name.startswith('BOLT_'))
-    if len(bolt_names) != int(reference['source_inputs']['expected_links']):
-        raise ValueError('Source CAE BOLT_* count differs from the exported seam/bolt definition')
-    if any(getattr(source.constraints[name], 'mpcType', None) != BEAM_MPC for name in bolt_names):
-        raise ValueError('Source CAE no longer uses the reference BEAM_MPC bolt model')
-    if 'GeneralContact' not in source.interactions or 'Hard_Frictionless' not in source.interactionProperties:
-        raise ValueError('Source CAE no longer contains the reference general hard/frictionless contact')
-    thicknesses = set()
-    for name in names:
-        instance = source.rootAssembly.instances[name]
-        assignments = source.parts[instance.partName].sectionAssignments
-        if not assignments:
-            raise ValueError('Missing shell section assignment: '+name)
-        for assignment in assignments:
-            thickness = getattr(source.sections[assignment.sectionName], 'thickness', None)
-            if thickness is None or thickness <= 0:
-                raise ValueError('A constant positive shell thickness is required')
-            thicknesses.add(float(thickness))
-    if len(thicknesses) != 1:
-        raise ValueError('This step-4 builder requires uniform shell thickness')
-    thickness = next(iter(thicknesses))
-    # ---- component sources: each component may come from its own ODB (same mesh) ----
-    need = set(args.needed_components)
-    components = []
-    for comp in COMPONENTS:
-        if comp not in need or (comp == 'global' and args.global_source == 'analytical'):
-            continue
-        spec = getattr(args, comp+'_source')
-        path, info = resolve_mode_source(spec, odb_path, reference['run_dir'])
-        modes = tuple(args.global_modes) if comp == 'global' else (getattr(args, comp+'_mode'),)
-        components.append((comp, path, modes, info))
-    by_odb = {}
-    for comp, path, modes, info in components:
-        by_odb.setdefault(os.path.normcase(path), [path, []])[1].append((comp, modes, info))
-    keys = xyz = normals = topology = None
-    raw, descriptions, sources = {}, {}, {}
-    for norm_path, (path, wanted) in by_odb.items():
-        modes = sorted(set(m for _, ms, _ in wanted for m in ms))
-        print('Reading mode(s) %s from %s' % (','.join(str(m) for m in modes), path)); sys.stdout.flush()
-        odb = openOdb(path=path, readOnly=True)
-        try:
-            k, x, n, fields, desc, topo, eigenvalues = read_modes_and_mesh(source, odb, names, args, modes=modes)
-        finally:
-            odb.close()
-        if keys is None:
-            keys, xyz, normals, topology = k, x, n, topo
-        elif k != keys or not np.array_equal(x, xyz):
-            raise ValueError('Mode source mesh differs from the reference mesh: '+path)
-        sha = pipeline_contract.file_sha256(path)
-        for comp, ms, info in wanted:
-            raw[comp] = [fields[m] for m in ms]
-            frames = [desc[str(m)] for m in ms]
-            descriptions[comp] = frames[0] if len(ms) == 1 else frames
-            values = [eigenvalues.get(m) for m in ms]
-            partners = sorted(set(p for m in ms for p in degenerate_partners(eigenvalues, m)) - set(ms))
-            classification = [gdlc_mode_shares(info['folder'], m, eigenvalues.get(m)) for m in ms]
-            sources[comp] = dict(info, odb=path, odb_sha256=sha, odb_size=os.path.getsize(path),
-                                 odb_mtime=os.path.getmtime(path),
-                                 mode=int(ms[0]) if len(ms) == 1 else [int(m) for m in ms],
-                                 frame=descriptions[comp], eigenvalue=values[0] if len(ms) == 1 else values,
-                                 degenerate_partner_modes=partners,
-                                 gdlc=classification[0] if len(ms) == 1 else classification)
-            if len(ms) == 2 and (None in values or not math.isclose(values[0], values[1], rel_tol=1e-2)):
-                raise ValueError('--global-mode %d,%d is not a degenerate pair (eigenvalues %s); a combination '
-                                 'of distinct eigenmodes is not an eigenmode' % (ms[0], ms[1], values))
-            if partners:
-                print('WARNING: %s mode %s has (nearly) equal eigenvalue(s) in mode(s) %s: inside such a group '
-                      'Abaqus returns an arbitrary basis, so the shape/direction of this single mode is not '
-                      'reproducible.%s' % (comp, ','.join(str(m) for m in ms), ','.join(str(m) for m in partners),
-                      ' Give the pair, e.g. --global-mode %d,%d, with --global-angle-deg.' % tuple(sorted((ms[0], partners[0])))
-                      if comp == 'global' and len(ms) == 1 else ''))
-            for m, item in zip(ms, classification):
-                if item is None:
-                    continue
-                if item['status'] != 'ok':
-                    print('NOTE: GDLC classification for %s mode %d not used (%s): %s'
-                          % (comp, m, item['status'], item['csv']))
-                    continue
-                shares = item.get('shares_pct', {})
-                expected = GDLC_EXPECTED[comp]
-                text = ', '.join('%s %.1f%%' % (k, v) for k, v in shares.items())
-                print('  GDLC %s mode %d: %s (dominant %s, confidence %s)'
-                      % (comp, m, text, item.get('dominant'), item.get('confidence')))
-                if item.get('dominant') != expected or shares.get(expected, 0.) < GDLC_PURITY_PCT:
-                    print('WARNING: the %s component (mode %d) is not a clean %s mode (%s); the imperfection '
-                          'will carry this mixture of mechanisms.' % (comp, m, expected, text))
-    if keys is None:                                    # e.g. only analytical global cases
-        odb = openOdb(path=odb_path, readOnly=True)
-        try:
-            keys, xyz, normals, unused, unused2, topology, unused3 = read_modes_and_mesh(
-                source, odb, names, args, modes=())
-        finally:
-            odb.close()
-    axis = 'xyz'.index(args.axis)
-    length = float(np.ptp(xyz[:, axis]))
-    for name in names:
-        z = xyz[[i for i, key in enumerate(keys) if key[0] == name], axis]
-        if not np.allclose([z.min(), z.max()], [xyz[:, axis].min(), xyz[:, axis].max()], atol=1e-5, rtol=0):
-            raise ValueError('The four pieces must have common ends')
-    zero = np.zeros_like(xyz, dtype=float)
-    local, local_meta = zero, None
-    dist, dist_meta = zero, None
-    if 'local' in raw:
-        local, local_meta = normalize_mode(raw['local'][0], normals, axis,
-            gauge_indices(args.local_gauge, keys), args.local_metric)
-    if 'dist' in raw:
-        dist, dist_meta = normalize_mode(raw['dist'][0], normals, axis,
-            gauge_indices(args.dist_gauge, keys), 'transverse')
-    angle = default_global_angle(load_case) if args.global_angle_deg is None else args.global_angle_deg
-    if 'global' in raw:
-        # eigenmode global shape (one mode or an aligned degenerate pair), unit peak transverse displacement
-        global_shape, global_meta = global_eigen_shape(raw['global'], axis,
-            angle if len(raw['global']) == 2 else None)
-        global_text = ('Eigenmode(s) %s of %s, %s; unit peak transverse displacement; bow angle %.2f deg, '
-                       'translation ratio %.3f' % (','.join(str(m) for m in args.global_modes),
-                       sources['global']['odb'], 'degenerate pair aligned with --global-angle-deg'
-                       if len(raw['global']) == 2 else 'single mode', global_meta['bow_angle_deg'],
-                       global_meta['translation_ratio']))
-        print('  global shape: '+global_text)
-    else:
-        global_shape, global_meta = global_bow(xyz, axis, angle), None
-        global_text = 'Analytical half-sine bow; prescribed transverse direction, not inferred weak axis'
+        # Enforce the exact upstream production contract before perturbing any node.
+        if len(source.boundaryConditions) != int(reference['build']['boundary_conditions']):
+            raise ValueError('Source CAE boundary conditions differ from pipeline_status.json')
+        if len(source.loads) != int(reference['build']['loads']):
+            raise ValueError('Source CAE loads differ from pipeline_status.json')
+        if len(source.constraints) != int(reference['build']['rigid_links']):
+            raise ValueError('Source CAE bolt constraint count differs from pipeline_status.json')
+        bolt_names = sorted(name for name in source.constraints.keys() if name.startswith('BOLT_'))
+        if len(bolt_names) != int(reference['source_inputs']['expected_links']):
+            raise ValueError('Source CAE BOLT_* count differs from the exported seam/bolt definition')
+        if any(getattr(source.constraints[name], 'mpcType', None) != BEAM_MPC for name in bolt_names):
+            raise ValueError('Source CAE no longer uses the reference BEAM_MPC bolt model')
+        if 'GeneralContact' not in source.interactions or 'Hard_Frictionless' not in source.interactionProperties:
+            raise ValueError('Source CAE no longer contains the reference general hard/frictionless contact')
+        thicknesses = set()
+        for name in names:
+            instance = source.rootAssembly.instances[name]
+            assignments = source.parts[instance.partName].sectionAssignments
+            if not assignments:
+                raise ValueError('Missing shell section assignment: '+name)
+            for assignment in assignments:
+                thickness = getattr(source.sections[assignment.sectionName], 'thickness', None)
+                if thickness is None or thickness <= 0:
+                    raise ValueError('A constant positive shell thickness is required')
+                thicknesses.add(float(thickness))
+        if len(thicknesses) != 1:
+            raise ValueError('This step-4 builder requires uniform shell thickness')
+        thickness = next(iter(thicknesses))
+        names = member_names+plate_names
+        # ---- component sources: each component may come from its own ODB (same mesh) ----
+        need = set(args.needed_components)
+        components = []
+        for comp in COMPONENTS:
+            if comp not in need or (comp == 'global' and args.global_source == 'analytical'):
+                continue
+            spec = getattr(args, comp+'_source')
+            path, info = resolve_mode_source(spec, odb_path, reference['run_dir'],reference=reference,component=comp)
+            modes = tuple(args.global_modes) if comp == 'global' else (getattr(args, comp+'_mode'),)
+            if not args.skip_mode_quality_checks and comp == 'global' and (len(modes) > 1 or args.global_angle_deg is not None):
+                odb = openOdb(path=path, readOnly=True)
+                try:
+                    values = {m: frame_eigenvalue(f) for m, f in mode_frames(odb, args.step).items()}
+                finally:
+                    odb.close()
+                modes, note = global_modes_for_angle(modes, values, args.global_angle_deg is not None)
+                if note:
+                    print('NOTE: global '+note); sys.stdout.flush()
+                    info = dict(info, automatic_degenerate_pair=note)
+            components.append((comp, path, modes, info))
+        global_modes_used = next((list(ms) for c, _, ms, _ in components if c == 'global'), None)
+        for i in range(len(components)):
+            for j in range(i+1, len(components)):
+                common = set(components[i][2]) & set(components[j][2])
+                if os.path.normcase(components[i][1]) == os.path.normcase(components[j][1]) and common:
+                    raise ValueError('%s and %s use the same mode %d of the same ODB; choose distinct modes'
+                                     % (components[i][0], components[j][0], min(common)))
+        by_odb = {}
+        for comp, path, modes, info in components:
+            by_odb.setdefault(os.path.normcase(path), [path, []])[1].append((comp, modes, info))
+        keys = xyz = normals = topology = None
+        raw, descriptions, sources = {}, {}, {}
+        for norm_path, (path, wanted) in by_odb.items():
+            modes = sorted(set(m for _, ms, _ in wanted for m in ms))
+            print('Reading mode(s) %s from %s' % (','.join(str(m) for m in modes), path)); sys.stdout.flush()
+            odb = openOdb(path=path, readOnly=True)
+            try:
+                k, x, n, fields, desc, topo, eigenvalues = read_modes_and_mesh(source, odb, names, args, modes=modes,
+                    require_positive=load_case['type']=='bending' and not args.skip_mode_quality_checks)
+            finally:
+                odb.close()
+            if keys is None:
+                keys, xyz, normals, topology = k, x, n, topo
+            elif k != keys or not np.array_equal(x, xyz):
+                raise ValueError('Mode source mesh differs from the reference mesh: '+path)
+            sha = pipeline_contract.file_sha256(path)
+            for comp, ms, info in wanted:
+                raw[comp] = [fields[m] for m in ms]
+                frames = [desc[str(m)] for m in ms]
+                descriptions[comp] = frames[0] if len(ms) == 1 else frames
+                values = [eigenvalues.get(m) for m in ms]
+                partners = sorted(set(p for m in ms for p in degenerate_partners(eigenvalues, m)) - set(ms))
+                classification = ([None]*len(ms) if args.skip_mode_quality_checks else
+                                  [gdlc_mode_shares(info['folder'],m,eigenvalues.get(m),sha) for m in ms])
+                if not args.skip_mode_quality_checks:
+                    for m,item in zip(ms,classification):
+                        validate_bending_reference_mode(load_case,comp,m,item)
+                sources[comp] = dict(info, odb=path, odb_sha256=sha, odb_size=os.path.getsize(path),
+                                     odb_mtime=os.path.getmtime(path),
+                                     mode=int(ms[0]) if len(ms) == 1 else [int(m) for m in ms],
+                                     frame=descriptions[comp], eigenvalue=values[0] if len(ms) == 1 else values,
+                                     degenerate_partner_modes=partners,
+                                     mode_quality_assessed=not args.skip_mode_quality_checks and python_builtins.all(
+                                         item and item.get('status') == 'ok' for item in classification),
+                                     gdlc=classification[0] if len(ms) == 1 else classification)
+                if not args.skip_mode_quality_checks and comp == 'global' and len(ms) > 1:
+                    global_modes_for_angle(ms, eigenvalues, args.global_angle_deg is not None)
+                if partners:
+                    print('WARNING: %s mode %s has (nearly) equal eigenvalue(s) in mode(s) %s: inside such a group '
+                          'Abaqus returns an arbitrary basis, so the shape/direction of this single mode is not '
+                          'reproducible.%s' % (comp, ','.join(str(m) for m in ms), ','.join(str(m) for m in partners),
+                          ' Give the pair, e.g. --global-mode %d,%d, with --global-angle-deg.' % tuple(sorted((ms[0], partners[0])))
+                          if comp == 'global' and len(ms) == 1 else ''))
+                for m, item in zip(ms, classification):
+                    if item is None:
+                        continue
+                    if item['status'] != 'ok':
+                        print('NOTE: GDLC classification for %s mode %d not used (%s): %s'
+                              % (comp, m, item['status'], item['csv']))
+                        continue
+                    shares = item.get('shares_pct', {})
+                    expected = GDLC_EXPECTED[comp]
+                    text = ', '.join('%s %.1f%%' % (k, v) for k, v in shares.items())
+                    print('  GDLC %s mode %d: %s (dominant %s, confidence %s)'
+                          % (comp, m, text, item.get('dominant'), item.get('confidence')))
+                    if item.get('dominant') != expected or shares.get(expected, 0.) < GDLC_PURITY_PCT:
+                        print('WARNING: the %s component (mode %d) is not a clean %s mode (%s); the imperfection '
+                              'will carry this mixture of mechanisms.' % (comp, m, expected, text))
+        if keys is None:                                    # e.g. only analytical global cases
+            if odb_path is None:
+                raise ValueError('Only analytical components: the mesh is read from the reference .odb, but the '
+                                 'reference run is only BUILT; solve it or give a solved mode source')
+            odb = openOdb(path=odb_path, readOnly=True)
+            try:
+                keys, xyz, normals, unused, unused2, topology, unused3 = read_modes_and_mesh(
+                    source, odb, names, args, modes=())
+            finally:
+                odb.close()
+        axis = 'xyz'.index(args.axis)
+        length = float(np.ptp(xyz[:, axis]))
+        member_rows = np.array([i for i, key in enumerate(keys) if key[0] in member_names], dtype=int)
+        for name in member_names:
+            z = xyz[[i for i, key in enumerate(keys) if key[0] == name], axis]
+            if not np.allclose([z.min(), z.max()], [xyz[:, axis].min(), xyz[:, axis].max()], atol=1e-5, rtol=0):
+                raise ValueError('The four pieces must have common ends')
+        zero = np.zeros_like(xyz, dtype=float)
+        local, local_meta = zero, None
+        dist, dist_meta = zero, None
+        if 'local' in raw:
+            local, local_meta = normalize_mode(raw['local'][0], normals, axis,
+                gauge_indices(args.local_gauge, keys) if args.local_gauge else member_rows, args.local_metric)
+        if 'dist' in raw:
+            dist, dist_meta = normalize_mode(raw['dist'][0], normals, axis,
+                gauge_indices(args.dist_gauge, keys) if args.dist_gauge else member_rows, 'transverse')
+        angle = default_global_angle(load_case) if args.global_angle_deg is None else args.global_angle_deg
+        if 'global' in raw:
+            # eigenmode global shape (one mode or an aligned degenerate pair), unit peak transverse displacement
+            explicit = args.global_angle_deg is not None
+            global_shape, global_meta = member_global_eigen_shape(raw['global'], axis,
+                angle if (len(raw['global']) >= 2 or explicit) else None, member_rows,
+                load_case=load_case, check_direction=not args.skip_mode_quality_checks)
+            global_text = ('Eigenmode(s) %s of %s, %s; unit peak transverse displacement; bow angle %.2f deg, '
+                           'translation ratio %.3f' % (','.join(str(m) for m in global_modes_used),
+                           sources['global']['odb'], 'complete degenerate group aligned with --global-angle-deg'
+                           if len(raw['global']) >= 2 else ('single mode, sign towards --global-angle-deg'
+                           if explicit else 'single mode'), global_meta['bow_angle_deg'],
+                           global_meta['translation_ratio']))
+            print('  global shape: '+global_text)
+            if not args.skip_mode_quality_checks and load_case['type'] != 'bending' and len(raw['global']) == 1 and explicit:
+                deviation = abs((global_meta['bow_angle_deg']-angle+90.) % 180.-90.)
+                if global_meta['translation_ratio'] < .5 or deviation > 10.:
+                    print('WARNING: global mode %d cannot be rotated: its bow points at %.1f deg (translation ratio '
+                          '%.2f), not along --global-angle-deg %g; the requested direction is NOT met.'
+                          % (global_modes_used[0], global_meta['bow_angle_deg'], global_meta['translation_ratio'],
+                             angle))
+        else:
+            global_shape, global_meta = global_bow(xyz, axis, angle), None
+            global_text = 'Analytical half-sine bow; prescribed transverse direction, not inferred weak axis'
+            if load_case['type'] == 'bending':
+                global_text += ('; bending run: %s %.6g deg (lateral = along the neutral axis), no twist component'
+                                % ('explicit angle' if args.global_angle_deg is not None else 'default lateral direction',
+                                   angle))
+        cases = case_definitions(thickness, args.local_low_t, args.local_high_t, args.dist_mm, length)
+        specs = {}
+        for name, triple in args.combos.items():
+            cases[name] = tuple(amplitude_mm(spec, thickness, length) for spec in triple)
+            specs[name] = [spec[2] for spec in triple]
+        selected = list(args.selected_cases)
+        if any(name not in cases for name in selected):
+            raise ValueError('Invalid case selection. Available: '+','.join(cases))
+        case_names = ['STEP4_'+name for name in selected]
+        if any(name in database.models for name in case_names):
+            raise ValueError('STEP4 model names already exist in source; start from the perfect step-3 CAE')
+        for name in selected:
+            missing = [c for c, a in zip(COMPONENTS, cases[name]) if a != 0. and c not in need]
+            if missing:
+                raise RuntimeError('Internal error: case %s uses unread component(s) %s' % (name, missing))
+        offsets_by_case = {name: cases[name][0]*local+cases[name][1]*dist+cases[name][2]*global_shape
+                           for name in selected}
+        # Inter-piece clearance screen: only pairs that can come within one thickness are kept.
+        reach = max(float(np.max(np.linalg.norm(o, axis=1))) for o in offsets_by_case.values())
+        member_keys = [keys[i] for i in member_rows]
+        pairs = interpiece_candidates(member_keys, xyz[member_rows], thickness+2.*reach+1e-6)
+        source_counts = {key: len(getattr(source, key)) for key in
+            ('boundaryConditions', 'constraints', 'interactions', 'loads', 'materials', 'sections')}
+        manifest = dict(stage=4, source_cae=source_cae, source_model=model_name, source_odb=odb_path,
+            source_odb_size=os.path.getsize(odb_path) if odb_path else None,
+            source_odb_mtime=os.path.getmtime(odb_path) if odb_path else None,
+            reference_run_status='COMPLETED' if reference['solved'] else 'BUILT',
+            reference_pipeline=pipeline_contract.reference_snapshot(reference, include_hashes=True),
+            source_repository_counts=source_counts,
+            settings=vars(args), thickness_mm=thickness, length_mm=length, source_frames=descriptions,
+            load_case=load_case, global_angle_deg_used=angle, global_modes_used=global_modes_used,
+            component_sources=sources,
+            perfect_baseline_model=model_name,
+            imperfection_field='u0 = aL*phiL + aD*phiD + aG*phiG (transverse nodal translations)',
+            local_normalization=local_meta, distortional_normalization=dist_meta,
+            global_normalization=global_meta,
+            steel_plate_imperfections='same eigenmode combination and normalization as column walls; all plate nodes carried',
+            global_shape=global_text,
+            combo_amplitude_specs=specs,
+            convention='Only transverse nodal translations; independent component normalization; no rescaling after addition',
+            scope='Imperfection specimens only. Existing elastic steps/loads retained as reference; no GMNIA setup or solver jobs.',
+            measurement_warning='0.34t is the plan input, not proof of statistical equivalence. Select a relevant local gauge.',
+            mesh_warning='Imperfections are in node coordinates. Show mesh. Do not remesh.', cases={})
+        counts = dict(source_counts)
+        for case_name in selected:
+            a_local, a_dist, a_global = cases[case_name]
+            offsets = offsets_by_case[case_name]
+            name = 'STEP4_'+case_name
+            print('Creating %s: local=%g mm, distortional=%g mm, global=%g mm' % (name, a_local, a_dist, a_global))
+            sys.stdout.flush()
+            model = database.Model(name=name, objectToCopy=source)
+            apply_offsets(model, names, keys, xyz, offsets, topology)
+            if any(len(getattr(model, key)) != value for key, value in counts.items()):
+                raise RuntimeError('Copied model lost a boundary condition, connection or property')
+            screen = clearance_screen(xyz[member_rows], offsets[member_rows], pairs, thickness)
+            if 'worst_pair_indices' in screen:
+                screen['worst_pair_nodes'] = [list(member_keys[i]) for i in screen.pop('worst_pair_indices')]
+                print('WARNING: %s brings %d inter-piece node pair(s) closer than t=%g mm (worst %s, overclosure '
+                      '%.3g mm). General contact will remove these overclosures by strain-free node adjustment, '
+                      'which locally changes the imperfection; check the .msg file after the solve.'
+                      % (name, screen['new_overclosure_pairs'], thickness, screen['worst_pair_nodes'],
+                         screen['worst_overclosure_mm']))
+            item = dict(local_component_mm=a_local, distortional_component_mm=a_dist, global_component_mm=a_global,
+                amplitude_spec=specs.get(case_name),
+                actual_max_transverse_offset_mm=float(np.max(np.linalg.norm(offsets, axis=1))),
+                actual_max_normal_offset_mm=float(np.max(np.abs(np.sum(offsets*normals, axis=1)))),
+                interpiece_clearance=screen)
+            manifest['cases'][name] = item
+        for name in case_names:
+            database.models[name].setValues(description='STEP4_PIPELINE_COMPATIBLE '+json.dumps(
+                dict(specification=manifest, current_case=manifest['cases'][name]), ensure_ascii=True))
+        # Remove jobs only in the new in-memory database; source disk file is unchanged.
+        for name in list(database.jobs.keys()):
+            del database.jobs[name]
+        source.setValues(description=str(source.description or '')+'\nSTEP4_MANIFEST='+json.dumps(manifest, ensure_ascii=True))
+        os.makedirs(os.path.dirname(args.output_cae), exist_ok=True)
+        if session.viewports:
+            viewport = session.viewports[session.currentViewportName]
+            viewport.setValues(displayedObject=database.models[case_names[0]].rootAssembly)
+            viewport.assemblyDisplay.setValues(mesh=ON)
+            viewport.view.fitView()
+        database.saveAs(pathName=args.output_cae)
+        print('SAVED: %s (%d imperfect models plus the untouched perfect reference model %s). '
+              'No analysis submitted; mesh not regenerated.' % (args.output_cae, len(selected), model_name))
+        for comp in COMPONENTS:
+            if comp in sources:
+                print('  %-6s mode %s from %s' % (comp, sources[comp]['mode'], sources[comp]['odb']))
+        if 'global' in need and 'global' not in sources:
+            print('  global analytical half-sine bow (angle %g deg)' % angle)
         if load_case['type'] == 'bending':
-            global_text += ('; bending run: %s %.6g deg (lateral = along the neutral axis), no twist component'
-                            % ('explicit angle' if args.global_angle_deg is not None else 'default lateral direction',
-                               angle))
-    cases = case_definitions(thickness, args.local_low_t, args.local_high_t, args.dist_mm, length)
-    specs = {}
-    for name, triple in args.combos.items():
-        cases[name] = tuple(amplitude_mm(spec, thickness, length) for spec in triple)
-        specs[name] = [spec[2] for spec in triple]
-    selected = list(args.selected_cases)
-    if any(name not in cases for name in selected):
-        raise ValueError('Invalid case selection. Available: '+','.join(cases))
-    case_names = ['STEP4_'+name for name in selected]
-    if any(name in database.models for name in case_names):
-        raise ValueError('STEP4 model names already exist in source; start from the perfect step-3 CAE')
-    for name in selected:
-        missing = [c for c, a in zip(COMPONENTS, cases[name]) if a != 0. and c not in need]
-        if missing:
-            raise RuntimeError('Internal error: case %s uses unread component(s) %s' % (name, missing))
-    offsets_by_case = {name: cases[name][0]*local+cases[name][1]*dist+cases[name][2]*global_shape
-                       for name in selected}
-    # Inter-piece clearance screen: only pairs that can come within one thickness are kept.
-    reach = max(float(np.max(np.linalg.norm(o, axis=1))) for o in offsets_by_case.values())
-    pairs = interpiece_candidates(keys, xyz, thickness+2.*reach+1e-6)
-    source_counts = {key: len(getattr(source, key)) for key in
-        ('boundaryConditions', 'constraints', 'interactions', 'loads', 'materials', 'sections')}
-    manifest = dict(stage=4, source_cae=source_cae, source_model=model_name, source_odb=odb_path,
-        source_odb_size=os.path.getsize(odb_path), source_odb_mtime=os.path.getmtime(odb_path),
-        reference_pipeline=pipeline_contract.reference_snapshot(reference, include_hashes=True),
-        source_repository_counts=source_counts,
-        settings=vars(args), thickness_mm=thickness, length_mm=length, source_frames=descriptions,
-        load_case=load_case, global_angle_deg_used=angle,
-        component_sources=sources,
-        perfect_baseline_model=model_name,
-        imperfection_field='u0 = aL*phiL + aD*phiD + aG*phiG (transverse nodal translations)',
-        local_normalization=local_meta, distortional_normalization=dist_meta,
-        global_normalization=global_meta,
-        global_shape=global_text,
-        combo_amplitude_specs=specs,
-        convention='Only transverse nodal translations; independent component normalization; no rescaling after addition',
-        scope='Imperfection specimens only. Existing elastic steps/loads retained as reference; no GMNIA setup or solver jobs.',
-        measurement_warning='0.34t is the plan input, not proof of statistical equivalence. Select a relevant local gauge.',
-        mesh_warning='Imperfections are in node coordinates. Show mesh. Do not remesh.', cases={})
-    counts = dict(source_counts)
-    for case_name in selected:
-        a_local, a_dist, a_global = cases[case_name]
-        offsets = offsets_by_case[case_name]
-        name = 'STEP4_'+case_name
-        print('Creating %s: local=%g mm, distortional=%g mm, global=%g mm' % (name, a_local, a_dist, a_global))
-        sys.stdout.flush()
-        model = database.Model(name=name, objectToCopy=source)
-        apply_offsets(model, names, keys, xyz, offsets, topology)
-        if any(len(getattr(model, key)) != value for key, value in counts.items()):
-            raise RuntimeError('Copied model lost a boundary condition, connection or property')
-        screen = clearance_screen(xyz, offsets, pairs, thickness)
-        if 'worst_pair_indices' in screen:
-            screen['worst_pair_nodes'] = [list(keys[i]) for i in screen.pop('worst_pair_indices')]
-            print('WARNING: %s brings %d inter-piece node pair(s) closer than t=%g mm (worst %s, overclosure '
-                  '%.3g mm). General contact will remove these overclosures by strain-free node adjustment, '
-                  'which locally changes the imperfection; check the .msg file after the solve.'
-                  % (name, screen['new_overclosure_pairs'], thickness, screen['worst_pair_nodes'],
-                     screen['worst_overclosure_mm']))
-        item = dict(local_component_mm=a_local, distortional_component_mm=a_dist, global_component_mm=a_global,
-            amplitude_spec=specs.get(case_name),
-            actual_max_transverse_offset_mm=float(np.max(np.linalg.norm(offsets, axis=1))),
-            actual_max_normal_offset_mm=float(np.max(np.abs(np.sum(offsets*normals, axis=1)))),
-            interpiece_clearance=screen)
-        manifest['cases'][name] = item
-    for name in case_names:
-        database.models[name].setValues(description='STEP4_PIPELINE_COMPATIBLE '+json.dumps(
-            dict(specification=manifest, current_case=manifest['cases'][name]), ensure_ascii=True))
-    # Remove jobs only in the new in-memory database; source disk file is unchanged.
-    for name in list(database.jobs.keys()):
-        del database.jobs[name]
-    source.setValues(description=str(source.description or '')+'\nSTEP4_MANIFEST='+json.dumps(manifest, ensure_ascii=True))
-    os.makedirs(os.path.dirname(args.output_cae), exist_ok=True)
-    if session.viewports:
-        viewport = session.viewports[session.currentViewportName]
-        viewport.setValues(displayedObject=database.models[case_names[0]].rootAssembly)
-        viewport.assemblyDisplay.setValues(mesh=ON)
-        viewport.view.fitView()
-    database.saveAs(pathName=args.output_cae)
-    print('SAVED: %s (%d imperfect models plus the untouched perfect reference model %s). '
-          'No analysis submitted; mesh not regenerated.' % (args.output_cae, len(selected), model_name))
-    for comp in COMPONENTS:
-        if comp in sources:
-            print('  %-6s mode %s from %s' % (comp, sources[comp]['mode'], sources[comp]['odb']))
-    if 'global' in need and 'global' not in sources:
-        print('  global analytical half-sine bow (angle %g deg)' % angle)
-    if load_case['type'] == 'bending':
-        print('  load case: bending, neutral axis %g deg (%s)' % (load_case.get('neutral_axis_angle_deg'),
-                                                               load_case.get('tag')))
-    print('  %-14s %9s %9s %9s %10s' % ('case', 'aL [mm]', 'aD [mm]', 'aG [mm]', 'max|u0|'))
-    for case_name in selected:
-        print('  %-14s %9.4g %9.4g %9.4g %10.4g' % ((case_name,)+tuple(cases[case_name])+(
-            manifest['cases']['STEP4_'+case_name]['actual_max_transverse_offset_mm'],)))
-    return manifest
+            print('  load case: bending, neutral axis %g deg (%s)' % (load_case.get('neutral_axis_angle_deg'),
+                                                                   load_case.get('tag')))
+        print('  %-14s %9s %9s %9s %10s' % ('case', 'aL [mm]', 'aD [mm]', 'aG [mm]', 'max|u0|'))
+        for case_name in selected:
+            print('  %-14s %9.4g %9.4g %9.4g %10.4g' % ((case_name,)+tuple(cases[case_name])+(
+                manifest['cases']['STEP4_'+case_name]['actual_max_transverse_offset_mm'],)))
+        return manifest
+    except BaseException:
+        database.close()
+        raise
+
+
+def bending_global_eigen_shape(fields, axis, load_case, angle_degrees=None):
+    """Check single modes and degenerate combinations against the applied moment.
+
+    A requested imperfection angle cannot redefine the moment's lateral direction.
+    Keep the lateral/torsional eigenfield intact; only its scale and sign change.
+    """
+    lateral = default_global_angle(load_case)
+    angle = lateral if angle_degrees is None else angle_degrees
+    deviation = abs((angle-lateral+90.) % 180.-90.)
+    if not np.isfinite(angle) or deviation > BENDING_MAX_BOW_DEVIATION_DEG:
+        raise ValueError('Bending eigenmode bow angle must follow the applied moment neutral axis '
+                         '(lateral direction %g deg); --global-angle-deg cannot rotate this load case' % lateral)
+    shape, meta = global_eigen_shape(fields, axis, angle if len(fields) > 1 else None)
+    return orient_bending_global(shape, meta, axis, lateral)
+
+
+def orient_bending_global(shape, meta, axis, angle_degrees):
+    """Bending global eigenmode = lateral-torsional buckling: the sections translate along the
+    neutral axis (lateral direction) and twist about a centre on the tension side. Check that the
+    selected single mode really is that shape - a net lateral bow, not a torsional or
+    antisymmetric (even half-wave) mode, along the lateral direction angle_degrees - and point
+    the bow towards +angle_degrees, so the sign of aG is reproducible ('p' = towards the lateral
+    direction). Abaqus/FE asymmetry leaves the bow a fraction of a degree off the axis, so the
+    direction test is a tolerance, not exact alignment. Returns (shape, meta)."""
+    transverse = [i for i in range(3) if i != axis]
+    ratio = float(meta['translation_ratio'])
+    if not ratio >= BENDING_MIN_TRANSLATION_RATIO:
+        raise ValueError('Bending global mode has no net lateral bow (translation ratio %.3f < %.2f): it is a '
+                         'torsional or antisymmetric (even half-wave) mode, not the lateral-torsional buckling '
+                         'shape; use the single-half-wave REF_G mode (normally --global-mode 1)'
+                         % (ratio, BENDING_MIN_TRANSLATION_RATIO))
+    deviation = abs((float(meta['bow_angle_deg'])-angle_degrees+90.) % 180.-90.)
+    if deviation > BENDING_MAX_BOW_DEVIATION_DEG:
+        raise ValueError('Bending global mode bows at %.2f deg, %.1f deg away from the lateral direction %g deg '
+                         '(neutral axis of the applied moment); it is not the lateral-torsional mode of this '
+                         'moment' % (meta['bow_angle_deg'], deviation, angle_degrees))
+    target = np.array([math.cos(math.radians(angle_degrees)), math.sin(math.radians(angle_degrees))])
+    if float(np.dot(shape[:, transverse].mean(axis=0), target)) < 0.:
+        shape = -shape
+        meta = dict(meta, eigenvector_sign_multiplier=-meta['eigenvector_sign_multiplier'],
+                    bow_angle_deg=(meta['bow_angle_deg']+360.) % 360.-180.)
+    meta = dict(meta, requested_bow_angle_deg=angle_degrees, bending_lateral_check=dict(
+        deviation_deg=deviation, translation_ratio=ratio, max_deviation_deg=BENDING_MAX_BOW_DEVIATION_DEG,
+        min_translation_ratio=BENDING_MIN_TRANSLATION_RATIO))
+    return shape, meta
+
+
+def validate_bending_mode_source(info, reference, component):
+    """A matching mesh alone cannot establish the bending load or bolt configuration."""
+    if pipeline_contract.reference_load_case(reference['build'])['type'] != 'bending':
+        return  # Preserve compression's established same-mesh source flexibility.
+    source_build = info.get('source_build')
+    if not isinstance(source_build, dict):
+        raise ValueError('Bending mode source has no build provenance: '+info['folder'])
+    if pipeline_contract.load_case_snapshot(source_build) != pipeline_contract.load_case_snapshot(reference['build']):
+        raise ValueError('Mode source load case/axis differs from the bending run: '+info['folder'])
+    expected_source = reference['source_inputs']
+    if source_build.get('source_inputs') != expected_source:
+        raise ValueError('Mode source structural configuration (geometry/material/bolts) differs: '+info['folder'])
+    for key in ('length_mm', 'nodes', 'elements', 'rigid_links', 'boundary_conditions', 'loads'):
+        if source_build.get(key) != reference['build'].get(key):
+            raise ValueError('Mode source configuration differs (%s): %s' % (key, info['folder']))
+    marker = info.get('gdlc_reference')
+    if marker is None and source_build.get('job_name') != info.get('source_job'):
+        raise ValueError('Bending reference provenance is missing: copied source build requires '
+                         'gdlc_reference.json in '+info['folder'])
+    if marker is not None:
+        expected_kind = GDLC_EXPECTED[component]
+        original = reference['paths']['inp']
+        if (marker.get('kind') != expected_kind or marker.get('source_run') != os.path.basename(reference['run_dir'])
+                or marker.get('source_inp') != os.path.basename(original)):
+            raise ValueError('Wrong bending reference family/kind; use <bending-run>_REF_%s: %s' %
+                             (expected_kind, info['folder']))
+        if marker.get('source_inp_sha256') and marker['source_inp_sha256'] != pipeline_contract.file_sha256(original):
+            raise ValueError('Bending reference was generated from a different original INP: '+info['folder'])
+        if expected_kind == 'G' and marker.get('twist') == 'restrained':
+            raise ValueError('Bending REF_G restrains twist and cannot supply lateral-torsional buckling: '+info['folder'])
+
+
+def validate_bending_reference_mode(load_case, component, mode, classification):
+    """A known impure reference vector must not pass the generic mixed-mode threshold.
+
+    Check the selected vector, not the whole reference run: another eigenmode's
+    failure does not invalidate a pure selected one. Apply to every load case;
+    deliberately selected mixed modes from the original model remain unaffected.
+    """
+    expected = {'local': 'L', 'global': 'G'}.get(component)
+    if (expected is None or not classification
+            or classification.get('status') != 'ok'
+            or (classification.get('reference_check') or {}).get('kind') != expected):
+        return
+    shares = classification.get('shares_pct', {})
+    primary = shares.get(expected, float('nan'))
+    # CAE's execution namespace can shadow Python's sum with its own API.
+    nonlocal_share = python_builtins.sum(shares.get(k, 0.) for k in ('G', 'D', 'C'))
+    if (not np.isfinite(primary) or primary < 95.
+            or (expected == 'L' and (not np.isfinite(nonlocal_share) or nonlocal_share > 5.))):
+        raise ValueError('REF_%s mode %d does not meet the reference criterion '
+                         '(%s >= 95%%%s): %s=%.4g%%. Select a verified pure mode; '
+                         'a changed reference requires new solved/classified results. The 80%% '
+                         'mixed-mode warning threshold is not a reference acceptance criterion.' %
+                         (expected, mode, expected, ' and G+D+C <= 5%' if expected == 'L' else '',
+                          expected, primary))
+
+
+    plate = [classification[key] for key in ('plate_deformation_pct','cluster_plate_deformation_max_pct')
+             if key in classification]
+    if (any(not np.isfinite(value) or value > 5. for value in plate)
+            or classification.get('plate_metrics_required') and not plate):
+        raise ValueError('REF_%s mode %d lacks acceptable attachment-deformation validation '
+                         '(individual and cluster plate deformation must be <= 5%%). '
+                         'Classify the saved reference modes; do not bypass this check.' % (expected,mode))
 
 
 def main(argv=None):
-    args = parse_arguments(argv)
+    try:
+        args = parse_arguments(argv)
+    except SystemExit as error:
+        if error.code not in (None, 0) and ('-cae' in sys.argv or 'abaqus' in sys.modules):
+            detail = getattr(error, 'step4_argument_error', None)
+            message = ('STEP4 FAILED: invalid arguments'+(': '+detail if detail else '')+
+                       '. No imperfection CAE was created. Correct the command-line values '
+                       'and rerun Step 4 only.')
+            if detail and 'mode' in detail.lower():
+                message += (' Supply mode numbers directly or use explicit set assignments; '
+                            'do not paste a block of set /p prompts.')
+            print(message)
+            sys.stdout.flush()
+            # CAE reports SystemExit(2) as "Exit code: 0" on some installations.
+            # A runtime exception keeps this an explicit failed script, not a clean exit.
+            raise RuntimeError(message) from error
+        raise
     if args.suggest:
         if args.suggest_source == 'csv':
             return suggest_modes(args.run_dir)

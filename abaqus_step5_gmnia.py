@@ -5,6 +5,12 @@ Abaqus 2024:
   abaqus cae noGUI=abaqus_step5_gmnia.py -- --source-cae "Step4_imperfections.cae"
     --output-dir "new_step5_folder" --fy 350
 
+Every option is written '--name value' with a space (the Abaqus launcher rejects
+'--name=value'). --cpus N|auto (default auto = all physical cores): CPUs of every
+Abaqus job of this folder - stored in the jobs, in abaqus_v6.env and passed on to
+the generated run_step5_queue_*.bat, which resolves it again on the machine that
+runs the queue (a request above its physical cores uses all of them).
+
 fy is REQUIRED (MPa). Elastic properties, thickness, mesh, imperfections, initial
 BCs and general contact are inherited. Plasticity is elastic-perfectly-plastic at
 fy by default; --stress-strain CSV (engineering strain, engineering stress MPa;
@@ -46,7 +52,7 @@ Primary post-peak stop: at the first converged increment after the peak for whic
 P <= postpeak_stop_ratio*Pu (default 0.70), implemented by URDFIL using the Riks
 LPF and LSTOP=1. Because P=LPF*P_ref with no preload, the force ratio is exactly
 the LPF ratio. A minimal NODE FILE request at every increment triggers URDFIL.
-The default queue monitors ODB LPF without compiling Fortran; URDFIL is optional.
+The default queue monitors converged STA LPF without compiling Fortran; URDFIL is optional.
 
 The positive-U3 monitor is disabled by default so it cannot compete with the
 common 70% criterion; it is enabled only when --max-end-displacement-mm is
@@ -54,7 +60,12 @@ supplied explicitly. Max increments defaults to 5000 as a high safety cap.
 A run can still fail before the 70% criterion through genuine nonconvergence or
 another solver/runtime error. No equilibrium tolerances are loosened.
 
-Only CAE/INP deliverables are placed in --output-dir (must be new or empty).
+Only CAE/INP deliverables are placed in --output-dir (must be new or empty), plus a
+<job>_step5.json metadata sidecar per job (the model-description JSON) that the queue
+and the extractor read before the CAE. Verified INP/sidecar pairs are delivered as each
+case finishes. The common CAE is saved once at the end, then the queue BAT is written.
+P-M interaction inputs reuse this module through
+abaqus_pm_interaction.py (prepare_model(..., pm_template=True)).
 Jobs are created for later manual use; this script NEVER submits them. Abaqus
 may create its own startup replay files in the launch directory. Source CAE is
 not saved over. Do not remesh the imperfect models. Units: N, mm, MPa.
@@ -71,6 +82,7 @@ import struct
 import sys
 import tempfile
 import abaqus_pipeline_contract as pipeline_contract
+import runtime_resources
 from abaqus_step5_progress import report
 
 # Abaqus/CAE noGUI can execute the script without a __file__ global.
@@ -98,16 +110,25 @@ def parse_arguments(argv=None):
     p.add_argument('--source-cae', required=True)
     p.add_argument('--output-dir', required=True)
     p.add_argument('--fy', type=float, required=True)
+    p.add_argument('--load-case', choices=pipeline_contract.LOAD_CASES, default=None,
+                   help='Assert the inherited Step4 loading; never converts its load case')
+    p.add_argument('--steel-plate-fy', type=float,
+                   help='Separate yield stress F\'y (MPa), required for steel-plate models; elastic-perfectly-plastic')
     p.add_argument('--models', nargs='+')
     p.add_argument('--reference-stress', type=float)
     p.add_argument('--initial-arc', type=float, default=.01)
     p.add_argument('--min-arc', type=float, default=1e-8)
     p.add_argument('--max-arc', type=float, default=.05)
     p.add_argument('--max-increments', type=int, default=5000)
+    p.add_argument('--riks-extrapolation', choices=('linear','none'), default='linear',
+                   help='Riks predictor; linear keeps existing behavior')
     p.add_argument('--max-end-displacement-mm', type=float)
     p.add_argument('--field-frequency', type=int, default=1)
-    p.add_argument('--cpus', type=int, default=None, help='Default: all physical cores available to the solver')
-    p.add_argument('--gpus', default='auto')
+    p.add_argument('--cpus', type=runtime_resources.cpu_request, default='auto',
+                   help="Abaqus CPUs: 'auto' (all physical cores) or a positive integer; also written into "
+                        "the generated queue .bat")
+    p.add_argument('--gpus', type=runtime_resources.gpu_request, default='auto',
+                   help="Abaqus GPUs: 'auto' (all visible) or an integer >= 0")
     p.add_argument('--stop-method', choices=['monitor', 'urdfil'], default='monitor')
     p.add_argument('--postpeak-stop-ratio', type=float, default=.70,
                    help='Stop at first converged post-peak increment with P <= ratio*Pu (default 0.70)')
@@ -122,7 +143,9 @@ def parse_arguments(argv=None):
             args.stress_strain_rows = read_stress_strain(args.stress_strain)
         except (OSError, ValueError) as error:
             p.error('--stress-strain: %s' % error)
-    import runtime_resources
+    # The request (auto or N) goes into the queue .bat, which resolves it on the machine that
+    # runs the jobs; the resolved values go into the jobs and abaqus_v6.env of this build.
+    args.cpus_requested, args.gpus_requested = args.cpus, args.gpus
     try:
         policy = runtime_resources.resolve_solver_policy(runtime_resources.detect_resources(), args.cpus, args.gpus)
     except ValueError as error:
@@ -130,7 +153,7 @@ def parse_arguments(argv=None):
     args.cpus, args.gpus = policy.cpus, policy.gpus
     if args.reference_stress is None:
         args.reference_stress = args.fy
-    for name in ('fy', 'reference_stress', 'initial_arc', 'min_arc', 'max_arc', 'max_end_displacement_mm'):
+    for name in ('fy', 'steel_plate_fy', 'reference_stress', 'initial_arc', 'min_arc', 'max_arc', 'max_end_displacement_mm'):
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or value <= 0):
             p.error('--%s must be positive and finite' % name.replace('_', '-'))
@@ -242,7 +265,8 @@ def perfect_step4_payload(reference_model):
 
 def render_postpeak_urdfil(ratio):
     """Fortran URDFIL: stop at first converged post-peak LPF <= ratio*peak LPF."""
-    literal = ('%.16g' % float(ratio)) + 'D0'
+    literal = '%.16g' % float(ratio)
+    literal = literal.replace('e', 'D').replace('E', 'D') if 'e' in literal.lower() else literal+'D0'
     return """      SUBROUTINE URDFIL(LSTOP,LOVRWRT,KSTEP,KINC,DTIME,TIME)
 C
 C     STEP5 GMNIA POST-PEAK STOP
@@ -322,13 +346,17 @@ def inject_urdfil_trigger(path):
 
 
 def write_queue_batch(path, job_names, cpus='auto', subroutine_name=STOP_SUBROUTINE_NAME,
-                      cae=None, script=None, ratio=.70, stop_method='monitor'):
-    """One CAE runner handles monitoring, per-job plots and final comparison."""
+                      cae=None, script=None, ratio=.70, stop_method='monitor', gpus='auto'):
+    """One CAE runner handles monitoring, per-job plots and final comparison.
+    cpus/gpus: 'auto' or a number, passed as '--cpus N' (never '--cpus=N', which the Abaqus
+    launcher rejects); the queue resolves them on the machine that runs it."""
+    cpus = runtime_resources.cpu_request(cpus)
+    gpus = runtime_resources.gpu_request(gpus)
     script = script or os.path.join(SCRIPT_DIR, 'abaqus_step5_queue_nogui.py')
     tail_script = os.path.join(os.path.dirname(script), 'step5_progress_tail.ps1')
     command = ('call abaqus cae noGUI="%s" -- --run-dir "%%~dp0." '
-               '--cpus %s --gpus auto --ratio %g --stop-method %s --jobs %s' %
-               (script, cpus, ratio, stop_method, ' '.join(job_names)))
+               '--cpus %s --gpus %s --ratio %s --stop-method %s --jobs %s' %
+               (script, cpus, gpus, repr(float(ratio)), stop_method, ' '.join(job_names)))
     if cae:
         command += ' --cae "%s"' % cae
     lines = ['@echo off', 'setlocal', 'cd /d "%~dp0"',
@@ -345,7 +373,7 @@ def write_queue_batch(path, job_names, cpus='auto', subroutine_name=STOP_SUBROUT
              '> "%STEP5_PROGRESS_DONE%" echo done',
              'timeout /t 1 /nobreak >nul',
              'echo [QUEUE EXIT] Code: %QUEUE_EXIT%',
-             'if not "%QUEUE_EXIT%"=="0" echo [ATTENTION] Queue failed or a stop criterion was not reached. Check messages, STEP5_queue_progress.log and STEP5_queue_status.json.',
+             'if not "%QUEUE_EXIT%"=="0" echo [ATTENTION] Queue failed or analysis/results are incomplete. Check messages, STEP5_queue_progress.log and STEP5_queue_status.json.',
              'endlocal & exit /b %QUEUE_EXIT%', '']
     with open(path, 'w', newline='') as stream:
         stream.write('\r\n'.join(lines))
@@ -431,16 +459,40 @@ def replace_bolts(model, expected_links=None):
     return metadata
 
 
-def prepare_model(model, args):
+def apply_plate_plasticity(model, reference, args):
+    plate = reference.get('steel_plates')
+    if not plate:
+        return {}
+    fy = getattr(args, 'steel_plate_fy', None)
+    if fy is None or not math.isfinite(fy) or fy <= 0:
+        raise ValueError('Steel plate models require positive --steel-plate-fy (MPa)')
+    name = plate['material']
+    if name not in model.materials:
+        raise ValueError('Steel plate material is missing: '+name)
+    material = model.materials[name]
+    if not hasattr(material, 'elastic') or hasattr(material, 'plastic'):
+        raise ValueError('Steel plate source must have elastic properties only')
+    material.Plastic(table=((float(fy), 0.),))
+    return {name: [[float(fy), 0.]]}
+
+
+def prepare_model(model, args, pm_template=False):
+    """Convert one Step-4 model into a Riks GMNIA model (in place).
+
+    pm_template=True (abaqus_pm_interaction.py): validate the inherited source loads,
+    then create one placeholder CF3 per end node for the consistent P-M ray forces.
+    The reference nodal supports and free end warping are preserved in every case."""
     from abaqusConstants import ON, OFF, UNIFORM, GENERAL
     assembly = model.rootAssembly
     prior_description = model.description
     payload = pipeline_contract.parse_prefixed_json(prior_description, STEP4_PREFIX)
     specification, reference = pipeline_contract.validate_step4_payload(payload)
-    names = sorted(assembly.instances.keys())
-    if tuple(names) != tuple(reference['instances']):
+    names = list(reference['instances'])
+    plate_names = pipeline_contract.plate_instance_names(reference)
+    all_names = names + plate_names
+    if set(assembly.instances.keys()) != set(all_names):
         raise ValueError('STEP5 source instances differ from the reference pipeline P1..P4 contract')
-    if any(str(e.type) != reference['element_type'] for name in names
+    if any(str(e.type) != reference['element_type'] for name in all_names
            for e in assembly.instances[name].elements):
         raise ValueError('STEP5 source mesh differs from the reference S4R element contract')
     if set(model.steps.keys()) != {'Initial', 'Buckle'}:
@@ -463,7 +515,7 @@ def prepare_model(model, args):
     if reference['connection_model'] != 'BEAM_MPC':
         raise ValueError('STEP5 requires the production BEAM_MPC reference source')
 
-    fingerprint = mesh_digest(model, names)
+    fingerprint = mesh_digest(model, all_names)
     coordinates = [n.coordinates for name in names for n in assembly.instances[name].nodes]
     zmin, zmax = min(p[2] for p in coordinates), max(p[2] for p in coordinates)
     length = zmax-zmin
@@ -472,8 +524,11 @@ def prepare_model(model, args):
     weights, end_labels, end_area = [[], []], [[], []], [0., 0.]
     expected_loads, loads, materials, integration_counts = set(), [], set(), set()
     load_case = pipeline_contract.snapshot_load_case(reference)
+    requested_case = getattr(args,'load_case',None)
+    if requested_case is not None and requested_case != load_case['type']:
+        raise ValueError('--load-case differs from inherited Step4 loading; Step5 cannot convert it')
     bending = load_case['type'] == 'bending'
-    end_meshes = []        # bending: (instance, node xyz, element topology) for the end forces
+    end_meshes = []        # (instance, node xyz, element topology) for nodal end forces
     for name in names:
         inst = assembly.instances[name]
         assignments = model.parts[inst.partName].sectionAssignments
@@ -487,8 +542,7 @@ def prepare_model(model, args):
         xyz = {n.label: n.coordinates for n in inst.nodes}
         topology = [tuple(n.label for n in e.getNodes()) for e in inst.elements]
         tributary = end_weights(xyz, topology, thickness, zmin, zmax)
-        if bending:
-            end_meshes.append((name, xyz, topology))
+        end_meshes.append((name, xyz, topology))
         for side, suffix, sign in ((0, '0', 1.), (1, 'L', -1.)):
             end = 'END_%s_%s' % (suffix, name)
             if not bending:
@@ -515,6 +569,7 @@ def prepare_model(model, args):
             int(reference['loads']), args.fy)
     if set(model.loads.keys()) != expected_loads:
         raise ValueError('Unexpected additional/missing loads; refusing to silently remove them')
+    template_nodes = pm_template_nodes(end_meshes, zmin, zmax) if pm_template else None
     if not math.isclose(end_area[0], end_area[1], rel_tol=1e-6):
         raise ValueError('Opposite loaded end areas differ')
     if len(integration_counts) != 1 or min(integration_counts) < 1:
@@ -533,6 +588,7 @@ def prepare_model(model, args):
         table = plastic_table(getattr(args, 'stress_strain_rows', None), young, args.fy)
         material.Plastic(table=table)
         plastic_tables[material_name] = [list(row) for row in table]
+    plastic_tables.update(apply_plate_plasticity(model, reference, args))
     for repository in (model.loads, model.fieldOutputRequests, model.historyOutputRequests):
         for key in list(repository.keys()):
             del repository[key]
@@ -543,26 +599,16 @@ def prepare_model(model, args):
         assembly.SetFromNodeLabels(name='STEP5_'+suffix, nodeLabels=tuple(end_labels[side]))
     bottom_name, bottom_labels = end_labels[0][0]
     assembly.SetFromNodeLabels(name='STEP5_STOP', nodeLabels=((bottom_name, (bottom_labels[0],)),))
-    stop = args.max_end_displacement_mm
-    if stop is None:
-        model.StaticRiksStep(name='GMNIA', previous='Initial', nlgeom=ON,
-            maxNumInc=args.max_increments, initialArcInc=args.initial_arc,
-            minArcInc=args.min_arc, maxArcInc=args.max_arc, totalArcLength=1.,
-            nodeOn=OFF)
-    else:
-        model.StaticRiksStep(name='GMNIA', previous='Initial', nlgeom=ON,
-            maxNumInc=args.max_increments, initialArcInc=args.initial_arc,
-            minArcInc=args.min_arc, maxArcInc=args.max_arc, totalArcLength=1.,
-            nodeOn=ON, region=assembly.sets['STEP5_STOP'], dof=3,
-            maximumDisplacement=stop)
-    if bending:
+    create_riks_step(model, assembly, args)
+    if pm_template:
+        create_pm_template_loads(model, template_nodes, 'GMNIA')
+    elif bending:
         for name, node_set, force in loads:
             model.ConcentratedForce(name=name, createStepName='GMNIA', region=assembly.sets[node_set],
                 cf3=force, distributionType=UNIFORM, follower=OFF)
     else:
         for name, surface, magnitude, sign in loads:
-            # P = LPF*A0*sigma_ref requires integration over the original edge
-            # length, even when a loaded end warps during NLGEOM deformation.
+            # Dead force per original edge length: P = LPF*A_mesh*sigma_ref in NLGEOM.
             model.ShellEdgeLoad(name=name, createStepName='GMNIA', region=assembly.surfaces[surface],
                 magnitude=magnitude, distributionType=UNIFORM, traction=GENERAL,
                 directionVector=((0., 0., 0.), (0., 0., sign)), follower=OFF, resultant=ON)
@@ -571,6 +617,13 @@ def prepare_model(model, args):
     model.FieldOutputRequest(name='ShellResponse', createStepName='GMNIA',
         region=assembly.sets['STEP5_SHELLS'], variables=('S', 'LE', 'PEEQ'),
         sectionPoints=tuple(range(1, next(iter(integration_counts))+1)), frequency=args.field_frequency)
+    if plate_names:
+        plate = reference['steel_plates']
+        assembly.SetFromElementLabels(name='STEP5_STEEL_PLATES', elementLabels=tuple(
+            (name, tuple(e.label for e in assembly.instances[name].elements)) for name in plate_names))
+        model.FieldOutputRequest(name='SteelPlateResponse', createStepName='GMNIA',
+            region=assembly.sets['STEP5_STEEL_PLATES'], variables=('S', 'LE', 'PEEQ'),
+            sectionPoints=tuple(range(1, int(plate['section_points'])+1)), frequency=args.field_frequency)
     model.FieldOutputRequest(name='NodalResponse', createStepName='GMNIA',
         variables=('U', 'RF'), frequency=args.field_frequency)
     model.FieldOutputRequest(name='ContactResponse', createStepName='GMNIA',
@@ -587,7 +640,7 @@ def prepare_model(model, args):
     model.HistoryOutputRequest(name='GlobalHistory', createStepName='GMNIA',
         variables=('ALLSE', 'ALLPD', 'ALLWK', 'ALLIE'), frequency=1)
     # Riks writes LPF automatically; LPF is not a valid CAE request identifier.
-    if mesh_digest(model, names) != fingerprint:
+    if mesh_digest(model, all_names) != fingerprint:
         raise RuntimeError('Source imperfect node coordinates/connectivity changed during conversion')
     print('  Imperfect mesh preserved; preparing INP.'); sys.stdout.flush()
     info = dict(stage=5, settings=vars(args),
@@ -601,10 +654,10 @@ def prepare_model(model, args):
             ratio=args.postpeak_stop_ratio,
             criterion='first converged post-peak increment with P <= ratio*Pu',
             equivalent_lpf_criterion='LPF <= ratio*max_previous_LPF because P=LPF*P_ref and P0=0',
-            implementation=('ODB LPF polling and native Abaqus terminate; first observed crossing'
+            implementation=('converged STA LPF polling and native Abaqus terminate; first observed crossing'
                             if args.stop_method == 'monitor' else 'URDFIL LSTOP=1 triggered by NODE FILE frequency=1'),
             user_subroutine=STOP_SUBROUTINE_NAME),
-        stop_node=[bottom_name, bottom_labels[0]], stop_positive_U3_mm=stop,
+        stop_node=[bottom_name, bottom_labels[0]], stop_positive_U3_mm=args.max_end_displacement_mm,
         material=('Elastic-perfectly-plastic at fy' if getattr(args, 'stress_strain_rows', None) is None else
                   'Isotropic hardening from engineering curve %s (sha256 %s), converted to true stress / '
                   'log plastic strain' % (args.stress_strain, pipeline_contract.file_sha256(args.stress_strain)))
@@ -618,13 +671,14 @@ def prepare_model(model, args):
             added_compliance='none intentionally introduced'),
         source_mesh_sha256=fingerprint,
         compatibility_checks=dict(
-            instances=names, element_type=reference['element_type'],
+            instances=all_names, element_type=reference['element_type'],
             source_rigid_links=int(reference['rigid_links']),
             source_boundary_conditions=int(reference['boundary_conditions']),
             source_loads=int(reference['loads']),
             source_contact=reference['shell_contact']),
         warning='Pilot Riks settings; no solve/convergence or physical mode classification validated. Do not remesh.')
     info['load_case'] = load_case
+    info['end_condition'] = dict(pipeline_contract.STEP5_END_CONDITION)
     info['section_for_PM'] = dict(
         area_mm2=end_area[0], squash_load_N=end_area[0]*args.fy,
         definition='meshed end area (chords); squash load = A*fy')
@@ -636,8 +690,55 @@ def prepare_model(model, args):
         info['section_for_PM'].update(
             first_yield_moment_Nmm=bending_info['first_yield_moment_Nmm'],
             plastic_moment_Nmm=bending_info['plastic_moment_Nmm'])
+    if pm_template:
+        # The variant writer (abaqus_pm_interaction.py) replaces the load description and
+        # reference quantities for every P-M ray; the source load case is kept as provenance.
+        info['source_load_case'] = info.pop('load_case')
+        for key in ('reference_force_N_per_end', 'force_formula', 'shortening_formula', 'reference_moment_Nmm',
+                    'moment_formula', 'rotation_formula', 'end_rotation_weights', 'first_yield_moment_Nmm',
+                    'plastic_moment_Nmm', 'reference_moment_Nmm_per_MPa', 'bending_axis_deg'):
+            info.pop(key, None)
+        info['pm_template'] = template_nodes
+        info['thickness_mm'] = thickness
     model.setValues(description='STEP5_GMNIA '+json.dumps(info, ensure_ascii=True))
     return info
+
+
+PM_LOAD_PREFIX = 'PM_END_'
+PM_SET_PREFIX = 'PMN_'
+
+
+def pm_template_nodes(end_meshes, zmin, zmax):
+    """Every end node and end edge of the (unperturbed) end sections, for P-M nodal forces.
+    Step 4 keeps both end sections at their original coordinates."""
+    tol = max(1e-6, (zmax-zmin)*1e-8)
+    nodes, edges = [], []
+    for name, xyz, topology in end_meshes:
+        for side, suffix, z, sign in ((0, '0', zmin, 1.), (1, 'L', zmax, -1.)):
+            end = set(label for label, p in xyz.items() if abs(p[2]-z) <= tol)
+            for labels in topology:
+                for a, b in zip(labels, labels[1:]+labels[:1]):
+                    if a in end and b in end:
+                        edges.append([name, side, min(a, b), max(a, b)])
+            for label in sorted(end):
+                k = int(name[1:])
+                nodes.append(dict(load='%s%s_P%d_N%d' % (PM_LOAD_PREFIX, suffix, k, label),
+                                  set='%s%s_P%d_%d' % (PM_SET_PREFIX, suffix, k, label),
+                                  instance=name, label=int(label), side=side, sign=sign,
+                                  x=float(xyz[label][0]), y=float(xyz[label][1])))
+    unique = sorted(set(tuple(e) for e in edges))
+    return dict(nodes=nodes, edges=[list(e) for e in unique],
+                definition='one placeholder CF3 per end node; values are set per P-M ray in the INP')
+
+
+def create_pm_template_loads(model, template, step_name):
+    """One node set and one placeholder concentrated force (CF3 = 1 N) per end node."""
+    from abaqusConstants import UNIFORM, OFF
+    assembly = model.rootAssembly
+    for node in template['nodes']:
+        assembly.SetFromNodeLabels(name=node['set'], nodeLabels=((node['instance'], (node['label'],)),))
+        model.ConcentratedForce(name=node['load'], createStepName=step_name, region=assembly.sets[node['set']],
+                                cf3=1.0, distributionType=UNIFORM, follower=OFF)
 
 
 def bending_end_loads(model, pieces, thickness, zmin, zmax, load_case, reference_stress, expected_count, fy):
@@ -649,6 +750,7 @@ def bending_end_loads(model, pieces, thickness, zmin, zmax, load_case, reference
     tol = max(1e-6, (zmax-zmin)*1e-8)
     loads, expected, weights = [], set(), [[], []]
     moments, totals, magnitudes = [0., 0.], [0., 0.], [0., 0.]
+    secondary = [0., 0.]
     nx, ny = load_case['compression_normal']
     xc, yc = load_case['centroid_mm']
     m_unit = float(load_case['reference_moment_mesh_Nmm_per_MPa'])
@@ -670,6 +772,7 @@ def bending_end_loads(model, pieces, thickness, zmin, zmax, load_case, reference
             value = q[label]
             eta = nx*(xyz[label][0]-xc)+ny*(xyz[label][1]-yc)
             moments[side] += value*eta
+            secondary[side] += value*(ny*(xyz[label][0]-xc)-nx*(xyz[label][1]-yc))
             totals[side] += value
             magnitudes[side] += abs(value)
             if abs(value) <= 1e-12*q_max:
@@ -695,9 +798,13 @@ def bending_end_loads(model, pieces, thickness, zmin, zmax, load_case, reference
                              'the end nodes moved or the mesh changed' % (moments[side], m_unit))
         if abs(totals[side]) > 1e-6*magnitudes[side]:
             raise ValueError('Bending end forces carry a net axial force')
+        if abs(secondary[side]) > 1e-6*abs(moments[side]):
+            raise ValueError('Bending end forces carry a moment about the other axis')
     return loads, expected, dict(
         reference_moment_Nmm=m_unit*reference_stress,
         reference_moment_Nmm_per_MPa=m_unit,
+        net_axial_force_relative=max(abs(totals[i])/magnitudes[i] for i in (0, 1)),
+        secondary_moment_relative=max(abs(secondary[i])/abs(moments[i]) for i in (0, 1)),
         moment_formula='M = LPF*reference_moment_Nmm (no preload); LPF=1 is the extreme-fibre stress reference_stress',
         rotation_formula=('theta = sum_bottom k_i*U3_i + sum_top k_i*U3_i, k_i = F_i/M_ref (signed): work-conjugate '
                           'relative end rotation, + = compression fibre shortens'),
@@ -713,6 +820,8 @@ def bending_end_loads(model, pieces, thickness, zmin, zmax, load_case, reference
 def verify_input(path, bolts, bending=False):
     with open(path) as stream:
         text = stream.read().upper()
+    if re.search(r'^\*(?:COUPLING|KINEMATIC|CONTACT CONTROLS|CONTROLS)\b', text, re.M):
+        raise RuntimeError('STEP5 input differs from the reference end/support and solution policy')
     if bending and not re.search(r'^\*CLOAD\b', text, re.M):
         raise RuntimeError('Bending STEP5 input has no *CLOAD end forces')
     for pattern in (r'\*STEP[^\n]*NLGEOM=YES', r'\*STATIC[^\n]*RIKS', r'\*PLASTIC',
@@ -727,88 +836,163 @@ def verify_input(path, bolts, bending=False):
         raise RuntimeError('Missing connector sections')
 
 
-def build(args):
-    report('BUILD START', 'Loading Abaqus modules')
+METADATA_SUFFIX = '_step5.json'
+
+
+def write_metadata(path, info, subroutine_path=None):
+    """Sidecar copy of the model description: extraction never depends on a large CAE."""
+    if not path.endswith(METADATA_SUFFIX):
+        raise ValueError('STEP5 metadata must use the job sidecar suffix')
+    name = os.path.basename(path[:-len(METADATA_SUFFIX)])
+    input_path = path[:-len(METADATA_SUFFIX)]+'.inp'
+    info.update(job_name=name, input_sha256=pipeline_contract.file_sha256(input_path))
+    subroutine = (subroutine_path if subroutine_path is not None
+                  else os.path.join(os.path.dirname(path), STOP_SUBROUTINE_NAME))
+    if info.get('settings', {}).get('stop_method') == 'urdfil':
+        info['stop_subroutine_sha256'] = pipeline_contract.file_sha256(subroutine)
+    with open(path, 'w', encoding='utf-8') as stream:
+        json.dump(info, stream, ensure_ascii=True)
+
+
+def open_step4_database(args):
+    """Open the Step-4 CAE and resolve the selected sources (PERFECT token and/or STEP4_*)."""
     import caeModules
-    from abaqus import openMdb
-    from abaqusConstants import ON, PERCENTAGE, FULL, SINGLE
     if not os.path.isfile(args.source_cae):
         raise ValueError('Source CAE not found: '+args.source_cae)
     if os.path.exists(args.output_dir) and (not os.path.isdir(args.output_dir) or os.listdir(args.output_dir)):
         raise ValueError('Output directory must be new or empty: '+args.output_dir)
     report('OPEN CAE', args.source_cae)
-    database = openMdb(pathName=args.source_cae)
-    report('VALIDATE', 'Checking Step4 models and reference provenance')
-    imperfect = sorted(n for n in database.models.keys() if n.startswith('STEP4_'))
-    reference_candidates = [n for n in database.models.keys()
-        if not n.startswith('STEP4_') and STEP4_MANIFEST_MARKER in str(database.models[n].description or '')]
-    if len(reference_candidates) != 1:
-        raise ValueError('Expected exactly one untouched Step-4 reference model; found %d' %
-                         len(reference_candidates))
-    perfect_source = reference_candidates[0]
-    # Validate the untouched reference provenance before using it as PERFECT.
-    reference_step4_manifest(database.models[perfect_source])
+    database = pipeline_contract.open_working_mdb(args.source_cae)
+    try:
+        report('VALIDATE', 'Checking Step4 models and reference provenance')
+        imperfect = sorted(n for n in database.models.keys() if n.startswith('STEP4_'))
+        reference_candidates = [n for n in database.models.keys()
+            if not n.startswith('STEP4_') and STEP4_MANIFEST_MARKER in str(database.models[n].description or '')]
+        if len(reference_candidates) != 1:
+            raise ValueError('Expected exactly one untouched Step-4 reference model; found %d' %
+                             len(reference_candidates))
+        perfect_source = reference_candidates[0]
+        # Validate the untouched reference provenance before using it as PERFECT.
+        source_manifest = reference_step4_manifest(database.models[perfect_source])
+        if source_manifest['reference_pipeline'].get('steel_plates') and getattr(args, 'steel_plate_fy', None) is None:
+            raise ValueError('Steel plate models require --steel-plate-fy (MPa), separate from --fy')
 
-    selected = list(args.models) if args.models else [PERFECT_TOKEN] + imperfect
-    if not selected or len(set(selected)) != len(selected):
-        raise ValueError('Select distinct STEP4_* models and/or the PERFECT token')
-    for name in selected:
-        if name == PERFECT_TOKEN:
-            continue
-        if not name.startswith('STEP4_') or name not in database.models:
-            raise ValueError('STEP4 source model not found: '+name)
-    for name in list(database.jobs.keys()):
-        del database.jobs[name]
-    keep = set(n for n in selected if n != PERFECT_TOKEN)
-    if PERFECT_TOKEN in selected:
-        keep.add(perfect_source)
-    for name in list(database.models.keys()):
-        if name not in keep:
-            del database.models[name]
-    scratch = tempfile.mkdtemp(prefix='cfs_step5_')
+        selected = list(args.models) if args.models else [PERFECT_TOKEN] + imperfect
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError('Select distinct STEP4_* models and/or the PERFECT token')
+        for name in selected:
+            if name == PERFECT_TOKEN:
+                continue
+            if not name.startswith('STEP4_') or name not in database.models:
+                raise ValueError('STEP4 source model not found: '+name)
+        for name in list(database.jobs.keys()):
+            del database.jobs[name]
+        keep = set(n for n in selected if n != PERFECT_TOKEN)
+        if PERFECT_TOKEN in selected:
+            keep.add(perfect_source)
+        for name in list(database.models.keys()):
+            if name not in keep:
+                del database.models[name]
+        return database, selected, perfect_source
+    except BaseException:
+        database.close()
+        raise
+
+
+def copy_source_model(database, source_name, name, perfect_source):
+    """New model `name` copied from a STEP4_* model or, for the PERFECT token, from the untouched
+    reference with zero-imperfection Step-4 provenance."""
+    if source_name == PERFECT_TOKEN:
+        source_model = database.models[perfect_source]
+        model = database.Model(name=name, objectToCopy=source_model)
+        model.setValues(description=STEP4_PREFIX+json.dumps(
+            perfect_step4_payload(source_model), ensure_ascii=True))
+        return model
+    return database.Model(name=name, objectToCopy=database.models[source_name])
+
+
+def write_job_input(database, name, info, args, user_subroutine):
+    """Create the (never submitted) job, write and verify its INP in the current directory."""
+    from abaqusConstants import ON, PERCENTAGE, FULL, SINGLE
+    nodal_precision = str(info['reference_pipeline'].get('nodal_precision', 'full')).lower()
+    if nodal_precision not in ('full', 'single'):
+        raise ValueError('Unsupported inherited nodal precision: '+nodal_precision)
+    job = database.Job(
+        name=name, model=name, numCpus=args.cpus, numDomains=args.cpus,
+        memory=100, memoryUnits=PERCENTAGE, getMemoryFromAnalysis=False,
+        nodalOutputPrecision=FULL if nodal_precision == 'full' else SINGLE,
+        userSubroutine=user_subroutine if args.stop_method == 'urdfil' else '',
+        description='Build only; reference-compatible STEP5; '+(
+            info.get('force_formula') or info.get('moment_formula') or 'P-M template'))
+    report('WRITE INP', name)
+    job.writeInput(consistencyChecking=ON)
+    report('VERIFY INP', name)
+    inject_urdfil_trigger(name+'.inp')
+    verify_input(name+'.inp', len(info['bolts']),
+                 bending='reference_moment_Nmm' in info or 'pm_template' in info)
+    info.update(job_name=name, input_sha256=pipeline_contract.file_sha256(name+'.inp'),
+                solution_controls=dict(analysis='Abaqus defaults',
+                    equilibrium_tolerances='Abaqus defaults', stabilization=False))
+    return job
+
+
+def write_solver_environment(args):
+    with open('abaqus_v6.env', 'w') as stream:
+        stream.write('standard_parallel = ALL\ngpus = %d\ncpus = %d\nmemory = \"100%%\"\n' % (args.gpus, args.cpus))
+    with open(STOP_SUBROUTINE_NAME, 'w') as stream:
+        stream.write(render_postpeak_urdfil(args.postpeak_stop_ratio))
+    return ['abaqus_v6.env', STOP_SUBROUTINE_NAME]
+
+
+def deliver(scratch, output_dir, outputs):
+    os.makedirs(output_dir, exist_ok=True)
+    report('COPY OUTPUTS', output_dir)
+    for name in outputs:
+        destination = os.path.join(output_dir, name)
+        if os.path.exists(destination):
+            raise ValueError('Refusing to overwrite '+destination)
+    for name in outputs:
+        shutil.move(os.path.join(scratch, name), os.path.join(output_dir, name))
+
+
+def remove_scratch(scratch, prefix):
+    # Only remove this builder's newly-created temporary workspace.
+    if (os.path.commonpath([os.path.abspath(scratch), os.path.abspath(tempfile.gettempdir())])
+            == os.path.abspath(tempfile.gettempdir()) and os.path.basename(scratch).startswith(prefix)):
+        shutil.rmtree(scratch)
+
+
+def build(args):
+    report('BUILD START', 'Loading Abaqus modules')
+    database, selected, perfect_source = open_step4_database(args)
+    try:
+        scratch = tempfile.mkdtemp(prefix='cfs_step5_')
+    except BaseException:
+        database.close()
+        raise
     previous = os.getcwd()
-    outputs = []
     job_names = []
     tag = ('%g' % args.fy).replace('.', 'p').replace('+', '')
     final_user_subroutine = os.path.join(args.output_dir, STOP_SUBROUTINE_NAME)
     try:
         os.chdir(scratch)
-        with open(STOP_SUBROUTINE_NAME, 'w') as stream:
-            stream.write(render_postpeak_urdfil(args.postpeak_stop_ratio))
-        outputs.append(STOP_SUBROUTINE_NAME)
-        with open('abaqus_v6.env','w') as stream:
-            stream.write('standard_parallel = ALL\ngpus = %d\ncpus = %d\nmemory = \"100%%\"\n' % (args.gpus,args.cpus))
-        outputs.append('abaqus_v6.env')
+        deliver(scratch, args.output_dir, write_solver_environment(args))
 
         for i, source_name in enumerate(selected, 1):
             report('BUILD %d/%d' % (i, len(selected)), 'Copying source model '+source_name)
             if source_name == PERFECT_TOKEN:
                 name = 'STEP5_PERFECT_FY'+tag
-                source_model = database.models[perfect_source]
-                model = database.Model(name=name, objectToCopy=source_model)
-                model.setValues(description=STEP4_PREFIX+json.dumps(
-                    perfect_step4_payload(source_model), ensure_ascii=True))
             else:
                 name = 'STEP5_'+source_name[len('STEP4_'):]+'_FY'+tag
-                model = database.Model(name=name, objectToCopy=database.models[source_name])
+            model = copy_source_model(database, source_name, name, perfect_source)
             report('PREPARE', name+' | materials, connectors, Riks step and outputs')
             info = prepare_model(model, args)
-            nodal_precision = str(info['reference_pipeline'].get('nodal_precision', 'full')).lower()
-            if nodal_precision not in ('full', 'single'):
-                raise ValueError('Unsupported inherited nodal precision: '+nodal_precision)
-            job = database.Job(
-                name=name, model=name, numCpus=args.cpus, numDomains=args.cpus,
-                memory=100, memoryUnits=PERCENTAGE, getMemoryFromAnalysis=False,
-                nodalOutputPrecision=FULL if nodal_precision == 'full' else SINGLE,
-                userSubroutine=final_user_subroutine if args.stop_method == 'urdfil' else '',
-                description='Build only; reference-compatible STEP5; '+(info.get('force_formula') or info['moment_formula']))
-            report('WRITE INP', name)
-            job.writeInput(consistencyChecking=ON)
-            report('VERIFY INP', name)
-            inject_urdfil_trigger(name+'.inp')
-            verify_input(name+'.inp', len(info['bolts']), bending='reference_moment_Nmm' in info)
-            outputs.append(name+'.inp')
+            write_job_input(database, name, info, args, final_user_subroutine)
+            write_metadata(name+METADATA_SUFFIX, info, subroutine_path=final_user_subroutine)
+            deliver(scratch, args.output_dir, [name+'.inp', name+METADATA_SUFFIX])
             job_names.append(name)
+            report('CASE READY %d/%d' % (i, len(selected)),
+                   name+' | verified INP and metadata delivered to '+args.output_dir)
             if 'reference_moment_Nmm' in info:
                 print('INP verified: %d bolts; bending axis %g deg; M_ref=%g N mm (LPF=1); postpeak stop=%g%% Mu' %
                       (len(info['bolts']), info['bending_axis_deg'], info['reference_moment_Nmm'],
@@ -823,37 +1007,50 @@ def build(args):
             if not source_name.startswith('STEP5_'):
                 del database.models[source_name]
 
-        ratio_tag = ('%g' % (100.*args.postpeak_stop_ratio)).replace('.', 'p')
-        queue_name = 'run_step5_queue_'+ratio_tag+'_pct.bat'
-        report('WRITE BAT', queue_name)
-        write_queue_batch(queue_name, job_names, 'auto', ratio=args.postpeak_stop_ratio, stop_method=args.stop_method)
-        outputs.append(queue_name)
-
         cae_name = 'Step5_GMNIA_FY'+tag+'.cae'
         report('SAVE CAE', cae_name)
         database.saveAs(pathName=os.path.join(scratch, cae_name))
         database.close()
-        outputs.append(cae_name)
-        os.makedirs(args.output_dir, exist_ok=True)
-        report('COPY OUTPUTS', args.output_dir)
-        for name in outputs:
-            destination = os.path.join(args.output_dir, name)
-            if os.path.exists(destination):
-                raise ValueError('Refusing to overwrite '+destination)
-            shutil.move(os.path.join(scratch, name), destination)
+        database = None
+        deliver(scratch, args.output_dir, [cae_name])
+
+        # Publish a runnable queue only after every case and the final CAE are delivered.
+        ratio_tag = ('%g' % (100.*args.postpeak_stop_ratio)).replace('.', 'p')
+        queue_name = 'run_step5_queue_'+ratio_tag+'_pct.bat'
+        report('WRITE BAT', queue_name)
+        write_queue_batch(queue_name, job_names, args.cpus_requested, ratio=args.postpeak_stop_ratio,
+                          stop_method=args.stop_method, gpus=args.gpus_requested)
+        deliver(scratch, args.output_dir, [queue_name])
         print('SAVED: %s; one CAE + %d INP files + URDFIL + sequential queue. NO ANALYSIS SUBMITTED.' %
               (args.output_dir, len(selected)))
     except Exception:
-        print('BUILD FAILED. Diagnostic intermediate files: '+scratch)
+        print('BUILD FAILED. Already delivered files are preserved in: '+args.output_dir+
+              '. Diagnostic intermediate files: '+scratch)
         raise
     else:
-        # Only remove this builder's newly-created temporary workspace.
-        if (os.path.commonpath([os.path.abspath(scratch), os.path.abspath(tempfile.gettempdir())])
-                == os.path.abspath(tempfile.gettempdir()) and os.path.basename(scratch).startswith('cfs_step5_')):
-            os.chdir(previous)
-            shutil.rmtree(scratch)
+        os.chdir(previous)
+        remove_scratch(scratch, 'cfs_step5_')
     finally:
         os.chdir(previous)
+        if database is not None:
+            database.close()
+
+
+def create_riks_step(model, assembly, args):
+    """Keep the original Riks procedure; optionally change only its initial predictor."""
+    from abaqusConstants import ON, OFF
+    stop = args.max_end_displacement_mm
+    options = dict(name='GMNIA', previous='Initial', nlgeom=ON,
+                   maxNumInc=args.max_increments, initialArcInc=args.initial_arc,
+                   minArcInc=args.min_arc, maxArcInc=args.max_arc, totalArcLength=1.,
+                   nodeOn=OFF if stop is None else ON)
+    if stop is not None:
+        options.update(region=assembly.sets['STEP5_STOP'], dof=3, maximumDisplacement=stop)
+    if getattr(args, 'riks_extrapolation', 'linear') == 'none':
+        from abaqusConstants import NONE
+        options['extrapolation'] = NONE
+    # totalArcLength scales the arc-length formulation; it is not an end condition.
+    model.StaticRiksStep(**options)
 
 
 if __name__ == '__main__':

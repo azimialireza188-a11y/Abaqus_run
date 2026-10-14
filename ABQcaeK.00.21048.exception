@@ -1,0 +1,37 @@
+<Description>
+   ABQcaeK.exe / rank 0 / thread 0  encountered a system exception 0xC0000005 (EXCEPTION_ACCESS_VIOLATION)
+</Description>
+
+<Context>
+   CAE
+</Context>
+
+<Callstack>
+</Callstack>
+
+<Memory>
+   <Current>           17 GB </Current>
+   <Resident>          10 GB </Resident>
+   <Physical>          15 GB </Physical>
+   <Limit>              0 GB </Limit>
+   <Accessible>        15 GB </Accessible>
+   <Available>          0 GB </Available>
+   <Allocator>            DL </Allocator>
+</Memory>
+
+<Swap>
+       <Size>          28 GB </Size>
+       <Used>          28 GB </Used>
+       <Free>           0 GB </Free>
+</Swap>
+
+<Directories>
+  <current> D:\Abaqus_run                  </current> <free>     83 GB </free>   <used>    301 GB </used> 
+     <temp> C:\Users\Sazgar\AppData\Local\Temp </temp>    <free>      0 GB </free>
+</Directories>
+
+<Installation>
+     <Version> 2024 6.24-1 </Version>
+       <Build> 2023_09_21-16.25.25 RELr426 190762 </Build>
+</Installation>
+

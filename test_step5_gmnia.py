@@ -1,8 +1,70 @@
 import ast
 import contextlib
 import io
+import os
+import sys
 import unittest
+sys.path.insert(0, os.path.dirname(os.path.abspath(
+    globals().get('__file__', sys._getframe().f_code.co_filename))))
 import abaqus_step5_gmnia as step5
+
+
+class SteelPlateTests(unittest.TestCase):
+    def test_plate_yield_is_required_and_independent_of_member_curve(self):
+        from types import SimpleNamespace as NS
+        tables = []
+        material = NS(elastic=NS(table=((200000., .3),)), Plastic=lambda **kw: tables.append(kw['table']))
+        model = NS(materials={'SteelPlate': material})
+        reference = {'steel_plates': {'material': 'SteelPlate'}}
+        with self.assertRaisesRegex(ValueError, 'steel-plate-fy'):
+            step5.apply_plate_plasticity(model, reference, NS(steel_plate_fy=None))
+        result = step5.apply_plate_plasticity(model, reference, NS(steel_plate_fy=355., fy=240.))
+        self.assertEqual(tables, [((355., 0.),)])
+        self.assertEqual(result, {'SteelPlate': [[355., 0.]]})
+        self.assertEqual(step5.apply_plate_plasticity(model, {}, NS()), {})
+
+
+@contextlib.contextmanager
+def _incremental_builder(directory, on_prepare=None, on_queue=None, stop_method='monitor'):
+    """Exercise file delivery with tiny stand-ins; no CAE import or solver."""
+    from pathlib import Path
+    from types import SimpleNamespace as NS
+    from unittest import mock
+    import tempfile
+    real_mkdtemp = tempfile.mkdtemp
+    output = Path(directory) / 'output'
+    sources = ['STEP4_first', 'STEP4_second']
+    database = NS(models={name: NS(name=name) for name in sources}, closed=False)
+    def save_as(pathName):
+        Path(pathName).write_bytes(b'fake final CAE')
+    def close():
+        database.closed = True
+    database.saveAs, database.close = save_as, close
+    args = NS(fy=240., output_dir=str(output), cpus=2, gpus=0, cpus_requested='auto',
+              gpus_requested='auto', postpeak_stop_ratio=.7, stop_method=stop_method)
+    def copy_model(db, source, name, perfect):
+        model = NS(name=name)
+        db.models[name] = model
+        return model
+    def prepare(model, unused):
+        if on_prepare:
+            on_prepare(model, output)
+        return dict(bolts=[], reference_force_N_per_end=100., settings=dict(stop_method=stop_method))
+    def write_input(db, name, info, unused, subroutine):
+        Path(name+'.inp').write_text('*Heading\n'+name+'\n', encoding='ascii')
+    real_queue = step5.write_queue_batch
+    def queue(*a, **kw):
+        if on_queue:
+            on_queue(database, output)
+        return real_queue(*a, **kw)
+    with mock.patch.multiple(step5,
+            open_step4_database=lambda unused: (database, sources, 'perfect'),
+            copy_source_model=copy_model, prepare_model=prepare,
+            write_job_input=write_input, write_queue_batch=queue), \
+            mock.patch.object(step5.tempfile, 'mkdtemp',
+                side_effect=lambda **kw: real_mkdtemp(dir=directory, **kw)), \
+            contextlib.redirect_stdout(io.StringIO()):
+        yield args, database, output
 
 
 def _fake_bending_mesh(nz=4, length=100.):
@@ -56,64 +118,181 @@ class _FakeModel(object):
                 self.sets = {}
                 self.instances = instances
 
-            def Set(self, name, nodes=None, edges=None):
-                self.sets[name] = NS(nodes=list(nodes or []), name=name)
+                self.referencePoints = {}
+
+            def Set(self, name, nodes=None, edges=None, referencePoints=None):
+                self.sets[name] = NS(nodes=list(nodes or []), name=name,
+                                     referencePoints=list(referencePoints or []))
                 return self.sets[name]
+
+            def ReferencePoint(self, point):
+                feature = NS(id=len(self.referencePoints)+1)
+                self.referencePoints[feature.id] = NS(point=tuple(point))
+                return feature
         self.rootAssembly = Assembly()
 
     def ConcentratedForce(self, name, createStepName, region, cf3, distributionType=None, follower=None):
         from types import SimpleNamespace as NS
-        self.loads[name] = NS(region=(region.name,), cf3=cf3, step=createStepName)
+        self.loads[name] = NS(region=(region.name,), cf3=cf3, step=createStepName, follower=follower)
+
+    def Moment(self, name, createStepName, region, cm1, cm2, distributionType=None, follower=None):
+        from types import SimpleNamespace as NS
+        self.loads[name] = NS(region=(region.name,), cm1=cm1, cm2=cm2, step=createStepName, follower=follower)
 
 
 class Step5Tests(unittest.TestCase):
+    def test_each_verified_case_is_delivered_before_next_case_is_prepared(self):
+        import json, tempfile
+        for method in ('monitor', 'urdfil'):
+            with self.subTest(stop_method=method), tempfile.TemporaryDirectory() as directory:
+                def before_prepare(model, output):
+                    self.assertTrue((output/'abaqus_v6.env').is_file())
+                    self.assertTrue((output/step5.STOP_SUBROUTINE_NAME).is_file())
+                    self.assertFalse((output/'run_step5_queue_70_pct.bat').exists())
+                    if model.name == 'STEP5_second_FY240':
+                        name = 'STEP5_first_FY240'
+                        self.assertTrue((output/(name+'.inp')).is_file())
+                        info = json.loads((output/(name+step5.METADATA_SUFFIX)).read_text())
+                        self.assertEqual(info['input_sha256'],
+                            step5.pipeline_contract.file_sha256(str(output/(name+'.inp'))))
+                        if method == 'urdfil':
+                            self.assertEqual(info['stop_subroutine_sha256'],
+                                step5.pipeline_contract.file_sha256(str(output/step5.STOP_SUBROUTINE_NAME)))
+                with _incremental_builder(directory, on_prepare=before_prepare, stop_method=method) as (args, db, output):
+                    step5.build(args)
+                self.assertEqual(len(list(output.iterdir())), 8)
+                self.assertTrue((output/'run_step5_queue_70_pct.bat').is_file())
+                self.assertTrue((output/'Step5_GMNIA_FY240.cae').is_file())
+
+    def test_failed_later_case_preserves_delivered_cases_without_a_queue(self):
+        import os, tempfile
+        previous = os.getcwd()
+        def fail_second(model, output):
+            if model.name == 'STEP5_second_FY240':
+                raise RuntimeError('second-case failure')
+        with tempfile.TemporaryDirectory() as directory:
+            with _incremental_builder(directory, on_prepare=fail_second) as (args, db, output):
+                with self.assertRaisesRegex(RuntimeError, 'second-case failure'):
+                    step5.build(args)
+                self.assertTrue(db.closed)
+            self.assertEqual(os.getcwd(), previous)
+            self.assertTrue((output/'STEP5_first_FY240.inp').is_file())
+            self.assertTrue((output/'STEP5_first_FY240_step5.json').is_file())
+            self.assertFalse((output/'STEP5_second_FY240.inp').exists())
+            self.assertFalse((output/'run_step5_queue_70_pct.bat').exists())
+            self.assertFalse((output/'Step5_GMNIA_FY240.cae').exists())
+
+    def test_queue_is_written_only_after_final_cae_and_all_cases_are_delivered(self):
+        import tempfile
+        def before_queue(db, output):
+            self.assertTrue(db.closed)
+            self.assertTrue((output/'Step5_GMNIA_FY240.cae').is_file())
+            for case in ('first', 'second'):
+                name = 'STEP5_'+case+'_FY240'
+                self.assertTrue((output/(name+'.inp')).is_file())
+                self.assertTrue((output/(name+step5.METADATA_SUFFIX)).is_file())
+        with tempfile.TemporaryDirectory() as directory:
+            with _incremental_builder(directory, on_queue=before_queue) as (args, db, output):
+                step5.build(args)
+
     def test_compression_load_preserves_the_reference_force_in_nlgeom(self):
         """The LPF force formula requires dead loading per original edge length."""
-        import json
-        from types import SimpleNamespace as NS
-        from unittest import mock
-        instances, unused, unused2 = _fake_bending_mesh()
-        model = _FakeModel(instances)
-        assembly = model.rootAssembly
-        assembly.surfaces = {}
-        for name, inst in instances.items():
-            inst.partName = name
-            for element in inst.elements:
-                element.type = 'S4R'
-            for suffix in ('0', 'L'):
-                end = 'END_%s_%s' % (suffix, name)
-                assembly.sets[end] = NS(edges=[NS(getSize=lambda **kw: 200.)])
-                assembly.surfaces[end+'_S'] = NS(name=end+'_S')
-                model.loads['COMP_'+end] = NS(region=(end+'_S',))
-        model.parts = {name: NS(sectionAssignments=[NS(sectionName='shell')]) for name in instances}
-        model.sections = {'shell': NS(thickness=2., numIntPts=5, material='steel')}
-        model.materials = {'steel': NS(elastic=NS(table=((200000., .3),)), Plastic=mock.Mock())}
-        model.boundaryConditions = {str(i): object() for i in range(9)}
-        model.constraints = {'BOLT_1': object()}
-        model.interactions = {'GeneralContact': object()}
-        model.interactionProperties = {'Hard_Frictionless': object()}
-        model.steps = {'Initial': object(), 'Buckle': object()}
-        model.fieldOutputRequests = {}; model.historyOutputRequests = {}
-        reference = dict(instances=list(instances), element_type='S4R', boundary_conditions=9,
-                         loads=8, rigid_links=1, expected_links=1, connection_model='BEAM_MPC')
-        counts = {key: len(getattr(model, key)) for key in
-                  ('boundaryConditions', 'constraints', 'interactions', 'loads', 'materials', 'sections')}
-        model.description = step5.STEP4_PREFIX+json.dumps(dict(current_case={}, specification=dict(
-            stage=4, reference_pipeline=reference, source_repository_counts=counts)))
-        assembly.SetFromNodeLabels = lambda name, **kw: assembly.sets.update({name: object()})
-        model.StaticRiksStep = mock.Mock()
-        model.ShellEdgeLoad = mock.Mock(side_effect=StopIteration('load boundary reached'))
-        args = step5.parse_arguments(['--source-cae', 'source.cae', '--output-dir', 'out', '--fy', '240'])
-        constants = NS(ON=True, OFF=False, UNIFORM='UNIFORM', GENERAL='GENERAL')
-        with mock.patch.dict('sys.modules', {'abaqusConstants': constants}), \
-                mock.patch.object(step5, 'replace_bolts', return_value={}), \
-                contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(StopIteration, 'load boundary'):
-                step5.prepare_model(model, args)
-        applied = model.ShellEdgeLoad.call_args.kwargs
-        self.assertTrue(applied['resultant'])
-        self.assertFalse(applied['follower'])
-        self.assertEqual(applied['magnitude'], 480.)
+        for pm_template,stop in ((False,None),(False,2.5),(True,None),(True,2.5)):
+            import json
+            from types import SimpleNamespace as NS
+            from unittest import mock
+            instances, unused, unused2 = _fake_bending_mesh()
+            model = _FakeModel(instances)
+            assembly = model.rootAssembly
+            assembly.sets['STEP5_BOLTS'] = NS(name='STEP5_BOLTS')
+            assembly.surfaces = {}
+            for name, inst in instances.items():
+                inst.partName = name
+                for element in inst.elements:
+                    element.type = 'S4R'
+                for suffix in ('0', 'L'):
+                    end = 'END_%s_%s' % (suffix, name)
+                    assembly.sets[end] = NS(edges=[NS(getSize=lambda **kw: 200.)])
+                    assembly.surfaces[end+'_S'] = NS(name=end+'_S')
+                    model.loads['COMP_'+end] = NS(region=(end+'_S',))
+            model.parts = {name: NS(sectionAssignments=[NS(sectionName='shell')]) for name in instances}
+            model.sections = {'shell': NS(thickness=2., numIntPts=5, material='steel')}
+            model.materials = {'steel': NS(elastic=NS(table=((200000., .3),)), Plastic=mock.Mock())}
+            model.boundaryConditions = {'AXIAL_FIX': mock.Mock()}
+            for name in instances:
+                for suffix in ('0', 'L'):
+                    model.boundaryConditions['SS_END_%s_%s' % (suffix, name)] = mock.Mock()
+            model.constraints = {'BOLT_1': object()}
+            model.interactions = {'GeneralContact': object()}
+            model.interactionProperties = {'Hard_Frictionless': object()}
+            model.steps = {'Initial': object(), 'Buckle': object()}
+            model.fieldOutputRequests = {}; model.historyOutputRequests = {}
+            reference = dict(instances=list(instances), element_type='S4R', boundary_conditions=9,
+                             loads=8, rigid_links=1, expected_links=1, connection_model='BEAM_MPC',
+                             shell_contact='GENERAL_STANDARD_HARD_FRICTIONLESS')
+            counts = {key: len(getattr(model, key)) for key in
+                      ('boundaryConditions', 'constraints', 'interactions', 'loads', 'materials', 'sections')}
+            model.description = step5.STEP4_PREFIX+json.dumps(dict(current_case={}, specification=dict(
+                stage=4, reference_pipeline=reference, source_repository_counts=counts)))
+            assembly.SetFromNodeLabels = lambda name, **kw: assembly.sets.update({name: NS(name=name)})
+            assembly.SetFromElementLabels = lambda name, **kw: assembly.sets.update({name: NS(name=name)})
+            model.FieldOutputRequest = mock.Mock()
+            model.HistoryOutputRequest = mock.Mock()
+            model.setValues = mock.Mock()
+            model.StaticRiksStep = mock.Mock()
+            model.ShellEdgeLoad = mock.Mock()
+            model.Coupling = mock.Mock()
+            model.DisplacementBC = mock.Mock()
+            args = step5.parse_arguments(['--source-cae', 'source.cae', '--output-dir', 'out', '--fy', '240'])
+            args.max_end_displacement_mm = stop
+            constants = NS(ON=True, OFF=False, UNIFORM='UNIFORM', GENERAL='GENERAL', KINEMATIC='KINEMATIC',
+                           WHOLE_SURFACE='WHOLE_SURFACE', SET='SET', UNSET='UNSET')
+            with mock.patch.dict('sys.modules', {'abaqusConstants': constants}), \
+                    mock.patch.object(step5, 'replace_bolts', return_value={}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                info = step5.prepare_model(model, args, pm_template=pm_template)
+            # Reference procedure: keep the inherited nodal supports and free end warping.
+            for name, bc in model.boundaryConditions.items():
+                bc.setValues.assert_not_called()
+            model.Coupling.assert_not_called()
+            model.DisplacementBC.assert_not_called()
+            self.assertFalse(assembly.referencePoints)
+            self.assertEqual(info['end_condition']['id'], step5.pipeline_contract.STEP5_END_CONDITION_ID)
+            if not pm_template:
+                p = info['reference_force_N_per_end']
+                self.assertAlmostEqual(p, 240.*info['end_area_mm2'])
+                self.assertEqual(model.ShellEdgeLoad.call_count, 8)
+                for call in model.ShellEdgeLoad.call_args_list:
+                    kw = call.kwargs
+                    self.assertEqual(kw['magnitude'], 480.)  # thickness 2 mm * 240 MPa
+                    self.assertTrue(kw['resultant'])
+                    self.assertFalse(kw['follower'])
+                    sign = 1. if 'END_0_' in kw['name'] else -1.
+                    self.assertEqual(kw['directionVector'], ((0., 0., 0.), (0., 0., sign)))
+            else:
+                model.ShellEdgeLoad.assert_not_called()
+                self.assertTrue(info['pm_template']['nodes'])
+                self.assertNotIn('end_plates', info['pm_template'])
+                self.assertEqual(set(model.loads), {n['load'] for n in info['pm_template']['nodes']})
+                self.assertTrue(all(load.cf3 == 1. and not load.follower for load in model.loads.values()))
+            self.assertEqual(info['stop_positive_U3_mm'], stop)
+            self.assertEqual(info['settings']['max_end_displacement_mm'], stop)
+            self.assertEqual(info['postpeak_stop']['ratio'], .70)
+            self.assertEqual(info['plastic_tables']['steel'], [[240.,0.]])
+            options=model.StaticRiksStep.call_args.kwargs
+            self.assertEqual(options['nodeOn'], stop is not None)
+            self.assertEqual(options.get('maximumDisplacement'), stop)
+            self.assertEqual(options['initialArcInc'], args.initial_arc)
+            self.assertEqual(options['minArcInc'], args.min_arc)
+            self.assertEqual(options['maxArcInc'], args.max_arc)
+            self.assertEqual(options['maxNumInc'], args.max_increments)
+            self.assertTrue(options['nlgeom'])
+            if stop is not None:
+                self.assertEqual(options['dof'],3)
+                self.assertIs(options['region'],assembly.sets['STEP5_STOP'])
+            model.setValues.assert_called_once()
+            self.assertEqual(json.loads(model.setValues.call_args.kwargs['description'][len('STEP5_GMNIA '):])['stop_positive_U3_mm'],stop)
+
 
     def test_nogui_without_file_resolves_queue_path_before_chdir(self):
         import os
@@ -133,6 +312,35 @@ class Step5Tests(unittest.TestCase):
                 self.assertIn(os.path.join(namespace['SCRIPT_DIR'], 'abaqus_step5_queue_nogui.py'), text)
             finally:
                 os.chdir(previous)
+
+    def test_cpus_space_form_reaches_jobs_env_and_queue_batch(self):
+        import os
+        import tempfile
+        from unittest import mock
+        import runtime_resources
+        base = ['--source-cae', 'source.cae', '--output-dir', 'out', '--fy', '240']
+        inventory = runtime_resources.ResourceInventory(16, 8, 1, 1, [])
+        with mock.patch.object(runtime_resources, 'detect_resources', return_value=inventory):
+            args = step5.parse_arguments(base+['--cpus', '4', '--initial-arc', '0.01', '--min-arc', '1e-8',
+                                               '--max-arc', '0.05', '--max-increments', '5000',
+                                               '--field-frequency', '1', '--postpeak-stop-ratio', '0.70'])
+            self.assertEqual((args.cpus, args.cpus_requested), (4, 4))
+            auto = step5.parse_arguments(base)
+            self.assertEqual((auto.cpus, auto.cpus_requested), (8, 'auto'))
+            for bad in ('0', 'four'):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    step5.parse_arguments(base+['--cpus', bad])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'q.bat')
+            step5.write_queue_batch(path, ['STEP5_PERFECT_FY240', 'STEP5_LDG_pp_FY240'], args.cpus_requested,
+                                    ratio=args.postpeak_stop_ratio, gpus=args.gpus_requested)
+            with open(path) as stream:
+                text = stream.read()
+            self.assertIn(' --cpus 4 --gpus auto --ratio 0.7 ', text)
+            self.assertNotRegex(text, r'--[a-z-]+=')            # the Abaqus launcher rejects --name=value
+            self.assertTrue(all(line.strip() for line in text.split('\n')[:-1]))   # no blank line inside
+            with self.assertRaises(Exception):
+                step5.write_queue_batch(path, ['STEP5_D_FY240'], 0)
 
     def test_fy_is_required_and_arc_limits_are_consistent(self):
         base = ['--source-cae', 'source.cae', '--output-dir', 'out']
@@ -155,6 +363,7 @@ class Step5Tests(unittest.TestCase):
             step5.parse_arguments(base+['--postpeak-stop-ratio', '0'])
 
     def test_urdfil_tracks_peak_and_stops_at_ratio(self):
+        import os, tempfile
         source = step5.render_postpeak_urdfil(0.70)
         self.assertIn('SUBROUTINE URDFIL', source)
         self.assertIn('CALL POSFIL(KSTEP,KINC,ARRAY,JRCD)', source)
@@ -164,6 +373,14 @@ class Step5Tests(unittest.TestCase):
         self.assertIn('CURRLPF.LE.RATIO*PEAKLPF', source)
         self.assertIn('LSTOP=1', source)
         self.assertIn('RATIO=0.7D0', source)
+        self.assertIn('RATIO=1D-07', step5.render_postpeak_urdfil(1e-7))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'queue.bat')
+            step5.write_queue_batch(path, ['STEP5_TEST'], ratio=.701234567, stop_method='urdfil')
+            with open(path) as stream:
+                import re
+                value = re.search(r'--ratio (\S+)', stream.read()).group(1)
+            self.assertEqual(float(value), .701234567)
 
     def test_perfect_reference_is_a_default_step5_case(self):
         with open(step5.__file__, encoding='utf-8') as stream:
@@ -188,6 +405,40 @@ class Step5Tests(unittest.TestCase):
             self.assertLess(text.index('*NODE FILE'), text.index('*END STEP'))
         finally:
             os.remove(path)
+
+    def test_written_input_preserves_reference_solution_defaults(self):
+        import os, tempfile
+        from pathlib import Path
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        from test_pm_interaction import fake_template, cae_like_inp
+        template, unused = fake_template()
+        base = cae_like_inp(template)
+        base = base[:base.index('** STEP5 URDFIL trigger')]+'*End Step\n'
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.getcwd()
+            try:
+                os.chdir(directory)
+                def write_input(**kw):
+                    Path('TEST.inp').write_text(base)
+                database = NS(Job=lambda **kw: NS(writeInput=write_input))
+                constants = NS(ON=True, PERCENTAGE='PERCENTAGE', FULL='FULL', SINGLE='SINGLE')
+                info = dict(reference_pipeline={}, bolts={'BOLT_1': {}}, pm_template=template)
+                args = NS(cpus=12, stop_method='monitor')
+                with mock.patch.dict('sys.modules', {'abaqusConstants': constants}):
+                    step5.write_job_input(database, 'TEST', info, args, '')
+                text = Path('TEST.inp').read_text()
+                self.assertNotRegex(text.upper(), r'^\*(?:CONTACT CONTROLS|CONTROLS|COUPLING|KINEMATIC)\b')
+                self.assertNotIn('*Contact Controls', text)
+                self.assertNotIn('*Controls', text)
+                self.assertIn('*NODE FILE, NSET=STEP5_STOP, FREQUENCY=1', text)
+                self.assertEqual(info['input_sha256'], step5.pipeline_contract.file_sha256('TEST.inp'))
+                for extra in ('*Coupling, constraint name=STALE\n', '*Controls, analysis=DISCONTINUOUS\n'):
+                    Path('TEST.inp').write_text(text.replace('*End Step', extra+'*End Step'))
+                    with self.assertRaisesRegex(RuntimeError, 'reference'):
+                        step5.verify_input('TEST.inp', 1, bending=True)
+            finally:
+                os.chdir(previous)
 
     def test_step5_requires_pipeline_compatible_step4_provenance(self):
         with open(step5.__file__, encoding='utf-8') as stream:
@@ -290,7 +541,7 @@ class Step5Tests(unittest.TestCase):
                        [tuple(n.label for n in e.getNodes()) for e in inst.elements])
                       for name, inst in sorted(instances.items())]
             loads, expected, info = step5.bending_end_loads(model, pieces, 2.0, 0., 100.,
-                                                            snap, 240., len(model.loads), 240.)
+                                                                   snap, 240., len(model.loads), 240.)
             self.assertEqual(expected, set(model.loads))
             for name, node_set, force in loads:
                 self.assertAlmostEqual(force, 240.*model.loads[name].cf3, places=9)
@@ -317,5 +568,52 @@ class Step5Tests(unittest.TestCase):
                                     definition, 240., 1, 240.)
 
 
+@unittest.skipUnless(os.environ.get('CFS_REFERENCE_STEP4_CAE'), 'optional build-only Abaqus check')
+class ReferenceCaeIntegrationTests(unittest.TestCase):
+    def test_perfect_and_imperfect_bending_inputs_preserve_reference_ends_and_plate_mesh(self):
+        import json, tempfile
+        from pathlib import Path
+        from abaqus import openMdb
+        source = os.environ['CFS_REFERENCE_STEP4_CAE']
+        original_hash = step5.pipeline_contract.file_sha256(source)
+        original_mtime = os.stat(source).st_mtime_ns
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(step5.__file__)) as directory:
+            output = Path(directory)/'step5'
+            args = step5.parse_arguments(['--source-cae', source, '--output-dir', str(output),
+                '--fy', '240', '--steel-plate-fy', '240', '--models', 'PERFECT', 'STEP4_LG_mp'])
+            step5.build(args)  # Build only; the builder has no solver submission path.
+            names = ['STEP5_PERFECT_FY240', 'STEP5_LG_mp_FY240']
+            for name in names:
+                info = json.loads((output/(name+step5.METADATA_SUFFIX)).read_text())
+                self.assertEqual(info['end_condition']['id'], 'reference_nodal_ends_v1')
+                self.assertEqual(info['plastic_tables']['SteelPlate'], [[240., 0.]])
+                self.assertEqual(info['input_sha256'], step5.pipeline_contract.file_sha256(str(output/(name+'.inp'))))
+                text = (output/(name+'.inp')).read_text().upper()
+                self.assertNotIn('*COUPLING', text)
+                self.assertNotIn('*CONTACT CONTROLS', text)
+                self.assertNotIn('*CONTROLS', text)
+                self.assertNotIn('*DSLOAD', text)
+                self.assertIn('*CLOAD', text)
+            self.assertFalse(list(output.glob('*.odb')))
+            self.assertEqual(step5.pipeline_contract.file_sha256(source), original_hash)
+            self.assertEqual(os.stat(source).st_mtime_ns, original_mtime)
+            database = openMdb(pathName=str(output/'Step5_GMNIA_FY240.cae'))
+            try:
+                for name in names:
+                    model = database.models[name]
+                    self.assertEqual(len(model.boundaryConditions), 9)
+                    self.assertFalse(model.rootAssembly.referencePoints)
+                    self.assertEqual(len(model.constraints), 0)
+                    self.assertEqual(len(model.loads), len(info['end_rotation_weights'][0])+len(info['end_rotation_weights'][1]))
+            finally:
+                database.close()
+
+
 if __name__ == '__main__':
-    unittest.main()
+    if os.environ.get('CFS_REFERENCE_STEP4_CAE'):
+        result = unittest.TextTestRunner(verbosity=2).run(
+            unittest.TestLoader().loadTestsFromTestCase(ReferenceCaeIntegrationTests))
+        if not result.wasSuccessful():
+            raise RuntimeError('Reference Step5 build-only integration check failed')
+    else:
+        unittest.main()

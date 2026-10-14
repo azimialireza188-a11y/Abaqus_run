@@ -6,6 +6,60 @@ import unittest
 import abaqus_pipeline_contract as contract
 
 
+class WorkingCaeTests(unittest.TestCase):
+    def test_locked_source_is_not_staged_or_opened(self):
+        from pathlib import Path
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)/'reference.cae'
+            source.write_bytes(b'unchanged source')
+            source.with_suffix('.lck').write_text('active kernel')
+            opener = mock.Mock()
+            with mock.patch.dict('sys.modules', {'abaqus': NS(openMdb=opener)}):
+                with self.assertRaisesRegex(ValueError, 'locked'):
+                    contract.open_working_mdb(str(source), folder)
+            opener.assert_not_called()
+            self.assertEqual(len(list(Path(folder).iterdir())), 2)
+
+    def test_kernel_update_targets_temporary_cae_and_preserves_original(self):
+        from pathlib import Path
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)/'reference.cae'
+            source.write_bytes(b'unchanged source')
+            staged = []
+            def open_database(pathName):
+                path = Path(pathName)
+                staged.append(path)
+                path.write_bytes(b'kernel writes even without explicit save')
+                return NS(models={'reference': object()}, close=lambda: None,
+                          saveAs=lambda **kw: Path(kw['pathName']).write_bytes(path.read_bytes()))
+            with mock.patch.dict('sys.modules', {'abaqus': NS(openMdb=open_database)}):
+                database = contract.open_working_mdb(str(source), folder)
+                self.assertEqual(source.read_bytes(), b'unchanged source')
+                self.assertIn('reference', database.models)
+                output = Path(folder)/'output.cae'
+                database.saveAs(pathName=str(output))
+                self.assertEqual(output.read_bytes(), b'kernel writes even without explicit save')
+                self.assertFalse(staged[0].parent.exists())
+                database.close()
+            self.assertEqual(source.read_bytes(), b'unchanged source')
+
+    def test_failed_open_removes_only_temporary_cae(self):
+        from pathlib import Path
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)/'reference.cae'
+            source.write_bytes(b'unchanged source')
+            with mock.patch.dict('sys.modules', {'abaqus': NS(openMdb=mock.Mock(side_effect=RuntimeError('bad CAE')))}):
+                with self.assertRaisesRegex(RuntimeError, 'bad CAE'):
+                    contract.open_working_mdb(str(source), folder)
+            self.assertEqual(list(Path(folder).iterdir()), [source])
+
+
 def valid_state(run_dir):
     source = dict(
         section_segments={name: [[0., 0., 1., 0.]] for name in ('P1', 'P2', 'P3', 'P4')},
@@ -76,6 +130,26 @@ class PipelineContractTests(unittest.TestCase):
             json.dump(state, stream)
         with self.assertRaisesRegex(ValueError, 'not COMPLETED'):
             contract.load_reference_run(root)
+
+    def test_built_only_reference_is_accepted_only_on_request_and_without_odb(self):
+        root, state = self.make_run()
+        state['status'] = 'BUILT'
+        with open(os.path.join(root, 'pipeline_status.json'), 'w') as stream:
+            json.dump(state, stream)
+        os.remove(os.path.join(root, state['build']['job_name']+'.odb'))      # --build-only: no .odb
+        with self.assertRaisesRegex(ValueError, 'not COMPLETED: BUILT'):
+            contract.load_reference_run(root)
+        loaded = contract.load_reference_run(root, allow_built=True)
+        self.assertFalse(loaded['solved'])
+        snap = contract.reference_snapshot(loaded, include_hashes=True)
+        self.assertIsNone(snap['source_odb_sha256'])
+        self.assertFalse(snap['reference_solved'])
+        self.assertTrue(snap['source_cae_sha256'])
+        state['status'] = 'FAILED'                                             # only BUILT, never FAILED
+        with open(os.path.join(root, 'pipeline_status.json'), 'w') as stream:
+            json.dump(state, stream)
+        with self.assertRaisesRegex(ValueError, 'not COMPLETED: FAILED'):
+            contract.load_reference_run(root, allow_built=True)
 
     def test_explicit_artifact_must_belong_to_same_reference_job(self):
         root, state = self.make_run()
@@ -200,6 +274,32 @@ class PipelineContractTests(unittest.TestCase):
                                for a, b in edges)/ref['c_extreme_mm']
         self.assertAlmostEqual(sum(q.values()), exact_force)
         self.assertAlmostEqual(sum(q[i]*eta(pts[i]) for i in q), exact_moment)
+
+
+class ReferenceNsetSyntaxTests(unittest.TestCase):
+    def test_reference_union_sets_fit_abaqus_lines_without_losing_members(self):
+        from gdlc_classifier import gdlc_mode_decomposition as gdlc
+        for name in ('GREF_BEAM_ROTATION','LREF_FOLDS','LREF_FOLDS_U1','LREF_FOLDS_U2'):
+            for count in (0,1,7,19,38,100):
+                with self.subTest(name=name,plates=count):
+                    instances=['P1','P2','P3','P4']+['STEEL_PLATE_%03d'%i for i in range(1,count+1)]
+                    nodes=[(inst,label) for inst in instances for label in (21,2,17,6,2)]
+                    lines=gdlc._nset_lines(name,nodes)
+                    self.assertTrue(all(len(line)<=256 for line in lines), 'Abaqus truncates long lines')
+                    union=lines.index('*Nset, nset='+name)
+                    tokens=[v.strip() for line in lines[union+1:] for v in line.split(',')]
+                    self.assertEqual(tokens,[name+'_'+inst for inst in sorted(instances)])
+                    for inst in instances:
+                        header='*Nset, nset='+name+'_'+inst+', instance='+inst
+                        self.assertEqual(lines[lines.index(header)+1],'2, 6, 17, 21')
+                    self.assertTrue(all(len(line.split(','))<=8 for line in lines[union+1:]))
+
+    def test_short_reference_sets_preserve_existing_input_text(self):
+        from gdlc_classifier import gdlc_mode_decomposition as gdlc
+        self.assertEqual(gdlc._nset_lines('LREF_FOLDS',[('P2',2),('P1',4),('P1',1),('P1',4)]),
+                         ['*Nset, nset=LREF_FOLDS_P1, instance=P1','1, 4',
+                          '*Nset, nset=LREF_FOLDS_P2, instance=P2','2',
+                          '*Nset, nset=LREF_FOLDS','LREF_FOLDS_P1, LREF_FOLDS_P2'])
 
 
 if __name__ == '__main__':

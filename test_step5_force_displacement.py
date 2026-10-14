@@ -4,6 +4,29 @@ import abaqus_step5_force_displacement_core as fd
 
 
 class ForceDisplacementTests(unittest.TestCase):
+    def test_unwritten_lpf_history_reports_missing_converged_data(self):
+        from types import SimpleNamespace as NS
+        for data in (None, []):
+            step = NS(historyRegions={'Assembly': NS(historyOutputs={
+                'LPF': NS(data=data, description='Load proportionality factor')})})
+            with self.subTest(data=data), self.assertRaisesRegex(ValueError, 'LPF history'):
+                fd.lpf_history(step)
+
+    def test_duplicate_initial_zero_is_removed_before_partial_prefix(self):
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        frames = [NS(frameValue=i, fieldOutputs={'U':object()}) for i in (0, 1, 2)]
+        odb = NS(steps={'GMNIA':NS(frames=frames)}, rootAssembly=NS(nodeSets={
+            'STEP5_BOTTOM':object(), 'STEP5_TOP':object()}))
+        info = dict(reference_force_N_per_end=1000, settings=dict(reference_stress=240),
+                    end_area_weights=[[['P1',1,1]],[['P1',2,1]]])
+        with mock.patch.object(fd, 'lpf_history', return_value=[(0,0),(0,0),(1,.4),(2,.8),(3,.9)]), \
+                mock.patch.object(fd, 'weighted_u3', return_value=0):
+            rows, meta = fd.curve_rows(odb, 'GMNIA', info, allow_partial=True)
+        self.assertEqual([r['lpf'] for r in rows], [0,.4,.8])
+        self.assertEqual(meta['duplicate_initial_zero_samples'], 1)
+        self.assertEqual(meta['dropped_history_samples'], 1)
+
     def test_end_response_rejects_local_nonfinite_and_duplicate_displacements(self):
         from types import SimpleNamespace as NS
         for method in (fd.weighted_u3, fd.coefficient_u3):

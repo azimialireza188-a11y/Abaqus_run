@@ -9,6 +9,31 @@ from types import SimpleNamespace
 
 
 class QueueTests(unittest.TestCase):
+    def test_windows_core_detection_uses_topology_without_wmi_access(self):
+        import ctypes, struct
+        import runtime_resources as r
+        # Variable-sized processor-core records: two cores, each with SMT threads.
+        topology = struct.pack('<II', 0, 32)+bytes(24)+struct.pack('<II', 0, 40)+bytes(32)
+        def query(relation, buffer, length):
+            if buffer is None:
+                length._obj.value = len(topology)
+                return 0
+            ctypes.memmove(buffer, topology, len(topology))
+            return 1
+        kernel = SimpleNamespace(GetLogicalProcessorInformationEx=query)
+        with mock.patch.object(r.os, 'name', 'nt'), \
+                mock.patch.object(r.ctypes, 'windll', SimpleNamespace(kernel32=kernel), create=True), \
+                mock.patch.object(r, 'logical_cpu_count', return_value=4), \
+                mock.patch.object(r, 'available_memory', return_value=(1000, 900)), \
+                mock.patch.object(r.subprocess, 'check_output', side_effect=FileNotFoundError) as external:
+            inventory = r.detect_resources()
+        self.assertEqual(inventory.physical_cores, 2)
+        self.assertEqual(r.resolve_solver_policy(inventory).cpus, 2)
+        self.assertTrue(all(call.args[0][0] == 'nvidia-smi' for call in external.call_args_list))
+
+    def test_zero_gpu_override_replaces_stale_environment(self):
+        self.assertIn('gpus=0', self.queue().job_command('STEP5_TEST', 8, 0, 'monitor'))
+
     def test_progress_is_mirrored_to_external_log(self):
         import abaqus_step5_progress as progress
         with tempfile.TemporaryDirectory() as d:
@@ -60,6 +85,15 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(r.resolve_policy(inventory).cpus,24)
         self.assertEqual(r.resolve_solver_policy(inventory,cpu_override=8).cpus,8)
         self.assertEqual(r.resolve_solver_policy(inventory).memory_reserve_bytes,0)
+
+    def test_solver_oversized_request_uses_all_available_cores(self):
+        import runtime_resources as r
+        inventory=r.ResourceInventory(8,4,16*1024**3,10*1024**3,[])
+        with self.assertWarnsRegex(RuntimeWarning, '8.*4'):
+            policy=r.resolve_solver_policy(inventory,cpu_override=8)
+        self.assertEqual(policy.cpus,4)
+        self.assertEqual(r.resolve_policy(inventory).cpus,8)
+        self.assertEqual((policy.memory_reserve_bytes,policy.gpu_reserve_bytes),(0,0))
 
     def test_zero_launcher_exit_without_odb_reports_solver_log(self):
         q=self.queue()
@@ -160,9 +194,14 @@ class QueueTests(unittest.TestCase):
 
     def test_missing_solver_status_and_partial_data_do_not_validate_capacity(self):
         q = self.queue()
-        self.assertEqual(q.outcome({}, True), 'SOLVER_STATUS_UNKNOWN')
+        # a crossing inside the synchronized data is a complete result even when the exit
+        # status of an earlier session is unknown or trailing frames were dropped
+        self.assertEqual(q.outcome({}, True), 'CRITERION_REACHED')
+        self.assertEqual(q.outcome({}, False), 'SOLVER_STATUS_UNKNOWN')
         self.assertEqual(q.outcome({'analysis_completed': True}, True), 'CRITERION_REACHED')
-        self.assertEqual(q.outcome({'solver_exit_code': 0, 'partial': True}, True), 'PARTIAL_RESULT')
+        self.assertEqual(q.outcome({'solver_exit_code': 0, 'partial': True}, True), 'CRITERION_REACHED')
+        self.assertEqual(q.outcome({'solver_exit_code': 0, 'partial': True}, False), 'PARTIAL_RESULT')
+        self.assertEqual(q.outcome({'solver_exit_code': 3}, True), 'SOLVER_ERROR')
 
     def test_extract_only_preserves_a_previous_solver_failure(self):
         import csv, json
@@ -199,6 +238,20 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(result['solver_exit_code'], 1)
             self.assertEqual(result['outcome'], 'SOLVER_ERROR')
             self.assertTrue(result['criterion_reached'])
+
+    def test_queue_cpus_option_and_repair_keep_the_requested_value(self):
+        import contextlib
+        q = self.queue()
+        argv = ['abaqus', '--', '--run-dir', '.', '--cpus', '4', '--jobs', 'STEP5_D_FY240']
+        seen = {}
+        with mock.patch('sys.argv', argv), mock.patch.object(q, 'run', side_effect=lambda a: seen.update(vars(a))):
+            q.main()
+        self.assertEqual((seen['cpus'], seen['gpus']), (4, 'auto'))
+        for bad in ('0', 'x'):
+            with mock.patch('sys.argv', argv[:5]+[bad]), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                q.main()
+        self.assertEqual(q.job_command('STEP5_D_FY240', 4, 0, 'monitor')[3], 'cpus=4')
 
     def test_queue_batch_invokes_runner_instead_of_fortran(self):
         with tempfile.TemporaryDirectory() as d:
@@ -299,18 +352,33 @@ class QueueTests(unittest.TestCase):
                 os.chdir(previous)
             self.assertTrue(result['termination_requested'])
 
-    def test_failed_compile_artifacts_are_backed_up_without_moving_input(self):
+    def test_existing_solver_artifacts_are_refused_without_moving_anything(self):
         q=self.queue()
         with tempfile.TemporaryDirectory() as d:
             name='STEP5_D_FY240'
             for ext in ('.inp','.log','.dat','.msg'):
                 with open(os.path.join(d,name+ext),'w') as f:
                     f.write(ext)
-            paths=q.backup_failed_artifacts(d,name)
-            self.assertEqual(len(paths),3)
+            with self.assertRaises(ValueError):
+                q.backup_failed_artifacts(d,name)
             self.assertTrue(os.path.isfile(os.path.join(d,name+'.inp')))
-            self.assertFalse(os.path.exists(os.path.join(d,name+'.log')))
-            self.assertTrue(all(os.path.isfile(p) for p in paths))
+            self.assertTrue(os.path.exists(os.path.join(d,name+'.log')))
+            self.assertEqual(len(os.listdir(d)), 4)
+
+    def test_submission_contract_checks_input_and_stop_ratio(self):
+        q = self.queue()
+        with tempfile.TemporaryDirectory() as d:
+            name = 'STEP5_TEST'
+            path = os.path.join(d, name+'.inp')
+            with open(path, 'w') as stream: stream.write('original input')
+            info = dict(job_name=name, input_sha256=q.contract.file_sha256(path),
+                        settings=dict(postpeak_stop_ratio=.7))
+            self.assertTrue(q.validate_submission(d, name, info, 'urdfil', .7))
+            with self.assertRaises(ValueError): q.validate_submission(d, name, info, 'urdfil', .8)
+            q.validate_submission(d, name, info, 'monitor', .8)
+            with open(path, 'w') as stream: stream.write('changed input')
+            with self.assertRaises(ValueError): q.validate_submission(d, name, info, 'monitor', .7)
+            with self.assertRaises(ValueError): q.validate_submission(d, name, {}, 'monitor', .7)
 
     def test_bending_comparison_and_pm_points(self):
         import csv

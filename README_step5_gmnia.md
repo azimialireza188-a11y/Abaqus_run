@@ -1,5 +1,21 @@
 # گام ۵: ساخت مدل GMNIA بدون اجرای تحلیل
 
+در مدل‌های دارای ورق عرضیِ ساخته‌شده در `D:\Abaqus_run_family`، گزینهٔ
+`--steel-plate-fy` الزامی است. مثلاً `--fy 240 --steel-plate-fy 360` یعنی تنش
+تسلیم مقاطع ۲۴۰ و ورق‌ها ۳۶۰ مگاپاسکال؛ ۳۶۰ صرفاً مثال است. ورق‌ها E و ν
+مرجع را حفظ می‌کنند و رفتار آن‌ها الاستیک–کاملاً پلاستیک است. منحنی اختیاری
+مصالح مقاطع به ورق اعمال نمی‌شود. مش و نقص ورق‌ها حفظ و خروجی S، LE و PEEQ
+آن‌ها در ۹ نقطهٔ ضخامت درخواست می‌شود. بخش‌های اتصال پیچ به Connector صلب
+تبدیل می‌شوند؛ تعداد پیچ‌های فیزیکی افزایش نمی‌یابد.
+
+نام گزینه دقیقاً `--steel-plate-fy 360` است؛ `--f'y=360` گزینهٔ تعریف‌شده‌ای
+نیست. مقدار تسلیم ورق برای هر دو جهت مشترک است. مسیر `--source-cae` باید
+به CAE واقعیِ Step4 مربوط به همین مدل ورق‌دار اشاره کند. برای ساخت با
+`--steel-plate-length 40 --steel-plate-length-2 40 --steel-plate-gap-mm 0`،
+نام پوشهٔ تولیدشده با `--output-root` پسوند `_PL40_PL240_PG0` دارد؛ اگر پوشهٔ
+هم‌نام از قبل وجود داشته باشد، نام یکتای تولیدشده و ثبت‌شده در گزارش ساخت
+را استفاده کنید. مسیر بدون این پسوند مربوط به اجرای دیگری است.
+
 اسکریپت `abaqus_step5_gmnia.py` فقط CAE مرحلهٔ چهارِ تولیدشده از همین pipeline مرجع را می‌پذیرد و یک فایل CAE و یک INP برای هر مدل انتخاب‌شده تحویل می‌دهد. هیچ Job ارسال نمی‌شود. مش، مختصات دارای نقص، شرایط مرزی و تماس قبلی حفظ می‌شوند. مدل بدون نقصِ مرجع نیز به‌طور پیش‌فرض وارد خروجی این مرحله می‌شود. Provenance مرحلهٔ چهار داخل Model description خوانده و قبل از هر تغییر با قرارداد `abaqus_complete_model_m20.py` کنترل می‌شود.
 
 ## دستور اجرا
@@ -10,6 +26,16 @@
 `run_step5_queue_70_pct.bat`، نام و شمارهٔ مدل (`JOB 1/8`)، ارسال حل (`SUBMIT`)،
 حل جاری (`SOLVING`)، خروج حلگر (`SOLVER EXIT`)، استخراج (`EXTRACT`)، رسم نمودار
 (`PLOT`) و مقایسه (`COMPARISON`) مشخص می‌شوند.
+
+ساخت Step5 خروجی را کیس‌به‌کیس تحویل می‌دهد: فایل‌های تنظیمات مشترک در ابتدا،
+سپس INP بررسی‌شده و فایل `<job>_step5.json` هر کیس بلافاصله پس از تکمیل آن
+در `--output-dir` قرار می‌گیرند. پیام `CASE READY i/n` تحویل هر کیس را اعلام می‌کند.
+CAE مشترک فقط یک‌بار در پایان ذخیره و تحویل می‌شود؛ سپس BAT صف ساخته و تحویل
+می‌شود. ساخت مدل، ذخیرهٔ CAE یا تحویل فایل‌ها هیچ تحلیلی را اجرا نمی‌کند.
+اگر ساخت کیس بعدی شکست بخورد، فایل‌های تکمیل‌شدهٔ قبلی در خروجی باقی می‌مانند
+و مسیر پوشهٔ موقت برای عیب‌یابی چاپ می‌شود. این تغییر قابلیت ادامهٔ خودکار ساخت
+در پوشهٔ نیمه‌کامل اضافه نمی‌کند؛ اجرای مجدد همچنان پوشهٔ جدید یا خالی می‌خواهد.
+فایل‌های نتایج و خروجی‌های قبلی بازنویسی نمی‌شوند.
 
 هنگام حل، هر ۱۵ ثانیه زمان سپری‌شده، آخرین خط فایل `.sta` (در صورت وجود)،
 و در حالت monitor آخرین LPF و نسبت بار به بیشترین بار ثبت‌شده نمایش داده می‌شود.
@@ -67,7 +93,13 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
 | `--max-increments` | 5000 |
 | `--max-end-displacement-mm` | غیرفعال (فقط با مقدار صریح فعال می‌شود) |
 | `--field-frequency` | 1؛ هر Increment |
-| `--cpus` | همهٔ CPUهای در دسترس |
+| `--cpus` | `auto` = همهٔ هسته‌های فیزیکی؛ یا یک عدد مثبت، مثلاً `--cpus 4` |
+
+`--cpus` در Jobها، در `abaqus_v6.env` و در `run_step5_queue_*.bat` تولیدشده نوشته می‌شود؛ صف آن را روی
+همان رایانه‌ای که حل را اجرا می‌کند دوباره تعیین می‌کند (درخواست بیش از تعداد هسته‌های فیزیکی، همهٔ آن‌ها را
+به‌کار می‌گیرد و هشدار می‌دهد). برای اجرای صف با تعداد دیگری، `--cpus N` را در خط `call abaqus ...` همان BAT
+عوض کنید. همهٔ گزینه‌ها به شکل `--name value` (با فاصله) نوشته می‌شوند؛ لانچر Abaqus شکل `--name=value` را
+پیش از شروع اسکریپت رد می‌کند. در یک دستور چندخطی با `^` خط خالی نگذارید.
 
 شرط جابه‌جایی مربوط به **U3 مثبت یک گره در انتهای پایین** است؛ کوتاه‌شدگی کل ستون نیست. گره پایش در Set به نام `STEP5_STOP` مشخص است. اندازهٔ مش از مرحلهٔ چهار می‌آید و اینجا تغییر نمی‌کند. طول‌قوس، زمان فیزیکی تحلیل نیست. معیارهای تعادل پیش‌فرض Abaqus ضعیف نشده‌اند و پایدارسازی مصنوعی اضافه نشده است.
 
@@ -87,7 +119,10 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
 
 وزن‌ها در `end_area_weights` توضیح Model ذخیره می‌شوند. History خروجی جابه‌جایی دو انتها و نیرو/گشتاور تمام پیچ‌ها در هر Increment موجود است؛ بنابراین نیروی پیچ‌ها در Increment بار اوج قابل بازیابی خواهد بود. کد حاضر فقط مدل می‌سازد و نمودار یا ODB تولید نمی‌کند.
 
-فایل CAE همهٔ مدل‌ها و Jobهای آماده را دارد؛ هر INP به یک Job تعلق دارد. پوشهٔ خروجی فقط CAE و INP دریافت می‌کند. فایل‌های شروع خود Abaqus مانند `abaqus.rpy` ممکن است در پوشهٔ اجرای دستور ایجاد شوند.
+فایل CAE نهایی همهٔ مدل‌ها و Jobهای آماده را دارد؛ هر INP به یک Job تعلق دارد.
+پوشهٔ خروجی INP و metadata هر کیس را به‌تدریج و CAE و BAT را در پایان دریافت می‌کند؛
+تنظیمات مشترک و فایل URDFIL نیز در آن قرار دارند. فایل‌های شروع خود Abaqus مانند
+`abaqus.rpy` ممکن است در پوشهٔ اجرای دستور ایجاد شوند.
 
 
 ## قرارداد سازگاری با pipeline مرجع
@@ -114,12 +149,50 @@ Jobهای Step 5 نیز precision خروجی nodal را از run مرجع به �
 واحد تولید می‌شوند؛ نسخهٔ نمایشی جدا از مدل تحلیل وجود ندارد.
 
 
+## End condition: supplied working reference (compression, bending, P-M)
+
+Step5 uses the end loading and supports of the supplied working reference code.
+The inherited end-node supports U1 = U2 = UR3 = 0 and the mid-length axial anchor
+are retained. U3, UR1 and UR2 at the ends remain free; end warping is free.
+Compression uses fixed-direction shell-edge forces with `resultant=ON` per original
+edge length. Bending uses the Step3 consistent nodal CF3 forces scaled by
+`reference_stress`. Every P-M ray uses consistent nodal CF3 forces on the same
+end nodes. No reference points, kinematic end-plate couplings, contact stiffness
+ramp, discontinuous controls or line-search overrides are added.
+
+The default folders are `Step5_GMNIA_FY<fy>_LG_REF1` and
+`Step5_PM_FY<fy>_LG_REF1`. Metadata records
+`end_condition.id = reference_nodal_ends_v1`. Resume refuses other end policies,
+including EP4, and preserves existing inputs/results. A verified Step4 checkpoint
+can be reused to build the new Step5 folder without repeating reference solves.
+
+This restores the reference boundary/loading model; it does not establish a rigid
+end-plate plastic capacity. The prescribed end stress distribution is part of the
+model, so end yielding may govern bending/P-M capacity. Section `M_p` remains a
+section reference, not a guaranteed GMNIA peak. Full nonlinear convergence must
+be checked in the user's next run; no full solve was used to validate this change.
+
+Steel-plate geometry and independent `--steel-plate-fy`, stress-free imperfect
+mesh coordinates, connector outputs and the 70% post-peak criterion are retained.
+Empty/unwritten ODB LPF histories produce a clear missing-history error instead
+of a `NoneType` exception; no artificial LPF/capacity is filled in.
+
+`openMdb` opens CAEs with update access and can change the source file even when
+only a later `saveAs` is requested. Step4, Step5, both P-M builders and legacy CAE
+metadata readers therefore open a temporary working CAE inside the code workspace
+through `abaqus_pipeline_contract.open_working_mdb`. The original is only read;
+the temporary file is removed after `saveAs`/close. It is not a delivered backup.
+Windows physical cores are discovered directly from native CPU topology, without
+requiring WMI permission; solver defaults remain all physical cores, all visible
+GPUs and 100% memory, with no capacity reservation.
+
 ## Force-displacement extraction
 
 For a solved STEP5 ODB, use `abaqus_step5_force_displacement.py` rather than
-plotting a single nodal RF3. The STEP5 end nodes are not axially constrained,
-and the reference load is applied as shell edge traction, so an end-node RF3 is
-not the column load.
+plotting a single nodal RF3. The STEP5 end nodes are not axially constrained
+(the end forces act on the loaded edges/nodes), so an end-node RF3 is not the
+column load. The area-weighted mean U3 and nodal work-conjugate rotation measure
+also apply to the reference's free-warping ends.
 
 The extractor uses exactly the conventions stored by the STEP5 builder:
 
@@ -224,22 +297,30 @@ The default maximum is 5000 increments, with no displacement stop unless
 `--max-end-displacement-mm` is explicitly given. Nonconvergence and other solver
 failures remain failures; they are not converted into successful completion.
 
-## Repair an existing queue after the ifort error
+## Repair a verified queue before any solver artifacts exist
 
-Pull the latest repository. In the directory containing your existing eight
-`STEP5_*.inp` files and `Step5_GMNIA_FY240.cae`, run:
+New sidecars bind each job name to the SHA256 of the verified final INP. A
+modified input or an old sidecar without this binding cannot be submitted by
+the queue: rebuild in a new directory. Legacy `--extract-only` remains available
+for reading prior outputs. URDFIL additionally requires the builder's stop ratio
+and, when recorded, its exact subroutine hash; monitor mode may use another
+ratio. Batch commands retain full floating-point precision. Existing solver
+artifacts block a new solve and are preserved without backups. Duplicate initial
+zero LPF samples are normalized before a live common-prefix extraction. Near-zero
+P/M endpoint resultants are clamped only within section-scaled roundoff tolerance.
+
+In a newly generated directory containing verified `STEP5_*.inp` sidecars, run:
 
 ```bat
-abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue_nogui.py" -- --run-dir . --repair-only
+abaqus cae noGUI="D:\Abaqus_run\abaqus_step5_queue_nogui.py" -- --run-dir . --repair-only --cpus 4
 run_step5_queue_70_pct.bat
 ```
 
-Repair backs up the previous BAT, validates the CAE metadata and rewrites the
-queue; it does not rebuild/modify CAE or INP and does not submit jobs. The new BAT
+Repair validates the verified job metadata and rewrites the
+queue (same file name as the builder, from `--ratio`; `--cpus`/`--gpus` are written into it); it does not rebuild/modify CAE or INP and does not submit jobs. The new BAT
 references the repository runner by absolute path. Keep that repository path
 available. Existing ODBs and live locks are never overwritten/deleted by this
-runner. Residual solver files from failed compilation are moved into a unique
-per-job backup directory before submission, preserving their diagnostics. For completed/failed existing ODBs, preserve results and replot using:
+runner. Existing solver artifacts are preserved in place and submission is refused when a destination is occupied; use a new run directory/job name. No backup copies are created. For completed/failed existing ODBs, preserve results and replot using:
 
 ```bat
 abaqus cae noGUI="C:\Users\810200014.HAMI.000\Documents\Abaqus_run\abaqus_step5_queue_nogui.py" -- --run-dir . --extract-only
@@ -280,8 +361,9 @@ with getMemoryFromAnalysis disabled, and all detected NVIDIA GPUs requested
 through documented Abaqus CLI/environment settings (not an unsupported Job
 constructor keyword). Step5 requests standard_parallel=all. Buckling retains
 standard_parallel=solver because that procedure does not support parallel
-Standard element operations. Explicit --cpus/--gpus overrides remain available
-for deliberate use; omit old --cpus 8 commands to use the automatic default.
+Standard element operations. Explicit --cpus/--gpus overrides (e.g. --cpus 4) are
+accepted by Step 5, the queue runner, the P-M modes and the Step-1..3 builder, and
+are carried into every generated BAT; --cpus auto uses all physical cores.
 No fixed RAM reserve or worker cap is imposed. The solver only uses hardware
 supported by its procedure and installed drivers; 100% utilization of every
 resource throughout a solve is not guaranteed.
@@ -308,8 +390,9 @@ same as for compression. Differences:
 
 - Loading: the Step-3 consistent nodal end forces of the linear stress `1 MPa*eta/c` (`BEND_END_*`, CF3)
   are recomputed from the end nodes, checked against the inherited loads (names, nodes, count, applied
-  moment, zero net axial force) and scaled to `--reference-stress` (default fy). LPF = 1 is therefore the
-  first-yield moment `M_y` at the extreme centre-line fibre, and `M = LPF*reference_moment_Nmm` (no preload).
+  moment, zero net axial force) and scaled to `--reference-stress` (default fy), then applied as CF3
+  at the same end nodes. LPF = 1 is the first-yield moment `M_y` at the extreme centre-line fibre,
+  and `M = LPF*reference_moment_Nmm` (no preload). End yielding may govern under this loading.
 - Response: work-conjugate end rotation `theta = sum_bottom k_i U3_i + sum_top k_i U3_i`,
   `k_i = F_i/M_ref` (signed, stored as `end_rotation_weights`). It equals the relative rotation of plane end
   sections exactly, a uniform U3 does not contribute, and `M*theta` is the work of the end forces
@@ -336,6 +419,13 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
   --field-frequency 1 ^
   --postpeak-stop-ratio 0.70
 ```
+
+## Metadata sidecars
+
+Every Step-5 job now also gets `<job>_step5.json` next to its INP: the same JSON that is stored in the
+model description of the CAE. The queue and `abaqus_step5_force_displacement.py` read the sidecar first,
+so `--cae` is only needed for older folders without sidecars. P-M interaction jobs
+(`abaqus_pm_interaction.py --mode gmnia`, see README.md) use the same queue and have sidecars only.
 
 ## Strain hardening (optional `--stress-strain`)
 
