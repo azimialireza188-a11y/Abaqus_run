@@ -110,6 +110,8 @@ def parse_arguments(argv=None):
     p.add_argument('--source-cae', required=True)
     p.add_argument('--output-dir', required=True)
     p.add_argument('--fy', type=float, required=True)
+    p.add_argument('--cufsm-report-dir',
+                   help='CUFSM report directory; exact builtup_4_pieces references for plots only')
     p.add_argument('--load-case', choices=pipeline_contract.LOAD_CASES, default=None,
                    help='Optional assertion of the inherited Step-4 load case; never converts the loading')
     p.add_argument('--models', nargs='+')
@@ -118,6 +120,8 @@ def parse_arguments(argv=None):
     p.add_argument('--min-arc', type=float, default=1e-8)
     p.add_argument('--max-arc', type=float, default=.05)
     p.add_argument('--max-increments', type=int, default=5000)
+    p.add_argument('--riks-controls', choices=('default', 'robust'), default='robust',
+                   help='Bounded Newton line search and delayed divergence checks; equilibrium tolerances unchanged')
     p.add_argument('--riks-extrapolation', choices=('linear', 'none'), default='linear',
                    help='Riks initial solution predictor: linear preserves the Abaqus default; '
                         'none suppresses extrapolation without changing equilibrium tolerances')
@@ -167,6 +171,12 @@ def parse_arguments(argv=None):
         p.error('--postpeak-stop-ratio must satisfy 0 < ratio < 1')
     args.source_cae = os.path.abspath(os.path.expanduser(args.source_cae))
     args.output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
+    args.report_reference=None
+    if args.cufsm_report_dir:
+        from abaqus_report_reference import read_reference
+        args.cufsm_report_dir=os.path.abspath(os.path.expanduser(args.cufsm_report_dir))
+        try:args.report_reference=read_reference(args.cufsm_report_dir,fy=args.fy)
+        except (OSError,ValueError) as error:p.error('--cufsm-report-dir: %s'%error)
     return args
 
 
@@ -459,7 +469,7 @@ def replace_bolts(model, expected_links=None):
 
 
 def create_riks_step(model, assembly, args):
-    """Keep the original Riks procedure; optionally change only its initial predictor."""
+    """Preserve the Riks path and tolerances; improve bounded Newton correction."""
     from abaqusConstants import ON, OFF
     stop = args.max_end_displacement_mm
     options = dict(name='GMNIA', previous='Initial', nlgeom=ON,
@@ -473,6 +483,9 @@ def create_riks_step(model, assembly, args):
         options['extrapolation'] = NONE
     # totalArcLength scales the arc-length formulation; it is not an end condition.
     model.StaticRiksStep(**options)
+    if riks_controls_profile(getattr(args, 'riks_controls', 'default')) == 'robust':
+        model.steps['GMNIA'].control.setValues(
+            allowPropagation=OFF, discontinuous=ON, lineSearch=(4., 1., .0001, .25, .1))
 
 
 def prepare_model(model, args, pm_template=False):
@@ -671,6 +684,13 @@ def prepare_model(model, args, pm_template=False):
             source_contact=reference['shell_contact']),
         warning='Pilot Riks settings; no solve/convergence or physical mode classification validated. Do not remesh.')
     info['load_case'] = load_case
+    if getattr(args,'report_reference',None) is not None:
+        info['report_reference']=args.report_reference
+    else:
+        from abaqus_report_reference import step5_reference
+        calculated_reference=step5_reference(info)
+        if calculated_reference:
+            info['report_reference']=calculated_reference
     info['section_for_PM'] = dict(
         area_mm2=end_area[0], squash_load_N=end_area[0]*args.fy,
         definition='meshed end area (chords); squash load = A*fy')
@@ -809,9 +829,71 @@ def bending_end_loads(model, pieces, thickness, zmin, zmax, load_case, reference
         bending_axis_deg=load_case.get('neutral_axis_angle_deg'))
 
 
-def verify_input(path, bolts, bending=False):
+def riks_controls_profile(request='auto', settings=None):
+    """New inputs use bounded controls; auto-resume preserves the recorded policy."""
+    if request not in ('auto', 'default', 'robust'):
+        raise ValueError('Unknown Riks controls: '+str(request))
+    if settings is None:
+        return 'robust' if request == 'auto' else request
+    actual = settings.get('riks_controls', 'default')
+    if actual not in ('default', 'robust'):
+        raise ValueError('Unknown saved Riks controls: '+str(actual))
+    if request != 'auto' and request != actual:
+        raise ValueError('Saved Riks controls differ; use a fresh --pm-directory / Step5 directory. Existing results are preserved.')
+    return actual
+
+
+def riks_controls_keywords(profile):
+    if riks_controls_profile(profile) == 'default':
+        return ''
+    return ('*Controls, analysis=DISCONTINUOUS\n'
+            '*Controls, parameters=LINE SEARCH\n4, 1, 0.0001, 0.25, 0.1\n')
+
+
+def verify_riks_controls(text, profile='default'):
+    """Allow only the declared bounded controls, never altered accuracy controls."""
+    blocks = []
+    for block in re.split(r'(?=^\*[^*])', text.upper(), flags=re.M):
+        lines = [line.strip() for line in block.splitlines() if line.strip() and not line.startswith('**')]
+        if lines and re.match(r'^\*CONTROLS\b', lines[0]):
+            blocks.append(lines)
+    if profile == 'default':
+        if blocks:
+            raise RuntimeError('STEP5 solution controls differ from the reference defaults')
+        return
+    if riks_controls_profile(profile) != 'robust':
+        raise RuntimeError('Unsupported solution controls')
+    found = set()
+    for lines in blocks:
+        keyword = lines[0].replace(' ', '')
+        if keyword == '*CONTROLS,RESET' and not found:
+            if len(lines) != 1: raise RuntimeError('Unexpected control reset data')
+            continue
+        if keyword == '*CONTROLS,ANALYSIS=DISCONTINUOUS' and len(lines) == 1:
+            name = 'discontinuous'
+        elif keyword == '*CONTROLS,PARAMETERS=LINESEARCH' and len(lines) == 2:
+            defaults = [0., 1., .0001, .25, .1]
+            tokens = lines[1].split(',')
+            if any(value.strip() for value in tokens[5:]):
+                raise RuntimeError('Unexpected extra Newton line-search controls')
+            values = [float(value.strip()) if value.strip() else defaults[i]
+                      for i, value in enumerate(tokens[:5])]
+            values += defaults[len(values):]
+            if values != [4., 1., .0001, .25, .1]:
+                raise RuntimeError('Unexpected Newton line-search controls')
+            name = 'line_search'
+        else:
+            raise RuntimeError('STEP5 input changes undeclared solution/accuracy controls')
+        if name in found: raise RuntimeError('Duplicate STEP5 solution controls')
+        found.add(name)
+    if found != {'discontinuous', 'line_search'}:
+        raise RuntimeError('Declared robust Riks controls are missing from STEP5 input')
+
+
+def verify_input(path, bolts, bending=False, riks_controls='default'):
     with open(path) as stream:
         text = stream.read().upper()
+    verify_riks_controls(text, riks_controls)
     if bending and not re.search(r'^\*CLOAD\b', text, re.M):
         raise RuntimeError('Bending STEP5 input has no *CLOAD end forces')
     for pattern in (r'\*STEP[^\n]*NLGEOM=YES', r'\*STATIC[^\n]*RIKS', r'\*PLASTIC',
@@ -847,41 +929,44 @@ def write_metadata(path, info, subroutine_path=None):
 def open_step4_database(args):
     """Open the Step-4 CAE and resolve the selected sources (PERFECT token and/or STEP4_*)."""
     import caeModules
-    from abaqus import openMdb
     if not os.path.isfile(args.source_cae):
         raise ValueError('Source CAE not found: '+args.source_cae)
     if os.path.exists(args.output_dir) and (not os.path.isdir(args.output_dir) or os.listdir(args.output_dir)):
         raise ValueError('Output directory must be new or empty: '+args.output_dir)
     report('OPEN CAE', args.source_cae)
-    database = openMdb(pathName=args.source_cae)
-    report('VALIDATE', 'Checking Step4 models and reference provenance')
-    imperfect = sorted(n for n in database.models.keys() if n.startswith('STEP4_'))
-    reference_candidates = [n for n in database.models.keys()
-        if not n.startswith('STEP4_') and STEP4_MANIFEST_MARKER in str(database.models[n].description or '')]
-    if len(reference_candidates) != 1:
-        raise ValueError('Expected exactly one untouched Step-4 reference model; found %d' %
-                         len(reference_candidates))
-    perfect_source = reference_candidates[0]
-    # Validate the untouched reference provenance before using it as PERFECT.
-    reference_step4_manifest(database.models[perfect_source])
+    database = pipeline_contract.open_working_mdb(args.source_cae)
+    try:
+        report('VALIDATE', 'Checking Step4 models and reference provenance')
+        imperfect = sorted(n for n in database.models.keys() if n.startswith('STEP4_'))
+        reference_candidates = [n for n in database.models.keys()
+            if not n.startswith('STEP4_') and STEP4_MANIFEST_MARKER in str(database.models[n].description or '')]
+        if len(reference_candidates) != 1:
+            raise ValueError('Expected exactly one untouched Step-4 reference model; found %d' %
+                             len(reference_candidates))
+        perfect_source = reference_candidates[0]
+        # Validate the untouched reference provenance before using it as PERFECT.
+        reference_step4_manifest(database.models[perfect_source])
 
-    selected = list(args.models) if args.models else [PERFECT_TOKEN] + imperfect
-    if not selected or len(set(selected)) != len(selected):
-        raise ValueError('Select distinct STEP4_* models and/or the PERFECT token')
-    for name in selected:
-        if name == PERFECT_TOKEN:
-            continue
-        if not name.startswith('STEP4_') or name not in database.models:
-            raise ValueError('STEP4 source model not found: '+name)
-    for name in list(database.jobs.keys()):
-        del database.jobs[name]
-    keep = set(n for n in selected if n != PERFECT_TOKEN)
-    if PERFECT_TOKEN in selected:
-        keep.add(perfect_source)
-    for name in list(database.models.keys()):
-        if name not in keep:
-            del database.models[name]
-    return database, selected, perfect_source
+        selected = list(args.models) if args.models else [PERFECT_TOKEN] + imperfect
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError('Select distinct STEP4_* models and/or the PERFECT token')
+        for name in selected:
+            if name == PERFECT_TOKEN:
+                continue
+            if not name.startswith('STEP4_') or name not in database.models:
+                raise ValueError('STEP4 source model not found: '+name)
+        for name in list(database.jobs.keys()):
+            del database.jobs[name]
+        keep = set(n for n in selected if n != PERFECT_TOKEN)
+        if PERFECT_TOKEN in selected:
+            keep.add(perfect_source)
+        for name in list(database.models.keys()):
+            if name not in keep:
+                del database.models[name]
+        return database, selected, perfect_source
+    except BaseException:
+        database.close()
+        raise
 
 
 def copy_source_model(database, source_name, name, perfect_source):
@@ -914,8 +999,14 @@ def write_job_input(database, name, info, args, user_subroutine):
     report('VERIFY INP', name)
     inject_urdfil_trigger(name+'.inp')
     verify_input(name+'.inp', len(info['bolts']),
-                 bending='reference_moment_Nmm' in info or 'pm_template' in info)
+                 bending='reference_moment_Nmm' in info or 'pm_template' in info,
+                 riks_controls=getattr(args, 'riks_controls', 'default'))
     info.update(job_name=name, input_sha256=pipeline_contract.file_sha256(name+'.inp'))
+    if getattr(args, 'riks_controls', 'default') == 'robust':
+        info['solution_controls'] = dict(analysis='bounded Newton / discontinuous',
+            equilibrium_tolerances='Abaqus defaults', stabilization=False,
+            line_search_iterations=4, divergence_check_after=8,
+            convergence_rate_check_after=10, equilibrium_iteration_limit=16)
     return job
 
 
@@ -990,6 +1081,7 @@ def build(args):
         report('SAVE CAE', cae_name)
         database.saveAs(pathName=os.path.join(scratch, cae_name))
         database.close()
+        database = None
         deliver(scratch, args.output_dir, [cae_name])
 
         # Publish a runnable queue only after every case and the final CAE are delivered.
@@ -1010,6 +1102,8 @@ def build(args):
         remove_scratch(scratch, 'cfs_step5_')
     finally:
         os.chdir(previous)
+        if database is not None:
+            database.close()
 
 
 if __name__ == '__main__':

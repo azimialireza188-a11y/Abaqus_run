@@ -54,7 +54,8 @@ class ImperfectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'REF_L'):
             step4.validate_bending_reference_mode(dict(type='bending'), 'local', 3, item)
         item['shares_pct']['L'] = 93.2
-        step4.validate_bending_reference_mode(dict(type='compression'), 'local', 1, item)
+        with self.assertRaisesRegex(ValueError, 'REF_L'):
+            step4.validate_bending_reference_mode(dict(type='compression'), 'local', 1, item)
         step4.validate_bending_reference_mode(dict(type='bending'), 'dist', 1, item)
         item.pop('reference_check')  # explicitly selected mixed original modes stay supported
         step4.validate_bending_reference_mode(dict(type='bending'), 'local', 1, item)
@@ -69,7 +70,7 @@ class ImperfectionTests(unittest.TestCase):
                                   run_name='cae_namespace_test')
         validate = namespace['validate_bending_reference_mode']
         for component, kind, shares in (
-                ('local', 'L', dict(L=99.9783, G=0., D=0., C=0.)),
+                ('local', 'L', dict(L=99.9783, G=0., D=0., C=0., O=.0217)),
                 ('global', 'G', dict(G=100., L=0., D=0., C=0.))):
             with self.subTest(component=component):
                 item = dict(status='ok', reference_check=dict(kind=kind), shares_pct=shares)
@@ -605,6 +606,63 @@ class ImperfectionTests(unittest.TestCase):
                          (ltb(1, centre=(300., 0.)), 'away from the lateral')):  # bow along y
             with self.assertRaisesRegex(ValueError, why):
                 step4.orient_bending_global(*step4.global_eigen_shape([bad], 2, None), axis=2, angle_degrees=0.)
+
+
+class LocalReferenceQualityTests(unittest.TestCase):
+    @staticmethod
+    def classified(shares=None, status='ok'):
+        return dict(status=status, reference_check=dict(kind='L', passed=False),
+                    shares_pct=shares if shares is not None else dict(G=0., D=0., L=98.3, C=0., O=1.7))
+
+    def test_local_reference_criterion_applies_to_every_load_case(self):
+        for load_type in ('compression', 'bending', 'combined'):
+            with self.subTest(load_type=load_type):
+                step4.validate_bending_reference_mode(dict(type=load_type), 'local', 2, self.classified())
+                impure = self.classified(dict(G=1., D=3., L=94., C=1., O=1.))
+                with self.assertRaisesRegex(ValueError, 'REF_L.*95'):
+                    step4.validate_bending_reference_mode(dict(type=load_type), 'local', 1, impure)
+
+    def test_local_reference_accepts_threshold_and_rounded_total(self):
+        for shares in (dict(G=2., D=3., L=95., C=0., O=0.),
+                       dict(G=0., D=0., L=95., C=0., O=5.),
+                       dict(G=0., D=0., L=98.3078, C=0., O=1.6921999)):
+            with self.subTest(shares=shares):
+                step4.validate_bending_reference_mode(dict(type='compression'), 'local', 1,
+                                                      self.classified(shares))
+
+    def test_local_reference_rejects_incomplete_or_malformed_shares(self):
+        malformed = [None, {}, dict(G=0., D=0., L=100., C=0.),
+                     dict(G=-1., D=0., L=100., C=0., O=1.),
+                     dict(G=0., D=0., L=101., C=0., O=0.),
+                     dict(G=0., D=0., L=96., C=0., O=0.),
+                     dict(G=0., D=0., L=95., C=0., O=5.001)]
+        for key in 'GDLCO':
+            for bad in (float('nan'), float('inf'), None, 'bad'):
+                shares = dict(G=0., D=0., L=98.3, C=0., O=1.7)
+                shares[key] = bad
+                malformed.append(shares)
+        for shares in malformed:
+            with self.subTest(shares=shares), self.assertRaisesRegex(ValueError, 'REF_L'):
+                item = self.classified()
+                item['shares_pct'] = shares
+                step4.validate_bending_reference_mode(dict(type='compression'), 'local', 1, item)
+
+    def test_unavailable_classification_and_original_mixed_sources_keep_warning_path(self):
+        original = dict(status='ok', shares_pct=dict(L=20., D=80.))
+        missing_marker = self.classified()
+        missing_marker.pop('reference_check')
+        for item in (None, original, missing_marker,
+                     self.classified({}, status='stale_odb_mismatch'),
+                     self.classified({}, status='unverified_odb_source')):
+            with self.subTest(item=item):
+                step4.validate_bending_reference_mode(dict(type='compression'), 'local', 1, item)
+
+    def test_nonlocal_and_nonbending_global_behavior_is_preserved(self):
+        step4.validate_bending_reference_mode(dict(type='bending'), 'dist', 1, self.classified({}))
+        global_item = dict(status='ok', reference_check=dict(kind='G'), shares_pct=dict(G=20.))
+        for load_type in ('compression', 'combined'):
+            with self.subTest(load_type=load_type):
+                step4.validate_bending_reference_mode(dict(type=load_type), 'global', 1, global_item)
 
 
 if __name__ == '__main__':

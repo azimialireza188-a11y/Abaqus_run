@@ -65,7 +65,9 @@ class ForceDisplacementTests(unittest.TestCase):
             args=NS(cae=cae,odb=odb_path,model=None,step='GMNIA',output_dir=d,allow_partial=True)
             modules={'caeModules':NS(),'abaqus':NS(openMdb=lambda **kw:db),
                      'odbAccess':NS(openOdb=opener)}
-            with mock.patch.dict('sys.modules',modules), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.dict('sys.modules',modules), \
+                    mock.patch.object(fd.pipeline_contract, 'open_working_mdb', return_value=db, create=True), \
+                    contextlib.redirect_stdout(io.StringIO()):
                 summary=fd.extract(args)
             opener.assert_called_once_with(path=odb_path,readOnly=True)
             self.assertTrue(summary['partial'])
@@ -295,7 +297,9 @@ class ForceDisplacementTests(unittest.TestCase):
             args=NS(cae=cae,odb=odb_path,model=None,step='GMNIA',output_dir=d,allow_partial=False,skip_png=True)
             modules={'caeModules':NS(),'abaqus':NS(openMdb=lambda **kw:db),
                      'odbAccess':NS(openOdb=mock.Mock(return_value=odb))}
-            with mock.patch.dict('sys.modules',modules), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.dict('sys.modules',modules), \
+                    mock.patch.object(fd.pipeline_contract, 'open_working_mdb', return_value=db, create=True), \
+                    contextlib.redirect_stdout(io.StringIO()):
                 summary=fd.extract(args)
             self.assertAlmostEqual(summary['peak']['moment_kNm'],0.048)
             self.assertAlmostEqual(summary['peak']['rotation_mrad'],2.0)   # beta_b - beta_t = 2*beta
@@ -308,6 +312,77 @@ class ForceDisplacementTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fd.coefficient_map([['P1',1,0.0]])
 
+    def test_unwritten_lpf_history_reports_missing_converged_data(self):
+        from types import SimpleNamespace as NS
+        for data in (None, []):
+            step = NS(historyRegions={'Assembly': NS(historyOutputs={
+                'LPF': NS(data=data, description='Load proportionality factor')})})
+            with self.subTest(data=data), self.assertRaisesRegex(ValueError, 'LPF history'):
+                fd.lpf_history(step)
+
+
+
+
+
+class ReportReferencePlotTests(unittest.TestCase):
+    def test_report_selection_and_legacy_normalization_are_independent(self):
+        reference = dict(schema='cufsm_builtup_reference_v1', AsFy_kN=1100., axes={
+            'x': dict(axis_deg=0., SFy_kNm=130., ZFy_kNm=190.),
+            'z': dict(axis_deg=90., SFy_kNm=140., ZFy_kNm=200.)})
+        info = dict(settings=dict(fy=240.), end_area_mm2=1000., first_yield_moment_Nmm=50e6,
+                    load_case=dict(type='bending'), bending_axis_deg=270., report_reference=reference)
+        lines = fd.capacity_lines(info)
+        self.assertEqual([line['value'] for line in lines], [140., 200.])
+        self.assertTrue(all('built-up z' in line['label'] for line in lines))
+        info['bending_axis_deg'] = 45.
+        self.assertTrue(all('report built-up x' in line['label'] for line in fd.capacity_lines(info)))
+        info['load_case']['type'] = 'compression'
+        self.assertEqual(fd.capacity_lines(info)[0]['value'], 1100.)
+        info['load_case']['type'] = 'combined'
+        self.assertEqual(fd.capacity_lines(info), [1.])
+        info.pop('report_reference')
+        info['load_case']['type'] = 'compression'
+        self.assertEqual(fd.capacity_lines(info), [240.])
+        info['load_case']['type'] = 'bending'
+        self.assertEqual(fd.capacity_lines(info), [50.])
+
+    def test_explicit_report_overlay_uses_model_fy_and_leaves_metadata_unchanged(self):
+        from unittest import mock
+        import abaqus_report_reference as reader
+        info = dict(settings=dict(fy=360.), reference_force_N_per_end=42., report_reference={'old': True})
+        with mock.patch.object(reader, 'read_reference', return_value={'new': True}) as read:
+            updated = fd.with_report_reference(info, 'report-folder')
+        read.assert_called_once_with('report-folder', fy=360.)
+        self.assertEqual(updated['reference_force_N_per_end'], 42.)
+        self.assertEqual(updated['report_reference'], {'new': True})
+        self.assertEqual(info['report_reference'], {'old': True})
+
+    def test_mixed_legacy_and_labelled_capacity_lines_are_supported(self):
+        axes = fd.RESPONSE_AXES['bending']
+        self.assertEqual(fd.normalize_capacity_lines([12., {'value': 18., 'label': 'ZFy report'}], axes),
+                         [{'value': 12., 'label': 'My = 12.000 kN m'},
+                          {'value': 18., 'label': 'ZFy report'}])
+        with self.assertRaisesRegex(ValueError, 'finite'):
+            fd.normalize_capacity_lines([float('nan')], axes)
+
+    def test_individual_svg_includes_both_report_benchmarks(self):
+        import os, tempfile
+        import xml.etree.ElementTree as ET
+        axes = fd.RESPONSE_AXES['bending']
+        rows = [dict(rotation_mrad=0., moment_kNm=0.), dict(rotation_mrad=2., moment_kNm=3.)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'curve.svg')
+            fd.write_svg(path, rows, rows[-1], 'Bending', axes,
+                         yield_lines=[{'value': 5., 'label': 'SFy report x'},
+                                      {'value': 7., 'label': 'ZFy report x'}])
+            root = ET.parse(path).getroot()
+            texts = [node.text for node in root.iter('{http://www.w3.org/2000/svg}text')]
+            self.assertIn('SFy report x', texts)
+            self.assertIn('ZFy report x', texts)
+            refs = [node for node in root.iter('{http://www.w3.org/2000/svg}line')
+                    if node.get('stroke-dasharray')]
+            self.assertEqual(len(refs), 2)
+            self.assertTrue(all(node.get('y1') == node.get('y2') for node in refs))
 
 if __name__ == '__main__':
     unittest.main()

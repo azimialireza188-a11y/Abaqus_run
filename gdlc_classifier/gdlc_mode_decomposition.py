@@ -265,7 +265,7 @@ CLASSES = ("G", "D", "L", "C", "O")
 CLASS_NAMES = {"G": "G global (rigid section)", "D": "D distortional (pieces' sections)",
                "L": "L local (folds fixed)", "C": "C relative rigid motion of the pieces",
                "O": "O other (extension, arc deformation)"}
-VERSION = "1.10.1"
+VERSION = "1.10.2"
 
 
 # ----------------------------------------------------------------------------
@@ -3520,6 +3520,51 @@ def local_corner_translation_rows(g: RingGeom) -> np.ndarray:
     return rows
 
 
+def local_reference_rigid_coverage(g: RingGeom) -> dict:
+    """Check that held virtual corners remove each piece's three planar rigid motions.
+
+    This checks only coverage of the corner constraints, not full cFSM purity:
+    transverse extension/rounded-arc deformation remain admissible in the FE model.
+    """
+    Qf = build_operators(g)[2]
+    ranks, pieces = [], []
+    for nodes in ring_components(g):
+        rigid = _rigid_fields(g, nodes)
+        lengths = np.linalg.norm(rigid, axis=0)
+        rigid = rigid / np.where(lengths > 0, lengths, 1.)
+        rank = int(np.linalg.matrix_rank(Qf @ rigid)) if Qf.size else 0
+        ranks.append(rank)
+        pieces.append(dict(instances=sorted(set(str(g.inst[j]) for j in nodes)), rank=rank))
+    return dict(passed=bool(ranks and all(rank == 3 for rank in ranks)),
+                ranks=ranks, pieces=pieces, required_rank_per_piece=3)
+
+
+def local_reference_terms(row, pivot, keys, inplane, fixed_dofs, mpc_dependent):
+    """Return a safe exact corner row, or [] if existing modal BCs imply it.
+
+    A BC on just one translation of the reference node must never remove both
+    virtual-corner constraints. Fixed right-hand variables can be substituted by
+    zero. An unsafe pivot or an untracked MPC dependency is rejected, not skipped.
+    """
+    row = np.asarray(row, dtype=float)
+    if row.shape != (2*len(keys),) or not np.all(np.isfinite(row)):
+        raise ValueError('Invalid REF_L corner constraint row')
+    indices = [pivot] + [int(j) for j in np.flatnonzero(np.abs(row) > 1e-12) if j != pivot]
+    terms = [(keys[j//2], inplane[j % 2], float(row[j])) for j in indices]
+    terms = [term for term in terms if abs(term[2]) > 1e-12]
+    free = [term for term in terms if (term[0], term[1]) not in fixed_dofs]
+    if not free:
+        return []
+    target = (keys[pivot//2], inplane[pivot % 2])
+    if target in fixed_dofs:
+        raise ValueError('REF_L constraint coverage is incomplete: a boundary fixes the reference '
+                         'translation but does not imply its rounded virtual-corner row: '+str(target))
+    if any(node in mpc_dependent for node, dof, value in free):
+        raise ValueError('REF_L exact corner row uses an MPC-dependent node; '
+                         'cannot omit the row or substitute independent shell UR')
+    return free
+
+
 def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes: int = 20) -> list[Path]:
     """Writes <run>_REF_G/ and <run>_REF_L/ next to the run, each with a modified .inp
     (submit it with Abaqus, then export its modes as for any run):
@@ -3534,12 +3579,12 @@ def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes
       REF_L: the virtual sharp corner of every fold is held in the section plane along the
              whole member (fold rotation free). All load cases use the exact classifier's
              translation-based fold-driver rows, including short arcs. Seams stay as built.
-             Purity still requires the output
-             check (extension/arc deformation and skipped constrained folds can remain).
+             Purity still requires the output check: extension/arc deformation remains
+             admissible. Incomplete corner coverage is rejected, not silently skipped.
     The eigensolver is selected from model features before submission; a failed solve is
     preserved for diagnosis rather than silently retried. Legacy refusal metadata falls
     back to subspace iteration automatically (see solve_reference_model).
-    Nodes with in-plane boundary conditions or eliminated by an *MPC are not constrained again."""
+    Local rows substitute fixed modal DOFs and reject unsafe eliminated DOFs."""
     # Geometry source: the modal export (.odb node coordinates) as before, or the .inp itself
     # for a built, not yet solved run. The source is kept for the life of the reference
     # folders (recorded as "geometry" in gdlc_reference.json). Historical INP-only
@@ -3584,6 +3629,23 @@ def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes
     bc_nodes = set(n_ for nodes, unused in inp.boundaries for n_ in nodes)
     key = [(str(i), int(l)) for i, l in zip(mesh.instance, mesh.label)]
     lines0 = inp_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not kinds or len(set(kinds)) != len(kinds) or set(kinds)-{'G', 'L'}:
+        raise ValueError('Reference kinds must contain G and/or L once each')
+    fixed_dofs = {(node, dof) for nodes, dofs in inp.boundaries for node in nodes for dof in dofs}
+    rigid_coverage = []
+    if 'L' in kinds:
+        unsupported = {_kw_params(line.strip())[0] for line in lines0
+                       if line.lstrip().startswith('*') and not line.lstrip().startswith('**')}
+        unsupported &= {'equation', 'coupling', 'tie', 'rigid body'}
+        if unsupported:
+            raise ValueError('REF_L source contains elimination constraints not tracked by this writer: '
+                             +', '.join(sorted(unsupported))+'. Use the original built model, not another reference.')
+        for g in groups:
+            coverage = local_reference_rigid_coverage(g)
+            if not coverage['passed']:
+                raise ValueError('REF_L corners cannot suppress all planar rigid motions of each piece: '
+                                 +str(coverage['ranks'])+'; a corner-free or single-corner piece is not a pure local reference')
+            rigid_coverage.append(coverage)
     i_end_asm = next(i for i, l in enumerate(lines0) if l.strip().lower().startswith("*end assembly"))
     written = []
     for kind in kinds:
@@ -3627,8 +3689,8 @@ def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes
                         formulation=formulation)
             log(f"  REF_G twist {twist_mode} ({twist_reason})")
         elif kind == "L":
-            # The classifier's L criterion is: translation of every fold's VIRTUAL SHARP
-            # CORNER c = 0, with the fold free to rotate (cFSM). For a rounded fold c is not
+            # The corner-driver part of the classifier's L criterion holds every VIRTUAL
+            # SHARP CORNER c = 0, with the fold free to rotate. For a rounded fold c is not
             # a node, so the classifier's own kinematic statement is imposed with one
             # *Equation per in-plane direction on the fold reference node r:
             #     u_r + theta x (c - p_r) = 0,
@@ -3638,6 +3700,7 @@ def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes
             # independent DOF and cannot substitute for chord rotation. Holding r itself would
             # let c move by theta*|c - p_r|; sharp folds (c = p_r) are held in-plane.
             held, held_dof, eq_lines, n_eq = [], {}, [], 0
+            required_rows, implied_rows, added_rows = 0, 0, 0
             for g in groups:
                 build_operators(g)                         # fills each fold's virtual_corner
                 exact_rows = local_corner_translation_rows(g)
@@ -3647,22 +3710,18 @@ def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes
                     sharp = float(np.linalg.norm(off)) <= 1e-9 * mesh.size or len(f["nodes"]) < 2
                     for gr in range(len(g.rings)):
                         kk = key[g.node_rows[gr][r]]
-                        if kk in excl:
-                            continue
-                        if sharp:
+                        ring_keys = [key[i] for i in g.node_rows[gr]]
+                        terms_by_dof = [local_reference_terms(exact_rows[2*fi+c], 2*r+c,
+                                          ring_keys, inplane, fixed_dofs, inp.mpc_dependent) for c in (0, 1)]
+                        required_rows += 2
+                        implied_rows += sum(not terms for terms in terms_by_dof)
+                        added_rows += sum(bool(terms) for terms in terms_by_dof)
+                        if sharp and all(len(terms) == 1 for terms in terms_by_dof):
                             held.append(kk)
                             continue
-                        for c in (0, 1):
-                            terms = [(kk, inplane[c], 1.0)]
-                            row = exact_rows[2*fi+c]
-                            nz = np.flatnonzero(np.abs(row) > 1e-12)
-                            terms += [(key[g.node_rows[gr][j//2]], inplane[j % 2], float(row[j]))
-                                      for j in nz if j != 2*r+c]
-                            blocked = [n_ for n_, _, _ in terms[1:] if n_ in excl]
-                            if blocked:
-                                raise ValueError(f'REF_L exact fold row references constrained/MPC-dependent '
-                                                 f'node {blocked[0]}; cannot safely substitute shell UR')
-                            terms = terms[:1] + [t_ for t_ in terms[1:] if abs(t_[2]) > 1e-12]
+                        for c, terms in enumerate(terms_by_dof):
+                            if not terms:
+                                continue
                             if len(terms) == 1:
                                 # Abaqus rejects one-term *Equation rows ("use *BOUNDARY"):
                                 # the constraint is u_r,c = 0, written as a boundary condition
@@ -3685,7 +3744,12 @@ def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes
                         n_dofs_held={str(d): len(v) for d, v in sorted(held_dof.items())},
                         constraint="u_ref + theta_chord x (virtual_corner - p_ref) = 0 per fold and ring "
                                    "(exact classifier Qf rows; reference translations eliminated together)",
-                        formulation='virtual_corner_exact_chord_v1')
+                        formulation='virtual_corner_exact_chord_v1',
+                        reference_scope='corner_restrained_local_reference; L+O admissible, output purity check required',
+                        rigid_motion_coverage=rigid_coverage,
+                        constraint_coverage=dict(required_rows=required_rows, added_rows=added_rows,
+                            implied_by_existing_boundaries=implied_rows,
+                            complete=required_rows == added_rows+implied_rows))
         lines = lines0[:i_end_asm] + add_asm + lines0[i_end_asm:]
         if add_bc:
             lines = _insert_step_bcs(lines, add_bc)
@@ -3737,30 +3801,67 @@ def make_reference_models(run_dir: Path, st: Settings, kinds=("G", "L"), n_modes
 
 
 def reference_check(run_dir: Path, rows) -> dict | None:
-    """For a REF_G / REF_L run: does the classifier recover the imposed mechanism?"""
+    """Check reported transverse kinematics, not independent cFSM validation."""
     f = run_dir / "gdlc_reference.json"
     if not f.is_file():
         return None
     ref = json.loads(f.read_text(encoding="utf-8"))
     kind = ref.get("kind")
+    if kind not in ('G', 'L'):
+        return None
+    invalid = []
+    for index, row in enumerate(rows):
+        try:
+            shares = np.array([float(row[name+'_pct']) for name in CLASSES])
+            value = float(row['eigenvalue'])
+            valid = (np.all(np.isfinite(shares)) and np.all((shares >= 0.) & (shares <= 100.))
+                     and abs(float(shares.sum())-100.) <= 1e-3 and math.isfinite(value) and value > 0.)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:invalid.append(row.get('mode', index+1))
+    if not rows or invalid:
+        return dict(kind=kind,passed=False,source_run=ref.get('source_run'),first_eigenvalue=None,
+                    invalid_modes=invalid,reason='Empty, incomplete or nonfinite/invalid reference modal data')
+    rows = [dict(row,eigenvalue=float(row['eigenvalue']),
+                 **{name+'_pct': float(row[name+'_pct']) for name in CLASSES}) for row in rows]
+    # Some external/archived reports provide eigenspace purity bounds. Honor those
+    # bounds when supplied; this implementation does not compute them. Individual
+    # eigenvector checks alone do not establish purity of every cluster combination.
+    subspace = []
+    for row in rows:
+        value = row.get('subspace_'+kind+'_min_pct')
+        if value in (None, ''):continue
+        try:value = float(value)
+        except (TypeError,ValueError,OverflowError):value = float('nan')
+        if not math.isfinite(value) or not 0. <= value <= 100.:
+            return dict(kind=kind,passed=False,source_run=ref.get('source_run'),first_eigenvalue=None,
+                        reason='Invalid reference eigenspace purity data')
+        subspace.append(value)
+    subspace_passed = not subspace or min(subspace) >= 95.
     if kind == "G":
         v = [r["G_pct"] for r in rows]
         res = dict(kind="G", min_G_pct=min(v), mean_G_pct=float(np.mean(v)),
-                   passed=bool(min(v) >= 95.0))
+                   passed=bool(min(v) >= 95.0 and subspace_passed))
     elif kind == "L":
         v = [r["G_pct"] + r["D_pct"] + r["C_pct"] for r in rows]
         c = [r["C_pct"] for r in rows]
         local = [r["L_pct"] for r in rows]
+        other = [r["O_pct"] for r in rows]
         ldom = [r["eigenvalue"] for r in rows if r.get("reliable_dominant", r.get("dominant")) == "L"]
         # Folds held => no G, D or C (every one of them moves folds): G+D+C must vanish.
         res = dict(kind="L", max_G_plus_D_plus_C_pct=max(v), mean_G_plus_D_plus_C_pct=float(np.mean(v)),
                    max_C_pct=max(c), mean_C_pct=float(np.mean(c)),
                    min_L_pct=min(local),
+                   max_O_pct=max(other),
                    first_L_dominant_eigenvalue=min(ldom) if ldom else None,
-                   passed=bool(max(v) <= 5.0 and min(local) >= 95.0))
+                   interpretation='corner_restrained_local_reference',
+                   passed=bool(max(v) <= 5.0 and min(local) >= 95.0 and max(other) <= 5.0
+                               and subspace_passed))
     else:
         return None
-    res.update(source_run=ref.get("source_run"), first_eigenvalue=min(r["eigenvalue"] for r in rows))
+    res.update(source_run=ref.get("source_run"), first_eigenvalue=min(r["eigenvalue"] for r in rows),
+               eigenspace_purity_assessed=len(subspace) == len(rows))
+    if subspace:res['min_subspace_'+kind+'_pct'] = min(subspace)
     return res
 
 # ----------------------------------------------------------------------------
@@ -3800,6 +3901,8 @@ def main(argv=None):
     ap.add_argument("--make-reference-models", action="store_true",
                     help="write <run>_REF_G and <run>_REF_L Abaqus inputs (pure-G, corner-restrained L) and exit")
     ap.add_argument("--reference-modes", type=int, default=20, help="eigenvalues requested in reference models")
+    ap.add_argument("--reference-kinds", default='G,L',
+                    help="with --make-reference-models: G,L (default), G or L only")
     ap.add_argument("--ref-g-twist", choices=("auto", "restrained", "free"), default=Settings.ref_g_twist,
                     help="REF_G: rotation of the sections about the member axis. auto (default) = restrained "
                          "for compression runs (global flexural modes only, no torsional / flexural-torsional "
@@ -3828,6 +3931,9 @@ def main(argv=None):
     if argv is None and "--benchmarks" in sys.argv:
         sys.argv.append("_")
     a = ap.parse_args(argv)
+    ref_kinds = tuple(k.strip().upper() for k in a.reference_kinds.split(',') if k.strip())
+    if not ref_kinds or len(set(ref_kinds)) != len(ref_kinds) or set(ref_kinds)-{'G','L'}:
+        ap.error('--reference-kinds must list G and/or L once each')
     if a.solve_only and (not a.solve_reference_models or a.make_reference_models or a.selftest_only):
         ap.error('--solve-only requires --solve-reference-models and cannot generate/classify reference models')
     if a.threads < 1:
@@ -3863,6 +3969,10 @@ def main(argv=None):
         sys.exit("folder(s) not found: " + "; ".join(missing))
     runs = find_runs(a.paths)
     if not runs:
+        if a.make_reference_models and any((Path(p)/'builtup_member.csv').is_file() for p in a.paths):
+            sys.exit('The selected folder contains CSV geometry inputs, not a built Abaqus model. '
+                     'Build the original model first, then pass its output run folder containing '
+                     '<job>.inp and <job>_build.json to --make-reference-models.')
         sys.exit("no run folders found (need a modal export, or one <job>.inp with a *Buckle step "
                  "and <job>_build.json / gdlc_reference.json)")
     log(f"{len(runs)} run(s); threads={N_THREADS}; cpus={os.cpu_count()}; export={st.export}")
@@ -3909,7 +4019,7 @@ def main(argv=None):
             try:
                 if not _prepare(r):
                     continue
-                make_reference_models(r, st, n_modes=a.reference_modes)
+                make_reference_models(r, st, kinds=ref_kinds, n_modes=a.reference_modes)
             except Exception as e:
                 log(f"  FAILED reference models for {r}: {e!r}")
                 bad += 1

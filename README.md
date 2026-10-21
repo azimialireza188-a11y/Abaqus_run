@@ -1,5 +1,98 @@
 # Abaqus_run
 
+`abaqus_family_pipeline.py --pm-only` prepares the original/reference/Step4 stages
+and runs only the P-M nonlinear rays, omitting the separate standalone Step5 run.
+Its reference folder may retain a bending load-case tag. The pure-P and pure-M
+endpoints remain part of P-M. `--parallel-jobs 2` enables independent nonlinear
+solves within each queue; `--cpus` is the total physical-core budget shared between
+workers, RAM shares total 100%, and only one worker uses the GPU. Default is one
+job. Each solve has private working/scratch files; extraction/plots/status writes
+remain serialized. Existing running jobs are not reconfigured by these options.
+
+## Unified family commands for the model without added plates
+
+`abaqus_family_pipeline.py` runs the existing builder, L/G reference analyses,
+Step 4 and the selected Step-5 queue. Add `--pm-interaction` to build, solve and
+collect nonlinear P-M rays for each family in the same command. The existing
+geometry, connections, end restraints and force distributions are preserved;
+this command does not add intermediate or end plates. Plate-geometry options
+from the separate plated repository are deliberately unsupported. Saved inputs
+whose metadata describes added plates are rejected.
+
+Example for bending about the 0-degree neutral axis and its P-M envelope, in CMD:
+
+```bat
+cd /d "C:\Users\810200014.HAMI.001\Documents\Abaqus_run"
+py -3.14 "C:\Users\810200014.HAMI.001\Documents\Abaqus_run\abaqus_family_pipeline.py" ^
+  --family-root "C:\Users\810200014.HAMI.001\Documents\CUFSM-Single\cfs_abaqus_family_imperfection\A4784_t2_qm1_0_0_0_R8_lipR20t_lipLen60_M80_L3600_gap10_nb19_end25-25_row15" ^
+  --output-root "D:\column-result\no_plates_bending_0" ^
+  --repo "C:\Users\810200014.HAMI.001\Documents\Abaqus_run" ^
+  --load-case bending ^
+  --bending-axis-deg 0 ^
+  --pm-interaction ^
+  --pm-axes "0" ^
+  --pm-angles "0,15,30,45,60,75,90" ^
+  --model-cases both ^
+  --mesh-mm 20 ^
+  --n-modes 250 ^
+  --n-vectors 500 ^
+  --max-iterations 1250 ^
+  --cpus auto ^
+  --buckle-output detailed ^
+  --nodal-precision full ^
+  --longitudinal-lines 4 ^
+  --longitudinal-line-min-spacing-mm 5 ^
+  --steel-column-plate-fy 240 ^
+  --local-mode 1 ^
+  --global-modes "1" ^
+  --resume
+```
+
+`--family-root` is the directory containing the `family_1`, `family_2`, ...
+input folders. If these are inside `New folder`, append that component to the
+input path. Output layout is
+`<output-root>/<family-root-name>/<family>_BEND000/imperfection/`.
+
+- Compression: replace `--load-case bending` with `--load-case compression`,
+  remove `--bending-axis-deg`, and omit `--global-modes` to use the existing
+  compression default `1,2`. Give compression its own output root. Remove
+  `--pm-interaction` if only the axial capacity analysis is needed.
+- Bending only: omit `--pm-interaction`; the primary moment-rotation plots are
+  still produced. Bending defaults to global mode `1`.
+- `--model-cases perfect` selects only PERFECT for nonlinear construction and
+  solution; `--model-cases imperfect` selects only LG_mp. Shared Step-4 reference
+  preparation can still contain both source cases. Default is `both`.
+- `--steel-column-plate-fy` specifies the existing column-wall yield stress;
+  the name matches the other repository's CLI and creates no plate.
+- `--pm-axes` gives moment neutral axes; `--pm-angles` gives load ratios along
+  each P-M curve (0 = axial, 90 = bending). Use `required` for the symmetry-based
+  axis set, or an explicit list such as `"0,45"`.
+
+Default nonlinear folders are `Step5_GMNIA_FY240_LG` and `Step5_PM_FY240_LG`;
+single-case folders append `_PERFECT_ONLY` or `_IMPERFECT_ONLY`. The P-M chart is
+under `<PM-folder>/diagram/PM_interaction.png` (also SVG). Verified PERFECT
+curves use blue circles/solid lines; imperfect curves use orange squares/dashed
+lines. Provisional incomplete-response points remain hollow and unconnected.
+The existing response-selection rule (peak, qualifying stiffness/load drop, or
+an eligible ascending endpoint) is preserved.
+
+The optional legacy override `--cufsm-report-dir` reads `summary.xlsx`, sheet `section_properties_3`, group
+`builtup_4_pieces`. The A*Fy, S*Fy and Z*Fy lines use the built-up section and
+the requested column fy. Report values are plotting references and do not alter
+FE loads or normalization. For angles without an exact report modulus, the
+reference axis is labeled explicitly; no diagonal Z value is invented.
+
+`--resume` verifies source content, modes, cases, material, numerical settings
+and job inputs before reuse. Completed jobs are reused; eligible saved stopped
+responses are collected without a new solve. Changed P-M axes/rays require a
+fresh `--pm-directory NAME`; changed Step-5 settings require a fresh
+`--step5-directory NAME`. Existing results are not overwritten to satisfy a
+changed request. `--start-family family_5` skips earlier families. Source and
+working CAEs are retained. Auto resources use all detected physical solver
+cores, all logical Python CPUs, available GPUs and 100% solver memory without
+a reserve. The integrated P-M option runs GMNIA; the separate elastic P-M
+buckling command below remains optional.
+
 ## Solve a model already created with --build-only
 
 Running the builder again without `--build-only` creates another run folder and
@@ -705,3 +798,28 @@ sidecars, interrupted Step5 builds lacking their final CAE/queue, running jobs,
 and unsuccessful occupied solver destinations are preserved and refused rather
 than overwritten or silently rerun. Lightweight checks use synthetic/mock jobs;
 actual Abaqus execution and convergence still require the user's full run.
+
+
+### Report-free section properties and HSS comparison
+
+`--cufsm-report-dir` is optional. Omit that entire argument to calculate the
+section references inside this repository. `--family-root` still supplies the
+original geometry CSV files; no Excel workbook, MAT file or report folder is
+needed. An explicitly supplied report remains a legacy override.
+
+The gross built-up A, centroid and inertia use all four pieces of
+`builtup_segments.csv`, with their actual thickness. S = I/(c + t/2) uses the gross outer-fibre
+benchmark, matching the former CUFSM report. The shell loading and mesh-based
+normalization keep their original centre-line definition. Z uses the equal-area
+plastic neutral axis. Each requested bending angle, including 45 degrees, is
+integrated directly. AsFy, SFy and ZFy use the current column yield stress, not
+the auxiliary plate yield stress. Transverse connecting plates are excluded
+from these prismatic column section benchmarks.
+
+References are embedded in new Step5 metadata. For old metadata the collector
+can calculate them from the bound `pipeline_status.json` geometry snapshot,
+checking its saved SHA-256 when present, without opening the old workbook.
+This affects plotted benchmarks only; solver inputs, response selection,
+normalization and provisional/verified status keep their existing definitions.
+Different family geometries retain separate references; a common benchmark is
+omitted when the collected geometries differ.

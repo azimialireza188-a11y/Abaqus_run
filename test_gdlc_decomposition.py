@@ -554,7 +554,10 @@ def test_local_reference_axis_aligned_corner_offset_is_a_boundary_not_a_one_term
     # fold reference node, so one in-plane row reduces to u_r,2 = 0. Abaqus rejects one-term
     # *Equation rows, so that DOF must be held by a boundary condition in every load case.
     c = np.cos(np.pi / 4)
-    p = np.array([(0, 20), (0, 14), (0, 8), (0, 2), (2 - 2 ** .5, 2 - 2 ** .5), (2, 0), (8, 0), (14, 0), (20, 0)],
+    # A second corner makes this piece's corner restraints block all three rigid
+    # motions. A one-corner piece alone is not an isolating Local reference.
+    p = np.array([(0, 20), (0, 14), (0, 8), (0, 2), (2 - 2 ** .5, 2 - 2 ** .5), (2, 0), (8, 0), (14, 0), (20, 0),
+                  (20, 6), (20, 12)],
                  float) @ np.array([[c, -c], [c, c]]).T
     n, nr = len(p), 3
     mesh = gdlc.Mesh(np.arange(n * nr), np.array(["P"] * (n * nr)), np.arange(1, n * nr + 1),
@@ -581,7 +584,7 @@ def test_local_reference_axis_aligned_corner_offset_is_a_boundary_not_a_one_term
     info = json.loads((out / "gdlc_reference.json").read_text())
     assert info["n_dofs_held"] == {"2": 3}
     assert text.count("LREF_FOLDS_U2, 2, 2") == 2                 # both load cases
-    held = {(("P", 5), 2), (("P", 14), 2), (("P", 23), 2)}
+    held = {(("P", 5+r*n), 2) for r in range(nr)}
     assert not held & {t[0][:2] for t in eqs}
     # A coarse three-node arc measures chord rotation using the reference node itself.
     # This kinematic definition is independent of the applied load case.

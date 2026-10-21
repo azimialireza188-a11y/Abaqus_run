@@ -1,9 +1,70 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
 
 import abaqus_pipeline_contract as contract
+
+
+class WorkingCaeTests(unittest.TestCase):
+    def test_locked_source_is_not_staged_or_opened(self):
+        from pathlib import Path
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)/'reference.cae'
+            source.write_bytes(b'unchanged source')
+            source.with_suffix('.lck').write_text('active kernel')
+            opener = mock.Mock()
+            with mock.patch.dict('sys.modules', {'abaqus': NS(openMdb=opener)}):
+                with self.assertRaisesRegex(ValueError, 'locked'):
+                    contract.open_working_mdb(str(source), folder)
+            opener.assert_not_called()
+            self.assertEqual(len(list(Path(folder).iterdir())), 2)
+
+    def test_kernel_update_targets_temporary_cae_and_preserves_original(self):
+        from pathlib import Path
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)/'reference.cae'
+            source.write_bytes(b'unchanged source')
+            staged = []
+            def open_database(pathName):
+                path = Path(pathName)
+                staged.append(path)
+                path.write_bytes(b'kernel writes even without explicit save')
+                return NS(models={'reference': object()}, close=lambda: None,
+                          saveAs=lambda **kw: Path(kw['pathName']).write_bytes(path.read_bytes()))
+            with mock.patch.dict('sys.modules', {'abaqus': NS(openMdb=open_database)}):
+                database = contract.open_working_mdb(str(source), folder)
+                self.assertEqual(source.read_bytes(), b'unchanged source')
+                self.assertIn('reference', database.models)
+                output = Path(folder)/'output.cae'
+                with mock.patch.object(contract.shutil, 'rmtree', side_effect=PermissionError('CAE still open')):
+                    database.saveAs(pathName=str(output))
+                    database.close()
+                    database.close()
+                self.assertEqual(output.read_bytes(), b'kernel writes even without explicit save')
+                self.assertTrue(staged[0].is_file())
+                self.assertEqual(staged[0].read_bytes(), b'kernel writes even without explicit save')
+            self.assertEqual(source.read_bytes(), b'unchanged source')
+
+    def test_failed_open_preserves_working_cae_and_original_error(self):
+        from pathlib import Path
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)/'reference.cae'
+            source.write_bytes(b'unchanged source')
+            with mock.patch.dict('sys.modules', {'abaqus': NS(openMdb=mock.Mock(side_effect=RuntimeError('bad CAE')))}):
+                with self.assertRaisesRegex(RuntimeError, 'bad CAE'):
+                    contract.open_working_mdb(str(source), folder)
+            working = list(Path(folder).glob('cfs_cae_work_*/reference.cae'))
+            self.assertEqual(len(working), 1)
+            self.assertEqual(working[0].read_bytes(), b'unchanged source')
+            self.assertEqual(source.read_bytes(), b'unchanged source')
 
 
 def valid_state(run_dir):
@@ -48,6 +109,7 @@ class PipelineContractTests(unittest.TestCase):
 
     def make_run(self):
         root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
         state = valid_state(root)
         with open(os.path.join(root, 'pipeline_status.json'), 'w') as stream:
             json.dump(state, stream)
@@ -151,7 +213,7 @@ class PipelineContractTests(unittest.TestCase):
             contract.validate_reference_state(state)
 
     def test_bending_reference_contract(self):
-        state = self.bending_state(tempfile.mkdtemp())
+        state = self.bending_state("unused")
         contract.validate_reference_state(state)
         snap = contract.load_case_snapshot(state['build'])
         self.assertEqual(snap['type'], 'bending')
@@ -160,7 +222,7 @@ class PipelineContractTests(unittest.TestCase):
         state['build']['loads'] = 41
         with self.assertRaisesRegex(ValueError, 'nodal-force count'):
             contract.validate_reference_state(state)
-        state = self.bending_state(tempfile.mkdtemp())
+        state = self.bending_state("unused")
         state['build']['load_case']['type'] = 'torsion'
         with self.assertRaises(ValueError):
             contract.validate_reference_state(state)
@@ -233,3 +295,29 @@ class PipelineContractTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NativeResourceTests(unittest.TestCase):
+    def test_windows_core_detection_uses_topology_without_wmi_access(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        import ctypes, struct
+        import runtime_resources as r
+        # Variable-sized processor-core records: two cores, each with SMT threads.
+        topology = struct.pack('<II', 0, 32)+bytes(24)+struct.pack('<II', 0, 40)+bytes(32)
+        def query(relation, buffer, length):
+            if buffer is None:
+                length._obj.value = len(topology)
+                return 0
+            ctypes.memmove(buffer, topology, len(topology))
+            return 1
+        kernel = SimpleNamespace(GetLogicalProcessorInformationEx=query)
+        with mock.patch.object(r.os, 'name', 'nt'), \
+                mock.patch.object(r.ctypes, 'windll', SimpleNamespace(kernel32=kernel), create=True), \
+                mock.patch.object(r, 'logical_cpu_count', return_value=4), \
+                mock.patch.object(r, 'available_memory', return_value=(1000, 900)), \
+                mock.patch.object(r.subprocess, 'check_output', side_effect=FileNotFoundError) as external:
+            inventory = r.detect_resources()
+        self.assertEqual(inventory.physical_cores, 2)
+        self.assertEqual(r.resolve_solver_policy(inventory).cpus, 2)
+        self.assertTrue(all(call.args[0][0] == 'nvidia-smi' for call in external.call_args_list))

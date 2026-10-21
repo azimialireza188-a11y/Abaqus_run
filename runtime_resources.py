@@ -7,6 +7,7 @@ import ctypes
 import inspect
 import os
 import subprocess
+import struct
 import warnings
 
 
@@ -86,14 +87,39 @@ def available_memory():
     raise OSError('Memory discovery unsupported on this platform')
 
 
+def windows_physical_core_count():
+    """Query native CPU topology across all processor groups without WMI privileges."""
+    query = ctypes.windll.kernel32.GetLogicalProcessorInformationEx
+    query.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    query.restype = ctypes.c_int
+    length = ctypes.c_ulong(0)
+    query(0, None, ctypes.byref(length))  # RelationProcessorCore: one record per core.
+    if length.value < 8:
+        raise OSError('Cannot query physical CPU topology')
+    capacity = length.value
+    buffer = ctypes.create_string_buffer(capacity)
+    if not query(0, buffer, ctypes.byref(length)) or length.value > capacity:
+        raise OSError('Cannot read physical CPU topology')
+    offset, cores = 0, 0
+    while offset < length.value:
+        if offset+8 > length.value:
+            raise ValueError('Truncated CPU topology header')
+        relation, size = struct.unpack_from('<II', buffer, offset)
+        if relation != 0 or size < 8 or offset+size > length.value:
+            raise ValueError('Invalid CPU topology record')
+        cores += 1
+        offset += size
+    if cores < 1:
+        raise ValueError('Empty CPU topology')
+    return cores
+
+
 def detect_resources():
     cpus = logical_cpu_count()
     physical = cpus
     try:
         if os.name == 'nt':
-            physical = min(cpus, int(subprocess.check_output(['powershell','-NoProfile','-Command',
-                '(Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum'],
-                text=True, timeout=10).strip()))
+            physical = min(cpus, windows_physical_core_count())
         elif os.path.exists('/proc/cpuinfo'):
             with open('/proc/cpuinfo') as f: sections=f.read().strip().split('\n\n')
             ids=set()

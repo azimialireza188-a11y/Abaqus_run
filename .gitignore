@@ -37,3 +37,14 @@ runs/
 portable_modal_export*/
 *.parquet
 STEP5_queue_progress.done
+
+# Retained local CAE working files and verification artifacts
+*.cae
+*.exception
+cfs_cae_work_*/
+cfs_step5_*/
+cfs_pm_*/
+cfs_pmb_*/
+tmp*/
+.pytest_cache/
+.verification*/

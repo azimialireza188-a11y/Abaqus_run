@@ -691,25 +691,35 @@ def validate_bending_reference_mode(load_case, component, mode, classification):
     """A known impure reference vector must not pass the generic mixed-mode threshold.
 
     Check the selected vector, not the whole reference run: another eigenmode's
-    failure does not invalidate a pure selected one. Compression and deliberately
-    selected mixed modes from the original model retain their existing behavior.
+    failure does not invalidate a pure selected one. REF_L uses the same criterion
+    for every load case; the REF_G criterion remains specific to bending. Original
+    mixed sources and unavailable classifications retain their warning path.
     """
     expected = {'local': 'L', 'global': 'G'}.get(component)
-    if (load_case.get('type') != 'bending' or expected is None or not classification
+    if (expected is None or (expected == 'G' and load_case.get('type') != 'bending') or not classification
             or classification.get('status') != 'ok'
             or (classification.get('reference_check') or {}).get('kind') != expected):
         return
     shares = classification.get('shares_pct', {})
+    if expected == 'L':
+        try:
+            shares = {k: float(shares[k]) for k in 'GDLCO'}
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise ValueError('REF_L mode %d requires complete finite individual G/D/L/C/O shares' % mode)
+        if (any(not np.isfinite(v) or v < 0. or v > 100. for v in shares.values())
+                or not math.isclose(python_builtins.sum(shares.values()), 100., rel_tol=0., abs_tol=1e-3)):
+            raise ValueError('REF_L mode %d has invalid individual G/D/L/C/O shares; '
+                             'each must be finite in [0, 100] and their sum must be 100%%' % mode)
     primary = shares.get(expected, float('nan'))
     # CAE's execution namespace can shadow Python's sum with its own API.
     nonlocal_share = python_builtins.sum(shares.get(k, 0.) for k in ('G', 'D', 'C'))
     if (not np.isfinite(primary) or primary < 95.
-            or (expected == 'L' and (not np.isfinite(nonlocal_share) or nonlocal_share > 5.))):
-        raise ValueError('Bending REF_%s mode %d does not meet the reference criterion '
+            or (expected == 'L' and (not np.isfinite(nonlocal_share) or nonlocal_share > 5. or shares['O'] > 5.))):
+        raise ValueError('REF_%s mode %d does not meet the reference criterion '
                          '(%s >= 95%%%s): %s=%.4g%%. Select a verified pure mode; '
                          'a changed reference requires new solved/classified results. The 80%% '
                          'mixed-mode warning threshold is not a reference acceptance criterion.' %
-                         (expected, mode, expected, ' and G+D+C <= 5%' if expected == 'L' else '',
+                         (expected, mode, expected, ' and G+D+C <= 5% and O <= 5%' if expected == 'L' else '',
                           expected, primary))
 
 

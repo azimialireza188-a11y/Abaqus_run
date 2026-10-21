@@ -11,6 +11,55 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import tempfile
+
+class _WorkingModelDatabase:
+    """Delegate CAE operations and retain the working source for inspection."""
+    def __init__(self, database, directory):
+        self._database, self._directory = database, directory
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._database, name)
+
+    def saveAs(self, **kwargs):
+        return self._database.saveAs(**kwargs)
+
+    def close(self):
+        if self._closed:
+            return
+        self._database.close()
+        self._closed = True
+
+def open_working_mdb(source_cae, scratch_dir=None):
+    """Open a retained CAE working file; openMdb itself uses update access.
+
+    Reading the original with shutil keeps its bytes/timestamp unchanged. This is
+    kernel workspace, retained after saveAs/close as requested for inspection.
+    Default workspace is alongside the scripts, not in an existing result directory.
+    """
+    from abaqus import openMdb
+    source_cae = os.path.abspath(source_cae)
+    locks = (os.path.splitext(source_cae)[0]+'.lck', source_cae+'.lck')
+    if any(os.path.exists(path) for path in locks):
+        raise ValueError('Source CAE is locked; close its active kernel before conversion: '+source_cae)
+    before = os.stat(source_cae)
+    scratch_dir = scratch_dir or os.path.dirname(os.path.abspath(__file__))
+    directory = tempfile.mkdtemp(prefix='cfs_cae_work_', dir=scratch_dir)
+    try:
+        working = os.path.join(directory, os.path.basename(source_cae))
+        shutil.copyfile(source_cae, working)
+        after = os.stat(source_cae)
+        if ((before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
+                or any(os.path.exists(path) for path in locks)):
+            raise ValueError('Source CAE changed or became locked while staging: '+source_cae)
+        print('CAE working file retained: '+working, flush=True)
+        return _WorkingModelDatabase(openMdb(pathName=working), directory)
+    except BaseException:
+        print('CAE working directory retained after error: '+directory, flush=True)
+        raise
+
 
 STATUS_FILE = 'pipeline_status.json'
 REFERENCE_ELEMENT_TYPE = 'S4R'

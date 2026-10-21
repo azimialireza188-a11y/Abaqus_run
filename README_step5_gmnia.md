@@ -4,6 +4,29 @@
 
 ## دستور اجرا
 
+کنترل مسیرهای اجرای موازی، مسیرهای معمول ویندوز، پیشوند `\\?\` و نام‌های
+کوتاه 8.3 را با نرمال‌سازی و در صورت نیاز با هویت فایل‌سیستم مقایسه می‌کند.
+پوشه‌های اختصاصی scratch و workspace که لینک، junction یا reparse point
+باشند همچنان رد می‌شوند؛ حفاظت پیش از ساخت و پس از حل برقرار است.
+`--resume` برای خطایی که پیش از ارسال Job رخ داده و هیچ نتیجه‌ای ایجاد
+نکرده است، مقصد استفاده‌نشده را دوباره بررسی و اجرا می‌کند. نتایج موجود
+و پوشه‌های کاری باقی‌مانده بازنویسی یا حذف نمی‌شوند.
+
+در اجرای موازی، هر Job پوشهٔ کاری کوتاه و مستقل زیر `.queue_work` دارد.
+فایل‌های scratch در مسیر کوتاهِ مستقل زیر `.abq_scratch` در پوشهٔ کد
+قرار می‌گیرند؛ اگر طول مسیر کافی نباشد، مسیر TEMP بررسی می‌شود. طول مسیرهای
+داخلی Abaqus پیش از ارسال Job کنترل می‌شود و هیچ تنظیمی از منابع سیستم
+برای این منظور کاهش نمی‌یابد. scratch پس از توقف حلگر و تحویل خروجی پاک
+می‌شود؛ در صورت توقف نامطمئن یا قفل فعال، فایل‌ها برای بررسی حفظ می‌شوند.
+
+وجود ODB و کد خروج صفر به‌تنهایی موفقیت حل نیست. خطاهای پیش‌پردازش از
+`.dat` و لاگ اجرا بررسی و با علت واقعی گزارش می‌شوند. شکست همگرایی که
+منحنی قابل‌استخراج دارد، همچنان طبق قواعد فعلی نتایج ناتمام پردازش می‌شود.
+ODB اولیهٔ فاقد گام تحلیل، قابل استفاده برای نمودار نیست. برای حفظ نتایج
+قبلی، آن‌ها بازنویسی نمی‌شوند؛ در اجرای مقایسه می‌توان با `--resume` و
+`--plates-pm-directory "Step5_PM_FY240_LG_REF1_PERFECT_FIXED"` فقط مقصد P–M
+ورق‌دار را تغییر داد و مراحل قبلیِ سازگار را دوباره استفاده کرد.
+
 ### نمایش مرحلهٔ جاری در CMD
 
 ساخت مدل و اجرای صف اکنون پیام‌های فوری همراه ساعت چاپ می‌کنند. در اجرای
@@ -341,6 +364,36 @@ attempting the remaining queue, except that preflight conflicts stop submission
 before any job starts. Solver stdout/stderr is saved per job as
 `STEP5_*_queue_solver.log`.
 
+## Bounded Newton controls for new inputs
+
+New Step5 inputs use `--riks-controls robust`: Newton line search with at most
+four searches and `ANALYSIS=DISCONTINUOUS` (I0=8, IR=10). The default maximum
+16 equilibrium iterations, five increment attempts, minimum arc 1e-8 and
+5000-increment ceiling remain unchanged. No field/constraint accuracy tolerances,
+hardening, damping, supports, loads or geometric imperfections are changed.
+The line searches add element residual evaluations, not stiffness decompositions.
+This is a bounded correction strategy, not an unlimited solver retry sequence.
+
+Family/comparison/HSS pipelines default to `--riks-controls auto`: robust for
+new inputs, recorded controls for occupied inputs. Legacy metadata without this
+key means default Abaqus controls. `--riks-controls default` explicitly retains
+those original controls. Saved failed results remain failed and are not silently
+resubmitted or overwritten when source code changes.
+
+For a new numerical attempt with verified earlier stages, use `--resume` with
+`--riks-controls robust --pm-directory Step5_PM_ROBUST_V1` (choose an unused name).
+The common comparison directory option also reaches HSS. Standalone Step5 uses
+a fresh `--step5-directory` instead. Earlier Step4 provenance can be reused even
+when its old nonlinear delivery used default controls. Occupied destinations
+still reject a different explicitly requested policy.
+
+These controls cannot guarantee postbuckling continuation through a true
+perfect-model bifurcation. A converged observed response, rather than a solver
+exit code or merely decreasing LPF, is required for interpreting a selected point.
+Ordinary unfinished-curve selection is unchanged; no missing P-M point is invented.
+See the official [Newton convergence controls](https://docs.software.vt.edu/abaqusv2025/English/SIMACAEANLRefMap/simaanl-c-convergcriteria.htm)
+and [Riks bifurcation restrictions](https://docs.software.vt.edu/abaqusv2025/English/SIMACAEANLRefMap/simaanl-c-postbuckling.htm).
+
 ## Automatic plots and resource requests
 
 The queue extracts each finished/terminated readable ODB with its own matching
@@ -358,6 +411,16 @@ that do not reach the 70% drop or have solver errors are labeled accordingly.
 No strain/displacement sorting is applied to Riks snap-back paths. All cases
 must have field_frequency=1 for audited sequence alignment with automatic LPF
 history. The builder enforces this; existing sparse-output models are rejected.
+
+An apparent 70% LPF crossing is also screened against the preceding ascending
+response. If every available active end-response channel retraces that path
+within 1% of its pre-peak excursion, the peak is marked `PATH_REVIEW_REQUIRED`:
+the observed increment is retained for P-M display as `UNVERIFIED_PATH_RETRACE`,
+but is not certified as Pu/Mu. A decreasing displacement alone does not trigger
+this warning; real snap-back need not retrace the ascending path. This screen
+does not establish physical collapse or rule out bifurcation. The established
+selection policy for other unfinished curves is unchanged. Resume reassesses
+saved CSVs and refreshes reports without submitting an existing occupied job.
 
 If Matplotlib is unavailable in Abaqus Python, PNG uses the native CAE XY plotting
 engine; SVG always uses the standard library. No pip installation is required.
@@ -391,6 +454,19 @@ Abaqus on the target Windows machine reports 12 available solver CPUs despite
 files, so existing CAE/INP/BAT files need not be rebuilt for this change. A launcher
 exit code zero with no ODB now reports the actual solver log as SOLVER_ERROR.
 
+
+## Unified family entry point
+
+For compression, bending, selected PERFECT/LG_mp cases, report references and
+an integrated nonlinear P-M queue, see the
+[unified no-added-plate commands](README.md#unified-family-commands-for-the-model-without-added-plates).
+The standalone commands in this document remain supported. Step 5 also accepts
+`--cufsm-report-dir DIR`; it stores the built-up report references in each job's
+metadata. This option adds graph references without changing loads or geometry.
+The family CLI's `--model-cases perfect|imperfect|both` forwards the existing
+standalone `--models PERFECT`, `--models STEP4_LG_mp`, or both, respectively.
+CAE readers use retained working files so the source CAE is not modified merely
+by opening it in the kernel.
 
 ## Bending (moment-rotation)
 
@@ -485,3 +561,119 @@ With the `--combo` cases of Step 4, this gives the strength-versus-amplitude tab
 `STEP5_PERFECT_FY…` has no imperfection. Riks then follows the symmetric fundamental path until yielding, or
 until round-off triggers a bifurcation. Its peak is an upper reference, used for normalisation and for
 checking the imperfection sensitivity; it is not a design strength.
+
+## Shared P-M selection after a stopped analysis
+
+Response-v3 uses the same selection for independent no-plate jobs and the
+plated/HSS comparison. Existing significant load-drop and stiffness-change
+events are retained, followed by the verified peak or incomplete ascending
+endpoint as applicable. Otherwise a terminal response contributes its observed
+maximum from one synchronized converged P/M frame, labelled
+`UNVERIFIED_OBSERVED_MAXIMUM` with `capacity_verified=false`.
+All displayed points participate in their own specimen/case connection,
+including provisional points. Those lines are comparison guides, not verified
+resistance envelopes. Failed analyses retain their solver-error status.
+Running jobs or missing/invalid curves cannot supply a completed point.
+Collection/resume can reassess saved CSVs without submitting an occupied job.
+
+## Per-P-M-job response pairs and ODB frames
+
+P-M collection writes `diagram/response_curves/<dataset>_<identity>/<job>_axial_bending_response.png`
+and `.svg`: P (kN) versus axial shortening (mm) on the left and M (kN m)
+versus total end rotation (mrad) on the right. Every requested perfect/imperfect
+job with a validated saved history is included, including stopped responses.
+The two-row horizontal tick labels show physical coordinates and actual marked
+ODB frame indices. `F28` means `steps['GMNIA'].frames[28]`, not increment/LPF.
+The complete mapping remains in `<job>_pm_response.csv`; the selected P-M frame
+is marked by a red diamond. Solver order/reversals are preserved; sparse labels
+do not pretend displacement uniquely determines frame number.
+`PM_model_response_plots.json` records source CSVs and output paths. Images are
+cached by source/selection signature and repaired from CSV if missing; no extra
+solve or ODB extraction is required. The combined comparison creates the same
+images for no-plate, plated and HSS datasets in its common `diagram` directory.
+
+The same directory also contains `<job>_axial_bending_response.xlsx` for each
+requested case/ray. `Axial` and `Bending` export all frames with numeric response
+pairs, explicit units and LPF; `Metadata` preserves source paths, solver status
+and the selected frame/verification. No extra Python package is required.
+Workbook caching is independent of image caching, so a missing/incomplete Excel
+file is repaired from CSV without rerendering PNG/SVG or solving again.
+
+
+## Per-job time limit
+
+Every Step-5 nonlinear job, including P-M jobs for no plates, with plates and
+HSS, has a 60-minute wall-clock limit by default. No extra command option is
+needed. Each parallel slot has its own clock starting at submission; time
+waiting in the queue is excluded. Startup and license waiting after submission
+are included.
+
+At the limit the queue requests native Abaqus termination, preserves the saved
+results and starts the next job after shutdown is confirmed. Native shutdown
+and extraction add a short interval after the solve limit. If shutdown cannot
+be confirmed, the queue reports an error instead of reusing a potentially live
+solver's slot.
+
+The status is `TIME_LIMIT`, never a verified capacity. Usable saved frames follow
+the same P-M selection rule as other incomplete jobs. With no usable frames the
+job is explicitly omitted from the plot and the queue continues; no zero or
+invented capacity point is created. `--resume` skips these recorded time stops
+instead of spending another hour on the same job. To retry intentionally, use
+a new run directory. An already running queue must be restarted to load this
+source change.
+
+## P-M response selection (response-v4-dual)
+
+For no-plate, plated and HSS jobs, both Perfect and imperfect, the queue and
+collector apply the same rule independently to P versus axial shortening and M
+versus end rotation. A component with identically zero applied load is excluded.
+The earliest accepted event selects BOTH P and M at one actual saved ODB frame;
+there is no pairing of independent maxima or interpolated capacity coordinates.
+
+A clear pre-peak knee needs at least 35% persistent tangent reduction, a load
+effect of at least 5% of the observed maximum (raised by a six-noise-scale gate),
+and strong broken-line evidence over both a straight line and smooth quadratic
+(BIC improvement >=10). Each side needs at least four real observations spanning
+8% of the loading-branch displacement range. Fits use equal displacement spacing;
+dense adaptive increments do not create extra support. Small coordinate jitter
+(up to 0.5% of branch span) is ignored for fitting. Real reversals bound the fit;
+a later post-peak tail cannot dilute a pre-peak knee. The selected row is the last
+observed frame before the fitted onset bracket, whose indices are recorded.
+
+The existing strong softening screen is retained. A recovered load drop is
+screened directly in solver order, with >=5% drop/recovery and several actual
+increments on each side, so a rotation reversal cannot erase it. These onset
+points remain provisional even if the solver completed. If no event is accepted,
+the existing verified-peak/ascending-endpoint/attained-maximum fallback remains.
+A retracing warning is preserved and cannot certify a provisional point or
+replace an earlier accepted event with a later maximum.
+
+`selection_response`, `selection_policy` and per-channel diagnostic evidence are
+exported with P-M points; paired response images identify the selected channel,
+and each XLSX Metadata sheet records the same policy and evidence. Collection
+re-evaluates saved validated curves under this rule without solving them again.
+No solver tolerances, run limits, geometry or material properties are changed by
+this selection policy; detecting a knee does not establish a design resistance.
+
+
+### Live CMD progress and per-job response reports
+
+The family/comparison and HSS pipelines relay CAE queue messages to the original
+terminal every 15 seconds. Each active job reports elapsed time, converged
+step/increment/attempt, LPF and its attained maximum. Adaptive Riks has no known
+completion percentage; the queue separately reports processed jobs / total jobs.
+Messages are also appended to `STEP5_console_progress.log`.
+
+After each P-M job exits and its ODB is closed/extracted, its solver directory gets
+`<job>_axial_bending_response.png`, `.svg` and `.xlsx`. Excel retains all original
+frame indices and synchronized P, shortening, M and rotation, including stopped
+analyses. `STEP5_response_paths.png/.svg` compares each completed history against
+its physical response and stored frame, with at most six jobs per page (`_002`,
+etc.). `PM_response_report_index.csv` records status and provenance.
+
+The comparison pipeline also updates `diagram/response_curves` and
+`diagram/04_PM_response_paths*.png/.svg` after each job. Existing cached paired
+figures/workbooks are reused. All reporting uses saved CSV, never another solve
+or an additional ODB extraction. A reporting failure preserves numerical results
+and is recorded separately; `--resume` repairs reports without resubmitting an
+occupied job. Selection criteria and capacity verification are unchanged.

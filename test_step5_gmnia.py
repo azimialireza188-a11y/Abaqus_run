@@ -5,6 +5,19 @@ import unittest
 import abaqus_step5_gmnia as step5
 
 
+class ReportArgumentTests(unittest.TestCase):
+    def test_report_uses_current_column_fy_and_resolves_directory(self):
+        import os
+        from unittest import mock
+        import abaqus_report_reference as reports
+        expected=dict(group='builtup_4_pieces',AsFy_kN=100.)
+        with mock.patch.object(reports,'read_reference',return_value=expected) as reader:
+            args=step5.parse_arguments(['--source-cae','source.cae','--output-dir','out',
+                '--fy','350','--cufsm-report-dir','report'])
+        self.assertEqual(args.report_reference,expected)
+        reader.assert_called_once_with(os.path.abspath('report'),fy=350.)
+
+
 @contextlib.contextmanager
 def _incremental_builder(directory, on_prepare=None, on_queue=None, stop_method='monitor'):
     """Exercise file delivery with tiny stand-ins; no CAE import or solver."""

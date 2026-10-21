@@ -27,6 +27,7 @@ import json
 import math
 import os
 import sys
+from html import escape
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(
     globals().get('__file__', sys._getframe().f_code.co_filename)))
@@ -85,8 +86,7 @@ def load_metadata(odb_path, model_name, cae=None):
     if not cae:
         raise ValueError('No metadata sidecar %s and no --cae given' % sidecar)
     import caeModules
-    from abaqus import openMdb
-    database = openMdb(pathName=cae)
+    database = pipeline_contract.open_working_mdb(cae)
     try:
         if model_name not in database.models.keys():
             raise ValueError('STEP5 model not found in CAE: '+model_name)
@@ -120,11 +120,14 @@ def parse_arguments(argv=None):
     p.add_argument('--model', help='STEP5 model name; default is ODB basename')
     p.add_argument('--step', default='GMNIA')
     p.add_argument('--output-dir', help='Default: directory containing the ODB')
+    p.add_argument('--cufsm-report-dir', help='Built-up CUFSM report directory for plotted SFy/ZFy/AsFy benchmarks')
     p.add_argument('--allow-partial', action='store_true',
                    help='Allow extraction from an in-progress ODB by using only the common complete frame/LPF prefix')
     args = p.parse_args(argv)
     args.cae = os.path.abspath(os.path.expanduser(args.cae)) if args.cae else None
     args.odb = os.path.abspath(os.path.expanduser(args.odb))
+    if args.cufsm_report_dir:
+        args.cufsm_report_dir = os.path.abspath(os.path.expanduser(args.cufsm_report_dir))
     args.output_dir = os.path.abspath(os.path.expanduser(
         args.output_dir or os.path.dirname(args.odb)))
     if args.cae and not os.path.isfile(args.cae):
@@ -225,7 +228,10 @@ def lpf_history(step):
             key = str(output_name).strip().upper()
             description = str(getattr(output, 'description', '')).upper()
             if key == 'LPF' or 'LOAD PROPORTIONALITY FACTOR' in description:
-                data = [(float(x), float(y)) for x, y in output.data]
+                raw = output.data
+                if raw is None:
+                    continue  # Failed/in-progress increment may have an unwritten LPF repository.
+                data = [(float(x), float(y)) for x, y in raw]
                 if data:
                     matches.append((str(region_name), str(output_name), data))
     if not matches:
@@ -491,14 +497,15 @@ def _nice_ticks(lo, hi, count=6):
     return values
 
 
-def write_svg(path, rows, peak, title, axes=None):
+def write_svg(path, rows, peak, title, axes=None, yield_lines=None):
     axes = axes or RESPONSE_AXES['compression']
     width, height = 1200, 800
     left, right, top, bottom = 115, 45, 75, 105
     xs = [row[axes['x']] for row in rows]
     ys = [row[axes['y']] for row in rows]
+    references = normalize_capacity_lines(yield_lines or [], axes)
     xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(0.0, min(ys)), max(ys)
+    ymin, ymax = min(0.0, min(ys)), max(ys+[line['value'] for line in references])
     if math.isclose(xmin, xmax):
         xmax = xmin+1.0
     if math.isclose(ymin, ymax):
@@ -542,6 +549,12 @@ def write_svg(path, rows, peak, title, axes=None):
                          (left, y, left+plot_w, y))
             lines.append('<text x="%d" y="%.2f" text-anchor="end" dominant-baseline="middle" font-family="Arial" font-size="15">%.4g</text>' %
                          (left-12, y, value))
+    for reference in references:
+        y = sy(reference['value'])
+        lines.append('<line x1="%d" y1="%.2f" x2="%d" y2="%.2f" stroke="#1676c3" stroke-dasharray="8 5"/>' %
+                     (left, y, left+plot_w, y))
+        lines.append('<text x="%d" y="%.2f" text-anchor="end" font-family="Arial" font-size="15">%s</text>' %
+                     (left+plot_w-8, y-6, escape(reference['label'])))
     lines.extend([
         '<polyline points="%s" fill="none" stroke="#1f5f99" stroke-width="3"/>' % poly,
         '<circle cx="%.2f" cy="%.2f" r="6" fill="#b42318"/>' %
@@ -559,11 +572,488 @@ def write_svg(path, rows, peak, title, axes=None):
         stream.write('\n'.join(lines))
 
 
+RESPONSE_PAIR_VERSION = 'axial_bending_frames_v2'
+
+
+def response_pair_samples(rows, key, selected_frame=None, count=6):
+    """Sparse exact sample labels, not a fictitious inverse displacement/frame scale."""
+    n = len(rows)
+    peak = max(range(n), key=lambda i: max(abs(rows[i]['force_kN']), abs(rows[i]['moment_kNm'])))
+    priority = [0, n-1, peak]
+    priority += [i for i, row in enumerate(rows) if row['frame'] == selected_frame]
+    lo, hi = min(row[key] for row in rows), max(row[key] for row in rows)
+    span = hi-lo
+    # Adaptive solvers may spend hundreds of increments in a tiny response
+    # interval. Pick real samples across physical response, not uniform frames.
+    priority += [min(range(n),key=lambda j:abs(rows[j][key]-(lo+i*span/max(1,count-1))))
+                 for i in range(count)]
+    groups = []
+    for i in dict.fromkeys(priority):
+        x = rows[i][key]
+        exact = next((g for g in groups if g['x'] == x), None)
+        if exact is not None:
+            exact['indices'].append(i)
+        elif not any(abs(g['x']-x) < .13*span for g in groups):
+            groups.append(dict(x=x, indices=[i]))
+    return sorted(groups, key=lambda g: g['x'])
+
+
+def response_pair_rows(rows):
+    """Shared numeric/frame validation for paired figures and Excel exports."""
+    keys = ('shortening_mm', 'rotation_mrad', 'force_kN', 'moment_kNm')
+    data = []
+    for row in rows:
+        try:
+            frame = float(row['frame'])
+            values = {key: float(row[key]) for key in keys}
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError('Incomplete paired-response row: '+str(error))
+        if (not math.isfinite(frame) or frame < 0 or frame != int(frame) or
+                not all(math.isfinite(v) for v in values.values())):
+            raise ValueError('Nonfinite response or invalid ODB frame index')
+        data.append(dict(values, frame=int(frame)))
+    if len(data) < 2 or any(b['frame'] <= a['frame'] for a, b in zip(data, data[1:])):
+        raise ValueError('Paired response needs at least two frames in strict ODB order')
+    return data
+
+
+def write_response_pair(stem, rows, model, result=None, dataset_label=None, source_csv=None):
+    """Plot synchronized P-delta/M-theta histories in ODB order, including reversals."""
+    data = response_pair_rows(rows)
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    result = result or {}
+    selected = result.get('pm_point') or {}
+    selected_frame = selected.get('frame')
+    selected_row = next((r for r in data if r['frame'] == selected_frame), None)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    files, frame_labels = [], {}
+    try:
+        fig.subplots_adjust(left=.075, right=.97, bottom=.29, top=.75, wspace=.28)
+        fig.suptitle(model+' | axial and bending response', fontsize=16, y=.975, weight='bold')
+        status = result.get('outcome', 'RESPONSE_ONLY')
+        fig.text(.075, .90, (dataset_label+' | ' if dataset_label else '')+
+                 'Step: GMNIA | '+status+' | %d saved frames' % len(data), fontsize=10, color='#334155')
+        detail = ('P-M selection: %s | Frame %s | capacity %s' %
+                  (selected.get('selection_kind', 'none'), selected_frame,
+                   'verified by current checks' if selected.get('capacity_verified') else 'unverified'))
+        fig.text(.075, .84, detail, fontsize=10, color='#536270')
+        response = {'shortening_mm': 'P-shortening', 'rotation_mrad': 'M-rotation'}.get(
+            selected.get('selection_response'), selected.get('selection_response', 'none'))
+        fig.text(.075, .80, 'Selection response: '+response+' | Policy: '+
+                 selected.get('selection_policy', 'not recorded'), fontsize=9, color='#536270')
+        for ax, xkey, ykey, xlabel, ylabel, title in (
+                (axes[0], 'shortening_mm', 'force_kN', 'Axial shortening, delta (mm)', 'Axial force, P (kN)', 'Axial response'),
+                (axes[1], 'rotation_mrad', 'moment_kNm', 'End rotation, theta (mrad)', 'Moment, M (kN m)', 'Bending response')):
+            line, = ax.plot([r[xkey] for r in data], [r[ykey] for r in data], color='#176a9c', lw=1.8)
+            line.set_gid('response-pair-curve')
+            groups = response_pair_samples(data, xkey, selected_frame)
+            labels = []
+            frame_labels[xkey] = []
+            for group in groups:
+                samples = [data[i] for i in group['indices']]
+                frames = [r['frame'] for r in samples]
+                labels.append('%.5g\n%s' % (group['x'], ','.join('F%d' % f for f in frames)))
+                frame_labels[xkey].append(dict(value=group['x'], frames=frames))
+                ax.plot([r[xkey] for r in samples], [r[ykey] for r in samples], 'o',
+                        ms=3.8, mfc='white', mec='#176a9c', ls='none', zorder=4)
+            ax.set_xticks([g['x'] for g in groups])
+            ax.set_xticklabels(labels, fontsize=9)
+            ax.set(xlabel=xlabel+'\nODB frame index (marked samples)', ylabel=ylabel, title=title)
+            ax.grid(True, color='#e5eaf0', lw=.65)
+            ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+            ax.tick_params(axis='y', labelsize=9)
+            ax.margins(x=.06, y=.10)
+            if selected_row is not None:
+                ax.plot(selected_row[xkey], selected_row[ykey], marker='D', ms=7,
+                        mec='#b42318', mfc='#b42318' if selected.get('capacity_verified') else 'white',
+                        ls='none', zorder=6)
+                ax.annotate('P-M point: F%d' % selected_frame,
+                            (selected_row[xkey], selected_row[ykey]), xytext=(6, 9),
+                            textcoords='offset points', fontsize=8, color='#b42318')
+        fig.text(.075, .12, 'Frame means steps["GMNIA"].frames[index] (zero-based); it is not increment number or LPF.',
+                 fontsize=9, color='#536270')
+        fig.text(.075, .075, 'Frame labels refer only to marked samples; repeated/reversed coordinates are retained. Red diamond: selected P-M point.',
+                 fontsize=9, color='#536270')
+        if source_csv:
+            fig.text(.075, .035, 'Every frame and its P, M, delta and theta: '+os.path.basename(source_csv),
+                     fontsize=8.5, color='#536270')
+        os.makedirs(os.path.dirname(os.path.abspath(stem)), exist_ok=True)
+        for extension in ('png', 'svg'):
+            path = stem+'.'+extension
+            fig.savefig(path, dpi=180, facecolor='white')
+            files.append(path)
+    finally:
+        plt.close(fig)
+    return dict(files=files, frames=len(data), frame_labels=frame_labels, version=RESPONSE_PAIR_VERSION)
+
+
+RESPONSE_WORKBOOK_VERSION = 'axial_bending_excel_v2'
+
+
+def response_workbook_valid(path):
+    """A missing/interrupted workbook is a cache miss, never a reason to solve again."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as archive:
+            required = {'[Content_Types].xml', '_rels/.rels', 'xl/workbook.xml',
+                        'xl/_rels/workbook.xml.rels', 'xl/styles.xml', 'xl/worksheets/sheet1.xml',
+                        'xl/worksheets/sheet2.xml', 'xl/worksheets/sheet3.xml'}
+            return required.issubset(archive.namelist()) and archive.testzip() is None
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def write_response_workbook(path, rows, model, result=None, dataset_label=None, source_csv=None, info=None):
+    """Dependency-free XLSX with both complete, numeric response pairs and provenance."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    data = response_pair_rows(rows)
+    lpf = []
+    for row in rows:
+        raw = row.get('lpf')
+        value = None if raw in (None, '') else float(raw)
+        if value is not None and not math.isfinite(value):
+            raise ValueError('Nonfinite LPF in response workbook')
+        lpf.append(value)
+    result, info = result or {}, info or {}
+    selected = result.get('pm_point') or {}
+    verified = str(selected.get('capacity_verified', False)).lower() in ('true', '1')
+    metadata = [
+        ('Model', model), ('Dataset', dataset_label or ''), ('Step', 'GMNIA'),
+        ('Frame convention', 'Zero-based steps["GMNIA"].frames[index]; not increment number or LPF'),
+        ('Solver outcome', result.get('outcome', 'RESPONSE_ONLY')),
+        ('Selected point verified', str(verified)), ('Selected frame', selected.get('frame')),
+        ('Selection kind', selected.get('selection_kind', 'none')),
+        ('Selection response', selected.get('selection_response', '')),
+        ('Selection policy', selected.get('selection_policy', '')),
+        ('Selection diagnostics', selected.get('selection_diagnostics', '')), ('Saved frames', len(data)),
+        ('Selected P (kN)', selected.get('P_kN')), ('Selected M (kN m)', selected.get('M_kNm')),
+        ('Model case', info.get('source_case', '')), ('Bending axis (deg)', info.get('bending_axis_deg')),
+        ('P-M angle (deg)', info.get('pm_angle_deg')), ('Source CSV', source_csv or ''),
+        ('Source ODB', os.path.join(os.path.dirname(source_csv), model+'.odb') if source_csv else ''),
+        ('Response convention', 'Original synchronized frames, in solver order; no smoothing or resampling'),
+        ('Verification note', 'Exporting a stopped response does not certify capacity or solver completion')]
+    sheets = [
+        ('Axial', ['Frame (GMNIA, 0-based)', 'Shortening (mm)', 'Axial force (kN)', 'LPF'],
+         [[r['frame'], r['shortening_mm'], r['force_kN'], p] for r, p in zip(data, lpf)]),
+        ('Bending', ['Frame (GMNIA, 0-based)', 'End rotation (mrad)', 'Moment (kN m)', 'LPF'],
+         [[r['frame'], r['rotation_mrad'], r['moment_kNm'], p] for r, p in zip(data, lpf)]),
+        ('Metadata', ['Property', 'Value'], metadata)]
+    ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    package = 'http://schemas.openxmlformats.org/package/2006/relationships'
+    def xml(element):
+        return ET.tostring(element, encoding='utf-8', xml_declaration=True)
+    workbook = ET.Element('workbook', {'xmlns': ns, 'xmlns:r': rel})
+    ET.SubElement(ET.SubElement(workbook, 'bookViews'), 'workbookView')
+    sheet_list = ET.SubElement(workbook, 'sheets')
+    relationships = ET.Element('Relationships', {'xmlns': package})
+    types = ET.Element('Types', {'xmlns': 'http://schemas.openxmlformats.org/package/2006/content-types'})
+    ET.SubElement(types, 'Default', Extension='rels', ContentType='application/vnd.openxmlformats-package.relationships+xml')
+    ET.SubElement(types, 'Default', Extension='xml', ContentType='application/xml')
+    ET.SubElement(types, 'Override', PartName='/xl/workbook.xml',
+                  ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml')
+    root_rels = ET.Element('Relationships', {'xmlns': package})
+    ET.SubElement(root_rels, 'Relationship', Id='rId1', Type=rel+'/officeDocument', Target='xl/workbook.xml')
+    # Keep a small, ordinary header style; data cells remain numeric General cells.
+    styles = ET.fromstring('<styleSheet xmlns="'+ns+'"><fonts count="2">'
+        '<font><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>'
+        '<fills count="3"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill></fills>'
+        '<borders count="1"><border/></borders><cellStyleXfs count="1">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
+    ET.SubElement(types, 'Override', PartName='/xl/styles.xml',
+                  ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml')
+    ET.SubElement(relationships, 'Relationship', Id='rIdStyles', Type=rel+'/styles', Target='styles.xml')
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
+        for index, (name, headers, values) in enumerate(sheets, 1):
+            ET.SubElement(sheet_list, 'sheet', {'name': name, 'sheetId': str(index), 'r:id': 'rId%d' % index})
+            ET.SubElement(relationships, 'Relationship', Id='rId%d' % index, Type=rel+'/worksheet',
+                          Target='worksheets/sheet%d.xml' % index)
+            ET.SubElement(types, 'Override', PartName='/xl/worksheets/sheet%d.xml' % index,
+                          ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml')
+            sheet = ET.Element('worksheet', {'xmlns': ns})
+            extent = 'A1:%s%d' % (chr(64+len(headers)), len(values)+1)
+            ET.SubElement(sheet, 'dimension', ref=extent)
+            view = ET.SubElement(ET.SubElement(sheet, 'sheetViews'), 'sheetView', workbookViewId='0')
+            ET.SubElement(view, 'pane', ySplit='1', topLeftCell='A2', activePane='bottomLeft', state='frozen')
+            ET.SubElement(sheet, 'sheetFormatPr', defaultRowHeight='15')
+            columns = ET.SubElement(sheet, 'cols')
+            for column in range(1, len(headers)+1):
+                width = 100 if name == 'Metadata' and column == 2 else 28
+                ET.SubElement(columns, 'col', min=str(column), max=str(column), width=str(width), customWidth='1')
+            table = ET.SubElement(sheet, 'sheetData')
+            for row_index, line in enumerate([headers]+list(values), 1):
+                record = ET.SubElement(table, 'row', r=str(row_index))
+                for column, value in enumerate(line, 1):
+                    if value is None:
+                        continue
+                    attributes = dict(r=chr(64+column)+str(row_index))
+                    if row_index == 1:
+                        attributes['s'] = '1'
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        if not math.isfinite(value):
+                            raise ValueError('Nonfinite numeric workbook cell')
+                        cell = ET.SubElement(record, 'c', attributes)
+                        ET.SubElement(cell, 'v').text = repr(value)
+                    else:
+                        cell = ET.SubElement(record, 'c', dict(attributes, t='inlineStr'))
+                        ET.SubElement(ET.SubElement(cell, 'is'), 't',
+                                      {'xml:space': 'preserve'}).text = str(value)
+            ET.SubElement(sheet, 'autoFilter', ref=extent)
+            archive.writestr('xl/worksheets/sheet%d.xml' % index, xml(sheet))
+        archive.writestr('[Content_Types].xml', xml(types))
+        archive.writestr('_rels/.rels', xml(root_rels))
+        archive.writestr('xl/workbook.xml', xml(workbook))
+        archive.writestr('xl/_rels/workbook.xml.rels', xml(relationships))
+        archive.writestr('xl/styles.xml', xml(styles))
+    return path
+
+
+def collect_response_pairs(output_dir, points, in_place=False):
+    """Render/cache per-job histories from validated CSVs; never extract ODBs or submit jobs."""
+    import hashlib
+    import re
+    from pathlib import Path
+    import abaqus_step5_queue as queue
+    output = Path(output_dir)
+    manifest_path = output/'PM_model_response_plots.json'
+    previous = {}
+    if manifest_path.is_file():
+        try:
+            with manifest_path.open(encoding='utf-8') as stream:
+                saved = json.load(stream)
+            if isinstance(saved,dict) and saved.get('version') == RESPONSE_PAIR_VERSION:
+                previous = {entry['identity']: entry for entry in saved.get('models', [])}
+        except (OSError, ValueError, KeyError, TypeError):
+            # This is a derived plot cache only. Validate scientific source
+            # artifacts below, then regenerate images after an interrupted write.
+            previous = {}
+    entries, files, seen, statuses = [], [], set(), {}
+    for point in points:
+        if point.get('source') != 'GMNIA':
+            continue
+        folder = Path(point['folder']).resolve()
+        name = str(point['model'])
+        if os.path.basename(name) != name or name in ('.', '..'):
+            raise ValueError('Invalid response model name: '+name)
+        identity = os.path.normcase(str(folder))+'|'+name
+        if identity in seen:
+            continue
+        seen.add(identity)
+        metadata, status_path = folder/(name+METADATA_SUFFIX), folder/'STEP5_queue_status.json'
+        if not metadata.is_file() or not status_path.is_file():
+            continue  # Historic point-only imports have no synchronized response history.
+        info = json.loads(metadata.read_text(encoding='utf-8-sig'))
+        if response_kind(info) != 'combined':
+            continue
+        if folder not in statuses:
+            statuses[folder] = json.loads(status_path.read_text(encoding='utf-8-sig'))
+        records = [r for r in statuses[folder] if r.get('model') == name]
+        if len(records) != 1:
+            raise ValueError('Missing/duplicate paired-response queue record: '+name)
+        ratio = records[0].get('postpeak_stop_ratio',(info.get('settings') or {}).get('postpeak_stop_ratio',.70))
+        entry = queue.completed_curve(folder, name, info, float(ratio), allow_incomplete=True, record=records[0])
+        if entry is None:
+            raise ValueError('Paired-response history is not safely reusable: '+name)
+        result, unused_curve = entry
+        csv_path = folder/(name+'_pm_response'+('_partial' if result.get('partial') else '')+'.csv')
+        payload = csv_path.read_bytes()
+        label = str(point.get('dataset_label') or folder.name)
+        signature = hashlib.sha256(json.dumps(dict(version=RESPONSE_PAIR_VERSION, dataset_label=label,
+            csv_sha256=hashlib.sha256(payload).hexdigest(), input_sha256=info.get('input_sha256'),
+            outcome=result.get('outcome'), selected=result.get('pm_point'),
+            partial=result.get('partial')), sort_keys=True, allow_nan=False).encode('utf-8')).hexdigest()
+        slug = re.sub('[^A-Za-z0-9_-]+', '_', label).strip('_')[:64] or 'dataset'
+        tag = hashlib.sha256(os.path.normcase(str(folder)).encode('utf-8')).hexdigest()[:8]
+        stem = (output/(name+'_axial_bending_response') if in_place else
+                output/'response_curves'/(slug+'_'+tag)/(name+'_axial_bending_response'))
+        paths = [str(stem)+'.'+extension for extension in ('png', 'svg')]
+        cached = previous.get(identity)
+        rows = None
+        if not (cached and cached.get('signature') == signature and cached.get('files') == paths and
+                all(Path(path).is_file() and Path(path).stat().st_size for path in paths)):
+            with csv_path.open(encoding='utf-8-sig', newline='') as stream:
+                rows = list(csv.DictReader(stream))
+            plot = write_response_pair(str(stem), rows, name, result, label, str(csv_path))
+            cached = dict(identity=identity, signature=signature, model=name, dataset=str(folder),
+                          source_csv=str(csv_path), source_odb=str(folder/(name+'.odb')), step='GMNIA',
+                          outcome=result.get('outcome'),
+                          selected_frame=(result.get('pm_point') or {}).get('frame'), **plot)
+        workbook_path = str(stem)+'.xlsx'
+        workbook_signature = hashlib.sha256((signature+RESPONSE_WORKBOOK_VERSION).encode('utf-8')).hexdigest()
+        if not (cached.get('workbook') == workbook_path and
+                cached.get('workbook_signature') == workbook_signature and response_workbook_valid(workbook_path)):
+            if rows is None:
+                with csv_path.open(encoding='utf-8-sig', newline='') as stream:
+                    rows = list(csv.DictReader(stream))
+            write_response_workbook(workbook_path,rows,name,result,label,str(csv_path),info)
+        cached.update(workbook=workbook_path,workbook_signature=workbook_signature,
+                      workbook_version=RESPONSE_WORKBOOK_VERSION, dataset_label=label,
+                      selection_kind=(result.get('pm_point') or {}).get('selection_kind'),
+                      selection_response=(result.get('pm_point') or {}).get('selection_response'),
+                      bending_axis_deg=info.get('bending_axis_deg'), pm_angle_deg=info.get('pm_angle_deg'),
+                      model_case=info.get('source_case'), fy_MPa=(info.get('settings') or {}).get('fy'))
+        entries.append(cached); files.extend(paths+[workbook_path])
+    if entries:
+        output.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(dict(version=RESPONSE_PAIR_VERSION, models=entries),
+                                            indent=2, allow_nan=False), encoding='utf-8')
+    return files
+
+
+def write_response_path_overview(output_dir, entries, stem='STEP5_response_paths'):
+    """All finished histories: response versus LPF and actual stored frame versus LPF.
+
+    Paginate instead of shrinking an arbitrary number of jobs into unreadable axes.
+    No curve is sorted, smoothed, certified, or omitted for lack of convergence.
+    """
+    import textwrap
+    from pathlib import Path
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    files = []
+    for start in range(0, len(entries), 6):
+        page = entries[start:start+6]
+        fig, axes = plt.subplots(len(page), 2, figsize=(13, 3.2*len(page)+1.2), squeeze=False)
+        try:
+            fig.subplots_adjust(left=.075, right=.97, bottom=.65/(3.2*len(page)+1.2),
+                                top=1.-.65/(3.2*len(page)+1.2), hspace=.85, wspace=.25)
+            fig.suptitle('Response paths | load reduction alone does not verify collapse', fontsize=13, weight='bold')
+            for pair, entry in zip(axes, page):
+                with open(entry['source_csv'], encoding='utf-8-sig', newline='') as stream:
+                    rows = list(csv.DictReader(stream))
+                data = response_pair_rows(rows)
+                lpf = [float(row['lpf']) for row in rows]
+                if not all(math.isfinite(value) for value in lpf):
+                    raise ValueError('Nonfinite LPF: '+entry['source_csv'])
+                key = entry.get('selection_response')
+                if key not in ('shortening_mm', 'rotation_mrad'):
+                    key = 'rotation_mrad' if max(abs(row['force_kN']) for row in data) < 1e-9 else 'shortening_mm'
+                label = 'End rotation (mrad)' if key == 'rotation_mrad' else 'Axial shortening (mm)'
+                peak = max(range(len(lpf)), key=lpf.__getitem__)
+                selected = next((i for i, row in enumerate(data) if row['frame'] == entry.get('selected_frame')), None)
+                title = (entry.get('dataset_label', '')+' | '+entry['model']+' | '+entry.get('outcome','UNKNOWN')+
+                         '\naxis=%s deg; ray=%s deg; Fy=%s MPa; %d frames; selected F%s | %s' %
+                         (entry.get('bending_axis_deg','?'), entry.get('pm_angle_deg','?'), entry.get('fy_MPa','?'),
+                          len(data), entry.get('selected_frame'), entry.get('selection_kind','none')))
+                for ax, x, xlabel in ((pair[0], [row[key] for row in data], label),
+                                      (pair[1], [row['frame'] for row in data], 'Stored ODB frame (zero-based)')):
+                    line, = ax.plot(x, lpf, 'o-', color='#0072b2', ms=2, lw=1.25)
+                    line.set_gid('response-path-curve')
+                    ax.plot(x[peak], lpf[peak], 'o', mfc='white', mec='#b2182b', ms=6)
+                    if selected is not None:
+                        ax.plot(x[selected], lpf[selected], 'D', mfc='white', mec='#b2182b', ms=5)
+                    ax.set(xlabel=xlabel, ylabel='Load proportionality factor', title='\n'.join(textwrap.wrap(title.split('\n')[0], 72))+ '\n'+title.split('\n')[1])
+                    ax.title.set_fontsize(7.5)
+                    ax.tick_params(labelsize=8)
+                    ax.grid(color='#e7ebef')
+            fig.text(.075, .012, 'Circle: attained maximum; diamond: selected P-M point. Failed/stopped histories remain unverified. Original solver order.', fontsize=8, color='#536270')
+            name = stem+('' if start == 0 else '_%03d' % (start//6+1))
+            for extension in ('png','svg'):
+                path = str(output/(name+'.'+extension))
+                fig.savefig(path, dpi=160, facecolor='white'); files.append(path)
+        finally:
+            plt.close(fig)
+    return files
+
+
+def publish_queue_responses(run_dir):
+    """Incremental reports from saved CSV only; no ODB opening or solver submission."""
+    from pathlib import Path
+    run_dir = Path(run_dir).resolve()
+    context = json.loads(os.environ.get('STEP5_LIVE_REPORT_CONTEXT', '{}'))
+    datasets = context.get('datasets') or [dict(root=str(run_dir), label=run_dir.name)]
+    current = next((entry for entry in datasets if Path(entry['root']).resolve() == run_dir),
+                   dict(root=str(run_dir), label=run_dir.name))
+
+    def points_for(entries):
+        points = []
+        for dataset in entries:
+            folder = Path(dataset['root'])
+            status = folder/'STEP5_queue_status.json'
+            if not status.is_file():
+                continue
+            for record in json.loads(status.read_text(encoding='utf-8-sig')):
+                if not record.get('curve_available') and not record.get('pm_point'):
+                    continue
+                points.append(dict(source='GMNIA', folder=str(folder), model=record['model'],
+                                   dataset_label=dataset.get('label',folder.name)))
+        return points
+
+    def publish(destination, points, in_place, stem):
+        files = collect_response_pairs(str(destination), points, in_place=in_place)
+        manifest = destination/'PM_model_response_plots.json'
+        if not manifest.is_file():
+            return
+        entries = json.loads(manifest.read_text(encoding='utf-8'))['models']
+        files += write_response_path_overview(str(destination), entries, stem=stem)
+        fields = ('dataset_label','model','outcome','frames','selected_frame','selection_kind',
+                  'selection_response','bending_axis_deg','pm_angle_deg','model_case','fy_MPa','source_csv','source_odb','workbook')
+        with (destination/'PM_response_report_index.csv').open('w',encoding='utf-8-sig',newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
+            writer.writeheader(); writer.writerows(entries)
+        print('RESPONSE REPORTS: %d finished histories -> %s (PNG/SVG/XLSX; path overview)' %
+              (len(entries), destination), flush=True)
+
+    publish(run_dir, points_for([current]), True, 'STEP5_response_paths')
+    if context.get('output_dir'):
+        publish(Path(context['output_dir']), points_for(datasets), False, '04_PM_response_paths')
+
+
+def normalize_capacity_lines(values, axes):
+    """Accept historic numeric yield lines and explicitly labelled plotting benchmarks."""
+    result = []
+    for item in values:
+        value = float(item['value'] if isinstance(item, dict) else item)
+        if not math.isfinite(value):
+            raise ValueError('Capacity line value must be finite')
+        label = str(item.get('label') or axes['capacity_label'] % value) if isinstance(item, dict) else axes['capacity_label'] % value
+        result.append(dict(value=value, label=label))
+    return result
+
+
+def with_report_reference(info, directory):
+    """Overlay plotting metadata in memory; never change the section/load normalization."""
+    if not directory:
+        from abaqus_report_reference import step5_reference
+        reference = step5_reference(info)
+        return dict(info,report_reference=reference) if reference else info
+    from abaqus_report_reference import read_reference
+    return dict(info, report_reference=read_reference(directory, fy=(info.get('settings') or {}).get('fy')))
+
+
 def capacity_lines(info):
-    """Reference lines in plot units: AsFy (kN) for compression, My (kN m) for bending."""
+    """Plot gross AsFy or SFy/ZFy from model geometry or an explicit legacy report."""
     fy = float((info.get('settings') or {}).get('fy', 0) or 0)
     if response_kind(info) == 'combined':
         return [1.0]
+    reference = info.get('report_reference')
+    if reference:
+        from abaqus_report_reference import reference_origin
+        origin = reference_origin(reference)
+        if response_kind(info) == 'bending':
+            from abaqus_report_reference import moment_reference
+            angle = info.get('bending_axis_deg')
+            if angle is None:
+                angle = (info.get('load_case') or {}).get('neutral_axis_angle_deg', 0.)
+            selected = moment_reference(reference, angle)
+            return [dict(value=float(selected[key]), label='%s (%s %s) = %.3f kN m' %
+                         (name, origin, selected['axis_label'], float(selected[key])))
+                    for name, key in (('SFy', 'SFy_kNm'), ('ZFy', 'ZFy_kNm'))]
+        value = float(reference['AsFy_kN'])
+        return [dict(value=value, label='AsFy (%s built-up) = %.3f kN' % (origin,value))]
     if response_kind(info) == 'bending':
         my = float(info.get('first_yield_moment_Nmm') or 0)
         return [my/1e6] if my > 0 else []
@@ -579,6 +1069,7 @@ def extract(args):
         raise ValueError('ODB is locked; use --allow-partial for a read-only snapshot')
     model_name = args.model or os.path.splitext(os.path.basename(args.odb))[0]
     info, metadata_source = load_metadata(args.odb, model_name, getattr(args, 'cae', None))
+    info = with_report_reference(info, getattr(args, 'cufsm_report_dir', None))
 
     odb = openOdb(path=args.odb, readOnly=True)
     try:
@@ -634,13 +1125,16 @@ def extract(args):
                        reference_moment_Nmm=info.get('reference_moment_Nmm'),
                        section_for_PM=info.get('section_for_PM'))
         summary.pop('shortening_convention'); summary.pop('reference_force_N_per_end')
+    if info.get('report_reference'):
+        summary['report_reference'] = info['report_reference']
     with open(json_path, 'w', encoding='utf-8') as stream:
         json.dump(summary, stream, indent=2, allow_nan=False)
     title=model_name+' - '+axes['title']+(' (PARTIAL SNAPSHOT)' if lpf_alignment['partial'] else '')
-    write_svg(svg_path, rows, peak, title, axes)
+    yield_lines=capacity_lines(info)
+    write_svg(svg_path, rows, peak, title, axes,
+              yield_lines=yield_lines if info.get('report_reference') else None)
     if not getattr(args,'skip_png',False):
         from abaqus_step5_queue import plot_png
-        yield_lines=capacity_lines(info)
         plot_png(png_path, [(model_name,[(r[axes['x']],r[axes['y']]) for r in rows])],yield_lines,title,axes=axes)
 
     print('FORCE-DISPLACEMENT EXTRACTED')
@@ -672,6 +1166,12 @@ def extract(args):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if '--publish-responses' in argv:
+        parser = argparse.ArgumentParser(description='Publish saved responses without opening ODBs')
+        parser.add_argument('--publish-responses', action='store_true', required=True)
+        parser.add_argument('--run-dir', required=True)
+        return publish_queue_responses(parser.parse_args(argv).run_dir)
     return extract(parse_arguments(argv))
 
 

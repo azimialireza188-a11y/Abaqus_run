@@ -88,7 +88,7 @@ class QueueTests(unittest.TestCase):
             self.assertFalse(q.finished_result(dict(result, analysis_completed=True, partial=True)))
             self.assertFalse(q.finished_result(dict(result, analysis_completed=True, solver_exit_code=1)))
 
-    def test_queue_finished_without_crossing_warns_and_incomplete_analysis_still_fails(self):
+    def test_queue_finished_without_crossing_and_stopped_curve_continue_without_capacity(self):
         import csv, json
         q = self.queue()
         for finished in (True, False):
@@ -122,7 +122,8 @@ class QueueTests(unittest.TestCase):
                         q.run(args)
                         self.assertTrue(any(c.args[0]=='POSTPEAK NOT VERIFIED' for c in report.call_args_list))
                     else:
-                        with self.assertRaisesRegex(RuntimeError,'incomplete'): q.run(args)
+                        q.run(args)
+                        self.assertTrue(any(c.args[0]=='CONTINUE AFTER STOP' for c in report.call_args_list))
                 with open(os.path.join(d,'STEP5_queue_status.json')) as f: result=json.load(f)[0]
                 self.assertFalse(result['capacity_verified'])
                 self.assertNotIn('Pu_over_Py',result)
@@ -171,6 +172,63 @@ class QueueTests(unittest.TestCase):
                 self.assertFalse(polys[i].get('stroke-dasharray'))
                 self.assertEqual(polys[i+1].get('stroke-dasharray'),'8 5')
             self.assertGreater(float(root.get('height')),900)
+
+    def test_saved_stopped_curve_is_reused_only_with_incomplete_opt_in(self):
+        import csv, json
+        q = self.queue()
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as d:
+            name = 'STEP5_TEST'
+            info = dict(reference_force_N_per_end=1000.)
+            record = dict(model=name, outcome='SOLVER_ERROR', criterion_reached=False,
+                          solver_exit_code=1, partial=False, force_kN=.9)
+            stem = os.path.join(d, name+'_force_displacement')
+            with open(os.path.join(d, name+'.odb'), 'w') as stream:
+                stream.write('fake ODB; must never open')
+            with open(os.path.join(d, name+'.sta'), 'w') as stream:
+                stream.write('ANALYSIS ABORTED')
+            with open(stem+'.csv', 'w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(['frame', 'shortening_mm', 'force_kN', 'lpf'])
+                writer.writerows([(0, 0., 0., 0.), (1, 1., .5, .5), (2, 2., .9, .9)])
+            with open(stem+'.json', 'w') as stream:
+                json.dump(dict(model=name, step='GMNIA', frames=3, partial=False), stream)
+            with open(os.path.join(d, 'STEP5_queue_status.json'), 'w') as stream:
+                json.dump([record], stream)
+            with mock.patch.object(q.fd, 'extract', side_effect=AssertionError('no extraction')):
+                self.assertIsNone(q.completed_curve(d, name, info))
+                result, curve = q.completed_curve(d, name, info, allow_incomplete=True, record=record)
+            self.assertEqual(curve[-1], (2., .9))
+            self.assertTrue(q.processed_result(result))
+            self.assertFalse(q.finished_result(result))
+            self.assertFalse(result['capacity_verified'])
+            with open(stem+'.csv', 'a') as stream:
+                stream.write('1,3,1,1\n')
+            with self.assertRaisesRegex(ValueError, 'summary/CSV mismatch'):
+                q.completed_curve(d, name, info, allow_incomplete=True, record=record)
+
+    def test_pm_selection_keeps_original_peak_and_solver_outcome(self):
+        import numpy as np
+        q = self.queue()
+        info = dict(load_case=dict(type='combined'), settings=dict(fy=240.), source_case='PERFECT',
+                    reference_axial_force_N=1000., reference_moment_Nmm=2e6,
+                    section_for_PM=dict(area_mm2=10., first_yield_moment_Nmm=4e6))
+        loads = [min(x, .7)+.03*max(x-.7, 0.) for x in np.linspace(0., 2., 201)]
+        rows = [dict(frame=i, lpf=float(value), extreme_fibre_shortening_mm=float(i),
+                     force_kN=float(value), moment_kNm=2.*float(value)) for i, value in enumerate(loads)]
+        result = dict(model='PM_A000_P45_PERFECT', outcome='SOLVER_ERROR', analysis_state='FAILED',
+                      capacity_verified=False, force_kN=max(loads), moment_kNm=2.*max(loads))
+        observed_peak = result['force_kN']
+        q.select_pm_result(result, info, rows)
+        self.assertEqual(result['outcome'], 'SOLVER_ERROR')
+        self.assertEqual(result['force_kN'], observed_peak)
+        self.assertFalse(result['capacity_verified'])
+        self.assertEqual(result['pm_selection_kind'], 'SIGNIFICANT_STIFFNESS_CHANGE')
+        self.assertAlmostEqual(result['pm_point']['P_kN'], .7)
+        self.assertAlmostEqual(result['pm_point']['M_kNm'], 1.4)
+        self.assertTrue(result['pm_point']['provisional'])
+        rows[70]['moment_kNm'] = 99.
+        with self.assertRaisesRegex(ValueError, 'synchronized LPF'):
+            q.select_pm_result(result, info, rows)
 
     def test_zero_gpu_override_replaces_stale_environment(self):
         self.assertIn('gpus=0', self.queue().job_command('STEP5_TEST', 8, 0, 'monitor'))
@@ -592,3 +650,132 @@ class QueueTests(unittest.TestCase):
             self.assertIn('My 50.000 kN m',text)
             self.assertIn('End rotation, theta (mrad)',text)
             self.assertTrue(os.path.getsize(os.path.join(d,'STEP5_all_moment_rotation_combined.png')) > 1000)
+
+    def test_labelled_report_lines_in_comparison_svg_and_png(self):
+        q = self.queue()
+        import matplotlib.pyplot as plt
+        curves = [('Bending', [(0., 0.), (1., 3.)])]
+        refs = [{'value': 5., 'label': 'SFy report x'}, {'value': 7., 'label': 'ZFy report x'}]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(plt, 'close'):
+            path = os.path.join(directory, 'comparison')
+            q.plot_svg(path+'.svg', curves, refs, 'Bending', q.fd.RESPONSE_AXES['bending'])
+            with open(path+'.svg', encoding='utf-8') as stream:
+                svg = stream.read()
+            self.assertIn('SFy report x', svg)
+            self.assertIn('ZFy report x', svg)
+            q.plot_png(path+'.png', curves, refs, 'Bending', q.fd.RESPONSE_AXES['bending'])
+            ax = plt.gcf().axes[0]
+            report_lines = [line for line in ax.lines if 'report' in line.get_label()]
+            self.assertEqual([list(line.get_ydata()) for line in report_lines], [[5., 5.], [7., 7.]])
+            self.assertGreater(ax.get_ylim()[1], 7.)
+        plt.close('all')
+
+    def test_cae_fallback_keeps_labelled_horizontal_report_lines(self):
+        q = self.queue()
+        import builtins
+        original_import = builtins.__import__
+        def without_matplotlib(name, *args, **kwargs):
+            if name == 'matplotlib':
+                raise ImportError('exercise CAE fallback')
+            return original_import(name, *args, **kwargs)
+        chart = SimpleNamespace(setValues=mock.Mock(), autoColor=mock.Mock())
+        plot = SimpleNamespace(charts={'chart': chart}, title=SimpleNamespace(setValues=mock.Mock()))
+        session = SimpleNamespace(xyPlots={}, xyDataObjects={}, XYPlot=mock.Mock(return_value=plot),
+            XYData=mock.Mock(side_effect=lambda **kw: kw), Curve=mock.Mock(side_effect=lambda **kw: kw),
+            viewports={'view': SimpleNamespace(setValues=mock.Mock())},
+            printOptions=SimpleNamespace(setValues=mock.Mock()), pngOptions=SimpleNamespace(setValues=mock.Mock()),
+            printToFile=mock.Mock())
+        with mock.patch.object(builtins, '__import__', side_effect=without_matplotlib), mock.patch.dict('sys.modules', {
+                'abaqus': SimpleNamespace(session=session), 'abaqusConstants': SimpleNamespace(PNG='PNG', OFF=False),
+                'visualization': SimpleNamespace()}):
+            q.plot_png('unused.png', [('curve', [(0., 0.), (2., 3.)])],
+                       [{'value': 7., 'label': 'ZFy report built-up x'}], 'Bending', q.fd.RESPONSE_AXES['bending'])
+        reference = session.XYData.call_args_list[-1].kwargs
+        self.assertEqual(reference['data'], ((0., 7.), (2., 7.)))
+        self.assertEqual(reference['legendLabel'], 'ZFy report built-up x')
+
+    def test_report_lines_are_deduplicated_by_value_and_identity(self):
+        q = self.queue()
+        lines = [5.]
+        q.merge_capacity_lines(lines, [5., {'value': 5., 'label': 'SFy report'},
+                                       {'value': 7., 'label': 'ZFy report'}], q.fd.RESPONSE_AXES['bending'])
+        q.merge_capacity_lines(lines, [{'value': 7., 'label': 'ZFy report'}], q.fd.RESPONSE_AXES['bending'])
+        self.assertEqual(lines, [5., {'value': 5., 'label': 'SFy report'}, {'value': 7., 'label': 'ZFy report'}])
+
+    def test_queue_report_override_preserves_capacity_ratios_and_metadata(self):
+        import csv, json
+        import abaqus_report_reference as reader
+        q = self.queue()
+        reference = dict(schema='cufsm_builtup_reference_v1', AsFy_kN=1100., axes={
+            'x': dict(axis_deg=0., SFy_kNm=130., ZFy_kNm=190.),
+            'z': dict(axis_deg=90., SFy_kNm=140., ZFy_kNm=200.)})
+        with tempfile.TemporaryDirectory() as directory:
+            name = 'STEP5_B_FY240'
+            info = dict(stage=5, settings=dict(field_frequency=1, fy=240.),
+                        load_case=dict(type='bending'), bending_axis_deg=0.,
+                        reference_moment_Nmm=20e6, first_yield_moment_Nmm=20e6, end_area_mm2=1000.)
+            metadata_path = os.path.join(directory, name+'_step5.json')
+            original = json.dumps(info)
+            with open(metadata_path, 'w') as stream:
+                stream.write(original)
+            with open(os.path.join(directory, name+'.inp'), 'w') as stream:
+                stream.write('test input')
+            csv_path = os.path.join(directory, name+'_moment_rotation.csv')
+            with open(csv_path, 'w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(['rotation_mrad', 'moment_kNm', 'lpf'])
+                writer.writerows([(0., 0., 0.), (1., 50., 1.), (2., 25., .5)])
+            summary = dict(csv=csv_path, peak=dict(moment_kNm=50., rotation_mrad=1., lpf=1.), partial=False)
+            args = SimpleNamespace(run_dir=directory, jobs=[name], cae=None, cpus=1, gpus=0,
+                                   extract_only=True, repair_only=False, ratio=.7, stop_method='monitor',
+                                   cufsm_report_dir='report-folder')
+            completed = dict(analysis_completed=True, analysis_state='COMPLETED', completion_diagnostics=[],
+                             completion_sources=['test'])
+            with mock.patch.object(reader, 'read_reference', return_value=reference) as read, \
+                    mock.patch.object(q.resources, 'detect_resources'), \
+                    mock.patch.object(q.resources, 'resolve_solver_policy', return_value=SimpleNamespace(cpus=1, gpus=0)), \
+                    mock.patch.object(q, 'completion_details', return_value=completed), \
+                    mock.patch.object(q.fd, 'extract', return_value=summary) as extract, \
+                    mock.patch.object(q, 'plot_png') as plot, mock.patch.object(q, 'write_comparison') as compare, \
+                    mock.patch.object(q, 'report'):
+                q.run(args)
+            read.assert_called_once_with('report-folder', fy=240.)
+            self.assertEqual(extract.call_args.args[0].cufsm_report_dir, 'report-folder')
+            self.assertEqual([line['value'] for line in plot.call_args.args[2]], [130., 190.])
+            result = compare.call_args.args[3][0]
+            self.assertEqual(result['My_kNm'], 20.)
+            self.assertEqual(result['Mu_over_My'], 2.5)
+            self.assertEqual(compare.call_args.kwargs['report_reference'], reference)
+            with open(metadata_path) as stream:
+                self.assertEqual(stream.read(), original)
+
+    def test_resumed_saved_curves_receive_report_lines_without_extraction(self):
+        import json
+        import abaqus_report_reference as reader
+        q = self.queue()
+        reference = dict(schema='cufsm_builtup_reference_v1', AsFy_kN=1100., axes={})
+        with tempfile.TemporaryDirectory() as directory:
+            name = 'STEP5_D_FY240'
+            info = dict(stage=5, settings=dict(field_frequency=1, fy=240.),
+                        reference_force_N_per_end=240000., end_area_mm2=1000.)
+            for filename, content in ((name+'.inp', 'test input'), (name+'_step5.json', json.dumps(info))):
+                with open(os.path.join(directory, filename), 'w') as stream:
+                    stream.write(content)
+            saved = dict(model=name, outcome='CRITERION_REACHED', peak_interpretation='verified',
+                         criterion_reached=True, analysis_completed=True, analysis_state='COMPLETED')
+            args = SimpleNamespace(run_dir=directory, jobs=[name], cae=None, cpus=1, gpus=0,
+                                   extract_only=False, repair_only=False, resume=True, ratio=.7,
+                                   stop_method='monitor', cufsm_report_dir='report-folder')
+            with mock.patch.object(reader, 'read_reference', return_value=reference), \
+                    mock.patch.object(q.resources, 'detect_resources'), \
+                    mock.patch.object(q.resources, 'resolve_solver_policy', return_value=SimpleNamespace(cpus=1, gpus=0)), \
+                    mock.patch.object(q, 'validate_submission'), \
+                    mock.patch.object(q, 'completed_curve', return_value=(saved, [(0., 0.), (1., 200.)])), \
+                    mock.patch.object(q.fd, 'extract') as extract, mock.patch.object(q, 'run_job') as solve, \
+                    mock.patch.object(q, 'plot_png') as png, mock.patch.object(q, 'plot_svg') as svg, \
+                    mock.patch.object(q, 'write_comparison'), mock.patch.object(q, 'report'):
+                q.run(args)
+            extract.assert_not_called()
+            solve.assert_not_called()
+            self.assertEqual(png.call_args.args[2][0]['value'], 1100.)
+            self.assertEqual(svg.call_args.args[2][0]['value'], 1100.)
